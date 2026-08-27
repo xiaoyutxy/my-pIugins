@@ -1,9 +1,9 @@
 {
-  "rev": "3.4.2",
+  "rev": "3.4.3",
   "guard": "",
   "diag": "",
   "deploy": "",
   "js": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-pIugins@main/sdm.js",
   "md5": "",
-  "notes": "音乐插件大修复 + 更新机制永久修复：版本检测直连GitHub，彻底解决CDN缓存问题"
+  "notes": "v3.4.3：修复检查更新报错——版本入口缺失自动回退总入口，防降级，下载校验版本一致"
 }
