@@ -5,5 +5,5 @@
   "deploy": "",
   "js": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-pIugins@main/sdm.js",
   "md5": "",
-  "notes": "音乐插件大修复 + 更新机制永久修复：版本检测直连GitHub，彻底解决CDN缓存问题"
+  "notes": "音乐插件大修复 + 更新机制永久修复"
 }
