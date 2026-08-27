@@ -1,9 +1,9 @@
 {
-  "rev": "3.4.3",
+  "rev": "3.4.4",
   "guard": "",
   "diag": "",
   "deploy": "",
   "js": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-pIugins@main/sdm.js",
   "md5": "",
-  "notes": "v3.4.3：修复检查更新报错——版本入口缺失自动回退总入口，防降级，下载校验版本一致"
+  "notes": "v3.4.4：美化检查更新按钮，新增脉冲动画新版徽标"
 }
