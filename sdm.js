@@ -8,14 +8,14 @@ try {
     let DIAG_LOG = []
     let SCAN_INTERVAL_MS = 10000
     let _isScanning = false
-    const PLUGIN_VERSION = '3.4.0'
+    const PLUGIN_VERSION = '3.3.0'
 
     // ════════════════════════════════════════════════════════════
     // 自有更新推送机制 ★ 改成你自己的 GitHub 仓库 ★
     // ════════════════════════════════════════════════════════════
     const SDM_CDN_ORIGIN = 'cdn.jsdelivr.net';
     const SDM_CDN_MIRRORS = ['cdn.jsdmirror.com', 'jsd.onmicrosoft.cn'];
-    const SDM_GH_BASE = `https://${SDM_CDN_ORIGIN}/gh/xiaoyutxy/my-pIugins@main/`;
+    const SDM_GH_BASE = `https://${SDM_CDN_ORIGIN}/gh/xiaoyutxy/my-plugins@refs/heads/main/`;
     let _sdmBestNode = null;
     let _sdmManifest = null;
     let _sdmUpdating = false;
@@ -36,7 +36,7 @@ try {
         const candidates = [SDM_CDN_ORIGIN, ...SDM_CDN_MIRRORS];
         const results = [];
         for (const node of candidates) {
-            const testUrl = `https://${node}/gh/xiaoyutxy/my-pIugins@main/_latest.json?_=${Date.now()}`;
+            const testUrl = `https://${node}/gh/xiaoyutxy/my-plugins@refs/heads/main/_latest.json?_=${Date.now()}`;
             const start = Date.now();
             const r = await _sdmRun(`curl -sL --connect-timeout 3 --max-time 5 -w '%{http_code}' -o /dev/null ${_sdmSq(testUrl)}`, 8000).catch(() => ({ content: '0' }));
             if (String(r?.content || '').trim() === '200') results.push({ node, rtt: Date.now() - start });
@@ -3594,14 +3594,11 @@ try {
                 var songs = []
                 if (data && data.data && data.data.lists) {
                     songs = data.data.lists.map(function(s) {
-                        // 2026-08-27: HQFileHash(320k)播放可用，FileHash(128k)经常无URL，优先用HQ
-                        var bestHash = s.HQFileHash || s.FileHash
                         return {
-                            id: 'kg_' + bestHash,
+                            id: 'kg_' + s.FileHash,
                             platform: 'kugou',
                             pfName: '酷狗',
-                            songId: bestHash,
-                            backupHash: s.FileHash || '',  // 128k备用hash
+                            songId: s.FileHash,
                             albumId: s.AlbumID,
                             name: s.SongName,
                             artists: s.SingerName ? [s.SingerName] : [],
@@ -3625,102 +3622,60 @@ try {
         // 酷我搜索
         var searchKuwo = async function(keyword) {
             try {
-                // 2026-08-27 更新：旧API已失效，使用search.kuwo.cn备用接口
                 var text = await shellCurl(
-                    'http://search.kuwo.cn/r.s?all=' + encodeURIComponent(keyword) + '&ft=music&itemset=web_2013&client=kt&pn=0&rn=15&rformat=json&encoding=utf8',
-                    "-H 'User-Agent: Mozilla/5.0 (Linux; Android 10)'"
+                    'http://www.kuwo.cn/api/www/search/searchMusicBykeyWord?key=' + encodeURIComponent(keyword) + '&pn=1&rn=15&httpsStatus=1&reqId=' + Date.now(),
+                    "-H 'Referer: http://www.kuwo.cn/' -H 'csrf: 00000000000000000000000000000000' -H 'Cookie: kw_token=00000000000000000000000000000000' -H 'User-Agent: Mozilla/5.0 (Linux; Android 10)'"
                 )
                 if (!text) throw new Error('无返回')
-                // search.kuwo.cn返回Python dict风格（单引号），用正则提取歌曲信息
+                var data = JSON.parse(text)
                 var songs = []
-                var songBlocks = text.match(/\{'[^']*?MUSICRID[^']*?\}/g) || []
-                songBlocks.forEach(function(block) {
-                    function getField(field) {
-                        var m = block.match(new RegExp("'" + field + "':'([^']*)'"))
-                        return m ? m[1].replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&') : ''
-                    }
-                    var rid = getField('MUSICRID').replace('MUSIC_', '')
-                    var name = getField('SONGNAME') || getField('NAME')
-                    var artist = getField('ARTIST')
-                    var album = getField('ALBUM')
-                    var duration = parseInt(getField('DURATION')) || 0
-                    if (rid && name) {
-                        songs.push({
-                            id: 'kw_' + rid,
+                if (data && data.data && data.data.list) {
+                    songs = data.data.list.map(function(s) {
+                        return {
+                            id: 'kw_' + s.rid,
                             platform: 'kuwo',
                             pfName: '酷我',
-                            songId: rid,
-                            name: name,
-                            artists: artist ? [artist] : [],
-                            album: album || '',
-                            duration: duration * 1000
-                        })
-                    }
-                })
-                _searchResults = _searchResults.concat(songs)
-                renderSearchResults()
+                            songId: s.rid,
+                            name: s.name,
+                            artists: s.artist ? s.artist.split('&') : [],
+                            album: s.album || '',
+                            duration: (s.duration || 0) * 1000
+                        }
+                    })
+                    _searchResults = _searchResults.concat(songs)
+                    renderSearchResults()
+                }
                 _searchStatus.kuwo = 'done'
                 updatePlatformButtons()
                 return songs
             } catch(e) {
-                // 如果备用接口也失败，尝试旧API
-                try {
-                    var text2 = await shellCurl(
-                        'http://www.kuwo.cn/api/www/search/searchMusicBykeyWord?key=' + encodeURIComponent(keyword) + '&pn=1&rn=15&httpsStatus=1&reqId=' + Date.now(),
-                        "-H 'Referer: http://www.kuwo.cn/' -H 'csrf: 00000000000000000000000000000000' -H 'Cookie: kw_token=00000000000000000000000000000000' -H 'User-Agent: Mozilla/5.0 (Linux; Android 10)'"
-                    )
-                    if (!text2) throw new Error('无返回')
-                    var data2 = JSON.parse(text2)
-                    var songs2 = []
-                    if (data2 && data2.data && data2.data.list) {
-                        songs2 = data2.data.list.map(function(s) {
-                            return {
-                                id: 'kw_' + s.rid,
-                                platform: 'kuwo',
-                                pfName: '酷我',
-                                songId: s.rid,
-                                name: s.name,
-                                artists: s.artist ? s.artist.split('&') : [],
-                                album: s.album || '',
-                                duration: (s.duration || 0) * 1000
-                            }
-                        })
-                        _searchResults = _searchResults.concat(songs2)
-                        renderSearchResults()
-                    }
-                    _searchStatus.kuwo = 'done'
-                    updatePlatformButtons()
-                    return songs2
-                } catch(e2) {
-                    _searchStatus.kuwo = 'failed'
-                    updatePlatformButtons()
-                    return []
-                }
+                _searchStatus.kuwo = 'failed'
+                updatePlatformButtons()
+                return []
             }
         }
 
         // 咪咕搜索
         var searchMigu = async function(keyword) {
             try {
-                // 2026-08-27 更新：旧API已失效（301），使用app.c.nf.migu.cn新接口
                 var text = await shellCurl(
-                    'https://app.c.nf.migu.cn/MIGUM2.0/v1.0/content/search_all.do?text=' + encodeURIComponent(keyword) + '&pageSize=15&pageNo=1&searchSwitch=' + encodeURIComponent('{"song":1}'),
+                    'https://m.music.migu.cn/migu/remoting/scr_search_tag?rows=15&type=2&keyword=' + encodeURIComponent(keyword) + '&pgc=1',
                     "-H 'Referer: https://m.music.migu.cn/' -H 'User-Agent: Mozilla/5.0 (Linux; Android 10)'"
                 )
                 if (!text) throw new Error('无返回')
                 var data = JSON.parse(text)
                 var songs = []
-                if (data && data.songResultData && data.songResultData.result) {
-                    songs = data.songResultData.result.map(function(s) {
+                if (data && data.musics) {
+                    songs = data.musics.map(function(s) {
                         return {
-                            id: 'mg_' + (s.contentId || s.copyrightId || s.id || ''),
+                            id: 'mg_' + (s.copyrightId || s.id || ''),
                             platform: 'migu',
                             pfName: '咪咕',
-                            songId: s.contentId || s.copyrightId || s.id || '',
-                            name: s.name || s.songName || s.title || '',
-                            artists: (s.singers || []).map(function(a) { return a.name }),
-                            album: (s.albums && s.albums.length) ? s.albums[0].name : '',
-                            duration: 0
+                            songId: s.copyrightId || s.id || '',
+                            name: s.songName || s.title || '',
+                            artists: s.singerName ? s.singerName.split('、') : [],
+                            album: s.albumName || '',
+                            duration: (s.duration || 0) * 1000
                         }
                     })
                     _searchResults = _searchResults.concat(songs)
@@ -3786,55 +3741,144 @@ try {
 
         // ---- 墨澜聚合音源 API后端（curl GET方式） ----
         // 每个平台多个后端，逐个尝试，哪个成功用哪个
-        // 2026-08-27 全面测试更新：GD Studio和酷狗移动端稳定可用
         var NETEASE_BACKENDS = [
-            // 1. GD Studio（稳定可用）
+            // 1. 笒鬼鬼API
+            { url: function(id) { return 'https://api.cenguigui.cn/api/netease/music_v1.php?id=' + id + '&type=json&level=exhigh' }, extract: [['data','url'],['url']] },
+            // 2. 溯音API
+            { url: function(id) { return 'https://oiapi.net/api/Music_163?id=' + id + '&type=json' }, extract: [['url'],['data','url'],['data',0,'url']] },
+            // 3. GD Studio
             { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?types=url&source=netease&id=' + id + '&br=320' }, extract: [['url']] },
-            // 2. GD Studio 无损音质
-            { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?types=url&source=netease&id=' + id + '&br=999' }, extract: [['url']] },
+            // 4. 星海主后端
+            { url: function(id) { return 'https://yy.zddyr.top/lx/api/?source=netease&songmid=' + id + '&quality=320k' }, extract: [['url']] },
+            // 5. 妖狐API
+            { url: function(id) { return 'https://api.yaohud.cn/api/music/wyvip?id=' + id + '&level=320k' }, extract: [['url'],['data','url']] },
+            // 6. 聆澜API
+            { url: function(id) { return 'https://source.shiqianjiang.cn/api/music/url?source=wy&songId=' + id + '&quality=320k' }, extract: [['url'],['data','url']] },
+            // 7. HYWmusic
+            { url: function(id) { return 'http://103.79.184.97/api/music/url?source=wy&songId=' + id + '&quality=320k&key=MOLAN-BAIJI' }, extract: [['url'],['data','url']], headers: 'X-Card-Key: MOLAN-BAIJI' },
+            // 8. 长青SVIP
+            { url: function(id) { return 'http://175.27.166.236/wy/wy.php?type=mp3&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+            // 9. 念心SVIP
+            { url: function(id) { return 'http://music.nxinxz.com/wy.php?id=' + id + '&level=exhigh&type=mp3' }, extract: [['url'],['data','url']] },
+            // 10. 星海主API（聚合音源版）
+            { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?use_xbridge3=true&loader_name=forest&need_sec_link=1&sec_link_scene=im&theme=light&types=url&source=netease&id=' + id + '&br=320' }, extract: [['url']] },
         ]
 
         var QQ_BACKENDS = [
-            // QQ音乐直链接口均已失效（403认证/410废弃），依赖汽水VIP跨平台搜索回退
-            // 保留GD Studio以防接口恢复
-            { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?types=url&source=tx&id=' + id + '&br=320' }, extract: [['url']] },
+            // 1. 星海主后端
+            { url: function(id) { return 'https://yy.zddyr.top/lx/api/?source=qq&songmid=' + id + '&quality=320k' }, extract: [['url']] },
+            // 2. 溯音QQ
+            { url: function(id) { return 'https://oiapi.net/api/QQ_Music?key=oiapi-ef6133b7-ac2f-dc7d-878c-d3e207a82575&type=json&br=5&n=1&mid=' + id }, extract: [['data','music'],['data','url'],['url']] },
+            // 3. GD Studio
+            { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?types=url&source=qq&id=' + id + '&br=320' }, extract: [['url']] },
+            // 4. 妖狐API
+            { url: function(id) { return 'https://api.yaohud.cn/api/music/qq_plus?id=' + id + '&level=320k' }, extract: [['url'],['data','url']] },
+            // 5. HYWmusic
+            { url: function(id) { return 'http://103.79.184.97/api/music/url?source=tx&songId=' + id + '&quality=320k&key=MOLAN-BAIJI' }, extract: [['url'],['data','url']], headers: 'X-Card-Key: MOLAN-BAIJI' },
+            // 6. 聆澜API
+            { url: function(id) { return 'https://source.shiqianjiang.cn/api/music/url?source=tx&songId=' + id + '&quality=320k' }, extract: [['url'],['data','url']] },
+            // 7. 长青SVIP
+            { url: function(id) { return 'http://175.27.166.236/kgqq/qq.php?type=mp3&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+            // 8. 念心SVIP
+            { url: function(id) { return 'https://music.nxinxz.com/kgqq/tx.php?id=' + id + '&level=exhigh&type=mp3' }, extract: [['url'],['data','url']] },
+            // 9. 星海主API（聚合音源版）
+            { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?use_xbridge3=true&loader_name=forest&need_sec_link=1&sec_link_scene=im&theme=light&types=url&source=tencent&id=' + id + '&br=320' }, extract: [['url']] },
         ]
 
         var KUGOU_BACKENDS = [
-            // 1. 酷狗移动端（稳定可用，返回play_url和backup_url）
-            { url: function(id) { return 'https://m.kugou.com/app/i/getSongInfo.php?cmd=playInfo&hash=' + id }, extract: [['url'],['playUrl'],['play_url'],['backup_url']] },
-            // 2. 酷狗移动端 128k备用hash（HQ hash失败时用）
-            { url: function(id, albumId, song) {
-                if (!song || !song.backupHash || song.backupHash === id) return null
-                return 'https://m.kugou.com/app/i/getSongInfo.php?cmd=playInfo&hash=' + song.backupHash
-              }, extract: [['url'],['playUrl'],['play_url'],['backup_url']] },
+            // 1. 长青海棠
+            { url: function(id) { return 'https://musicserver.haitangw.cc/v1/music/resolve-url' }, extract: [['data','url']], method: 'POST', postBody: function(id) { return '{"source":"kg","rid":"' + id + '","level":"exhigh"}' } },
+            // 2. 海棠API
+            { url: function(id) { return 'https://musicapi.haitangw.net/kgqq/kg.php?type=json&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+            // 3. 酷狗官方
+            { url: function(id, albumId) { return 'https://wwwapi.kugou.com/yy/index.php?r=play/getdata&hash=' + id + '&platid=4&album_id=' + (albumId||'') + '&mid=00000000000000000000000000000000' }, extract: [['data','play_url'],['data','play_backup_url']] },
+            // 4. GD Studio
+            { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?types=url&source=kg&id=' + id + '&br=320' }, extract: [['url']] },
+            // 5. 妖狐API
+            { url: function(id) { return 'https://api.yaohud.cn/api/music/kgvip?id=' + id + '&level=320k' }, extract: [['url'],['data','url']] },
+            // 6. 聆澜API
+            { url: function(id) { return 'https://source.shiqianjiang.cn/api/music/url?source=kg&songId=' + id + '&quality=320k' }, extract: [['url'],['data','url']] },
+            // 7. HYWmusic
+            { url: function(id) { return 'http://103.79.184.97/api/music/url?source=kg&songId=' + id + '&quality=320k&key=MOLAN-BAIJI' }, extract: [['url'],['data','url']], headers: 'X-Card-Key: MOLAN-BAIJI' },
+            // 8. 长青SVIP
+            { url: function(id) { return 'https://music.haitangw.cc/kgqq/kg.php?type=mp3&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+            // 9. 念心SVIP
+            { url: function(id) { return 'https://music.nxinxz.com/kgqq/kg.php?id=' + id + '&level=exhigh&type=mp3' }, extract: [['url'],['data','url']] },
+            // 10. 星海主API（聚合音源版）
+            { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?use_xbridge3=true&loader_name=forest&need_sec_link=1&sec_link_scene=im&theme=light&types=url&source=kugou&id=' + id + '&br=320' }, extract: [['url']] },
         ]
 
         // ---- 长青SVIP后端（多平台） ----
-        // 2026-08-27 已测试全部失效，仅保留备用结构
+        var CHANGQING_BACKENDS = {
+            netease: { url: function(id) { return 'http://175.27.166.236/wy/wy.php?type=mp3&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+            qq: { url: function(id) { return 'http://175.27.166.236/kgqq/qq.php?type=mp3&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+            kugou: { url: function(id) { return 'https://music.haitangw.cc/kgqq/kg.php?type=mp3&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+            kuwo: { url: function(id) { return 'https://musicapi.haitangw.net/music/kw.php?type=mp3&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+            migu: { url: function(id) { return 'https://music.haitangw.cc/musicapi/mg.php?type=mp3&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+        }
 
         // ---- 念心SVIP后端（多平台） ----
-        // 2026-08-27 已测试全部失效（404），仅保留备用结构
+        var NIANXIN_BACKENDS = {
+            netease: { url: function(id) { return 'http://music.nxinxz.com/wy.php?id=' + id + '&level=exhigh&type=mp3' }, extract: [['url'],['data','url']] },
+            qq: { url: function(id) { return 'https://music.nxinxz.com/kgqq/tx.php?id=' + id + '&level=exhigh&type=mp3' }, extract: [['url'],['data','url']] },
+            kugou: { url: function(id) { return 'https://music.nxinxz.com/kgqq/kg.php?id=' + id + '&level=exhigh&type=mp3' }, extract: [['url'],['data','url']] },
+            kuwo: { url: function(id) { return 'http://music.nxinxz.com/kw.php?id=' + id + '&level=exhigh&type=mp3' }, extract: [['url'],['data','url']] },
+            migu: { url: function(id) { return 'http://music.nxinxz.com/mg.php?id=' + id + '&level=exhigh&type=mp3' }, extract: [['url'],['data','url']] },
+        }
 
         // ---- 溯音酷我后端 ----
-        // 2026-08-27 已测试失效
+        var SUYIN_KUWO_BACKENDS = [
+            // 1. 溯音酷我（搜索方式，用歌名搜索获取URL）
+            { url: function(id, albumId, song) {
+                if (!song || !song.name) return null
+                var kw = encodeURIComponent((song.artists || []).join('') + song.name)
+                return 'https://oiapi.net/api/Kuwo?msg=' + kw + '&n=1&br=1&type=json'
+              }, extract: [['data','url'],['url']], needSong: true },
+        ]
 
         // ---- 溯音咪咕后端 ----
-        // 2026-08-27 已测试失效（502）
+        var SUYIN_MIGU_BACKENDS = [
+            { url: function(id, albumId, song) {
+                if (!song || !song.name) return null
+                var kw = encodeURIComponent(song.name + (song.artists && song.artists.length ? song.artists[0] : ''))
+                return 'https://api.xcvts.cn/api/music/migu?gm=' + kw + '&n=1&num=1&type=json'
+              }, extract: [['musicInfo'],['url']], needSong: true },
+        ]
 
         // ---- 酷我后端 ----
         var KUWO_BACKENDS = [
-            // 1. 酷我antiserver（稳定可用，返回纯文本直链）
-            { url: function(id) { return 'http://antiserver.kuwo.cn/anti.s?type=convert_url&format=mp3&response=url&rid=MUSIC_' + id }, extract: [], textUrl: true },
-            // 2. 酷我antiserver AAC格式备用
-            { url: function(id) { return 'http://antiserver.kuwo.cn/anti.s?type=convert_url&format=aac&response=url&rid=MUSIC_' + id }, extract: [], textUrl: true },
+            // 1. 酷我官方
+            { url: function(id) { return 'http://www.kuwo.cn/url?format=mp3&rid=MUSIC_' + id + '&type=convert_url3&br=320kmp3' }, extract: [['url'],['data','url']] },
+            // 2. 长青SVIP
+            { url: function(id) { return 'https://musicapi.haitangw.net/music/kw.php?type=mp3&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+            // 3. 念心SVIP
+            { url: function(id) { return 'http://music.nxinxz.com/kw.php?id=' + id + '&level=exhigh&type=mp3' }, extract: [['url'],['data','url']] },
+            // 4. 溯音酷我搜索
+            { url: function(id, albumId, song) {
+                if (!song || !song.name) return null
+                var kw = encodeURIComponent((song.artists || []).join('') + song.name)
+                return 'https://oiapi.net/api/Kuwo?msg=' + kw + '&n=1&br=1&type=json'
+              }, extract: [['data','url'],['url']], needSong: true },
+            // 5. GD Studio
+            { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?types=url&source=kuwo&id=' + id + '&br=320' }, extract: [['url']] },
+            // 6. 星海主
+            { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?use_xbridge3=true&loader_name=forest&need_sec_link=1&sec_link_scene=im&theme=light&types=url&source=kuwo&id=' + id + '&br=320' }, extract: [['url']] },
         ]
 
         // ---- 咪咕后端 ----
-        // 2026-08-27 已测试咪咕全部接口失效（301重定向），依赖汽水VIP跨平台搜索回退
         var MIGU_BACKENDS = [
-            // 咪咕官方接口已失效
+            // 1. 咪咕官方
             { url: function(id) { return 'https://music.migu.cn/v3/api/music/audioUrl?songId=' + id + '&channel=0&netType=1&playMode=1' }, extract: [['data','url'],['url']] },
+            // 2. 念心SVIP
+            { url: function(id) { return 'http://music.nxinxz.com/mg.php?id=' + id + '&level=exhigh&type=mp3' }, extract: [['url'],['data','url']] },
+            // 3. 长青SVIP
+            { url: function(id) { return 'https://music.haitangw.cc/musicapi/mg.php?type=mp3&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+            // 4. 溯音咪咕搜索
+            { url: function(id, albumId, song) {
+                if (!song || !song.name) return null
+                var kw = encodeURIComponent(song.name)
+                return 'https://api.xcvts.cn/api/music/migu?gm=' + kw + '&n=1&num=1&type=json'
+              }, extract: [['musicInfo'],['url']], needSong: true },
         ]
 
         // ---- 汽水VIP后端（跨平台搜索+获取） ----
@@ -3888,20 +3932,6 @@ try {
 
                     if (!text) continue
 
-                    // 纯文本直链类型后端（如酷我antiserver）
-                    if (backend.textUrl) {
-                        var plainUrl = text.trim()
-                        if (plainUrl && plainUrl.indexOf('http') === 0) {
-                            var isPlainValid = await validateAudioUrl(plainUrl)
-                            if (isPlainValid) {
-                                aiLogSafe('[' + song.pfName + '] ' + (backend.name || '后端' + (i+1)) + ' 获取成功', 'success')
-                                return plainUrl
-                            }
-                            aiLogSafe('[' + song.pfName + '] ' + (backend.name || '后端' + (i+1)) + ' URL无效或已过期，尝试下一个', 'warn')
-                        }
-                        continue
-                    }
-
                     var data
                     try { data = JSON.parse(text) } catch(e) { continue }
                     if (!data) continue
@@ -3946,56 +3976,11 @@ try {
                 }
             } catch(e) {}
 
-            // 汽水VIP也失败，跨平台网易云回退（用歌名搜索网易云同曲播放）
-            if (song.name && song.platform !== 'netease') {
-                try {
-                    var neteaseFallbackUrl = await neteaseCrossPlatformFallback(song)
-                    if (neteaseFallbackUrl) {
-                        aiLogSafe('[' + song.pfName + '] 网易云跨平台回退获取成功', 'success')
-                        return neteaseFallbackUrl
-                    }
-                } catch(e) {}
-            }
-
             // 所有后端都失败，网易云兜底用直链
             if (song.platform === 'netease') {
                 return 'https://music.163.com/song/media/outer/url?id=' + song.songId + '.mp3'
             }
 
-            return ''
-        }
-
-        // 网易云跨平台回退：其他平台播放失败时，用歌名+歌手在网易云搜索同曲播放
-        var neteaseCrossPlatformFallback = async function(song) {
-            if (!song || !song.name) return ''
-            var keyword = song.name
-            if (song.artists && song.artists.length) keyword += ' ' + song.artists[0]
-            try {
-                var searchText = await shellCurl(
-                    'https://music.163.com/api/search/get?s=' + encodeURIComponent(keyword) + '&type=1&offset=0&limit=5',
-                    "-H 'User-Agent: Mozilla/5.0 (Linux; Android 10)' -H 'Referer: https://music.163.com/'"
-                )
-                if (!searchText) return ''
-                var searchData
-                try { searchData = JSON.parse(searchText) } catch(e) { return '' }
-                var songs = searchData && searchData.result && searchData.result.songs
-                if (!songs || !songs.length) return ''
-
-                // 取第一条结果用GD Studio获取播放地址
-                var neteaseId = songs[0].id
-                if (!neteaseId) return ''
-
-                var urlText = await shellCurl(
-                    'https://music-api.gdstudio.xyz/api.php?types=url&source=netease&id=' + neteaseId + '&br=320',
-                    "-H 'User-Agent: Mozilla/5.0'"
-                )
-                if (!urlText) return ''
-                var urlData
-                try { urlData = JSON.parse(urlText) } catch(e) { return '' }
-                if (urlData && urlData.url && urlData.url.indexOf('http') === 0) {
-                    return urlData.url
-                }
-            } catch(e) {}
             return ''
         }
 
