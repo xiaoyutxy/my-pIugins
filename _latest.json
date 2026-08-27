@@ -1,9 +1,9 @@
 {
-  "rev": "3.4.0",
+  "rev": "3.4.1",
   "guard": "",
   "diag": "",
   "deploy": "",
   "js": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-pIugins@main/sdm.js",
   "md5": "",
-  "notes": "音乐插件大修复：修复酷狗/酷我/咪咕搜索与播放接口，新增网易云跨平台回退"
+  "notes": "音乐插件大修复 + 更新机制永久修复：版本检测直连GitHub，彻底解决CDN缓存问题"
 }
