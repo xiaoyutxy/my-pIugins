@@ -8,7 +8,7 @@ try {
     let DIAG_LOG = []
     let SCAN_INTERVAL_MS = 10000
     let _isScanning = false
-    const PLUGIN_VERSION = '3.4.3'
+    const PLUGIN_VERSION = '3.4.4'
 
     // ════════════════════════════════════════════════════════════
     // 自有更新推送机制 ★ 改成你自己的 GitHub 仓库 ★
@@ -228,7 +228,7 @@ try {
                 _sdmManifest = raw;
                 const btn = document.querySelector('#sdm_check_update_btn');
                 if (btn && !document.querySelector('#sdm_update_badge')) {
-                    btn.insertAdjacentHTML('beforeend', ` <span id="sdm_update_badge" style="font-size:.4rem;color:#34d399;font-weight:700;">v${raw.rev}</span>`);
+                    btn.insertAdjacentHTML('beforeend', ` <span id="sdm_update_badge" style="font-size:.38rem;color:white;font-weight:700;background:linear-gradient(135deg,#f59e0b,#ef4444);padding:2px 7px;border-radius:9px;box-shadow:0 2px 6px rgba(239,68,68,.4);animation:sdm_pulse 1.5s ease-in-out infinite;">NEW v${raw.rev}</span>`);
                 }
             }).catch(() => {});
         });
@@ -1737,6 +1737,7 @@ try {
     }
 }
 @keyframes smart_action_ripple{0%{transform:scale(0);opacity:.6}100%{transform:scale(2.5);opacity:0}}
+@keyframes sdm_pulse{0%,100%{transform:scale(1);box-shadow:0 2px 6px rgba(239,68,68,.4)}50%{transform:scale(1.1);box-shadow:0 3px 12px rgba(239,68,68,.6)}}
 #smart_sakura_container{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:9999;overflow:hidden}
 #smart_sakura_canvas{position:absolute;top:0;left:0;width:100%;height:100%;display:block}
 .smart_sakura{position:absolute;top:0;left:0;animation:petal_fall linear infinite;will-change:transform,opacity;filter:drop-shadow(0 0 2px rgba(255,182,193,.4))}
@@ -1837,7 +1838,7 @@ try {
         <strong class="smart-grad-text">🌸 智能设备管理器</strong>
         <span style="font-size:.4rem;opacity:.8;margin-left:6px;background:linear-gradient(135deg,#ff9ecd,#c44fc4);color:white;padding:2px 8px;border-radius:10px;box-shadow:0 2px 6px rgba(255,158,205,.3);">用户插件</span>
         <span style="font-size:.55rem;font-weight:bold;margin-left:8px;background:linear-gradient(135deg,#3b82f6,#1d4ed8);color:white;padding:2px 10px;border-radius:10px;box-shadow:0 2px 8px rgba(59,130,246,.4);border:1px solid rgba(147,197,253,.3);">📦 v${PLUGIN_VERSION}</span>
-        <span id="sdm_check_update_btn" style="font-size:.45rem;font-weight:bold;margin-left:4px;color:#34d399;cursor:pointer;background:rgba(52,211,153,.12);border:1px solid rgba(52,211,153,.3);padding:2px 8px;border-radius:8px;transition:all .2s;" onmouseover="this.style.background='rgba(52,211,153,.25)'" onmouseout="this.style.background='rgba(52,211,153,.12)'">🔄 检查更新</span>
+        <span id="sdm_check_update_btn" style="font-size:.45rem;font-weight:bold;margin-left:6px;cursor:pointer;background:linear-gradient(135deg,#34d399,#10b981);color:white;padding:3px 12px;border-radius:12px;box-shadow:0 2px 8px rgba(52,211,153,.35);border:1px solid rgba(255,255,255,.2);transition:all .2s ease;display:inline-flex;align-items:center;gap:3px;user-select:none;" onmouseover="this.style.transform='scale(1.05)';this.style.boxShadow='0 3px 12px rgba(52,211,153,.5)'" onmouseout="this.style.transform='scale(1)';this.style.boxShadow='0 2px 8px rgba(52,211,153,.35)'" onmousedown="this.style.transform='scale(.95)'" onmouseup="this.style.transform='scale(1.05)'">🔄 检查更新</span>
         <span style="font-size:.4rem;opacity:.35;margin-left:4px">QQ 1085465022</span>
         <span style="display:inline-flex;align-items:center;gap:3px;margin-left:6px;vertical-align:middle;">
             <span style="font-size:.4rem;opacity:.5;">作者</span>
