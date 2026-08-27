@@ -8,7 +8,7 @@ try {
     let DIAG_LOG = []
     let SCAN_INTERVAL_MS = 10000
     let _isScanning = false
-    const PLUGIN_VERSION = '3.4.0'
+    const PLUGIN_VERSION = '3.4.1'
 
     // ════════════════════════════════════════════════════════════
     // 自有更新推送机制 ★ 改成你自己的 GitHub 仓库 ★
@@ -16,6 +16,7 @@ try {
     const SDM_CDN_ORIGIN = 'cdn.jsdelivr.net';
     const SDM_CDN_MIRRORS = ['cdn.jsdmirror.com', 'jsd.onmicrosoft.cn'];
     const SDM_GH_BASE = `https://${SDM_CDN_ORIGIN}/gh/xiaoyutxy/my-pIugins@main/`;
+    const SDM_RAW_BASE = 'https://raw.githubusercontent.com/xiaoyutxy/my-pIugins/main/';
     let _sdmBestNode = null;
     let _sdmManifest = null;
     let _sdmUpdating = false;
@@ -46,10 +47,25 @@ try {
     };
 
     const _sdmFetchManifest = async (jsonFile) => {
-        const bestNode = await _sdmProbeCdn();
-        const url = SDM_GH_BASE.replace(SDM_CDN_ORIGIN, bestNode) + jsonFile + '?_=' + Date.now();
         const tmp = '/data/local/tmp/_sdm_mf.tmp';
         await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
+        // 优先从 GitHub raw 拉取（无缓存，永远最新），失败再回退到 CDN
+        const rawUrl = SDM_RAW_BASE + jsonFile + '?t=' + Date.now();
+        for (let retry = 0; retry < 2; retry++) {
+            const r = await _sdmRun(`curl -sL --fail --connect-timeout 8 --max-time 15 ${_sdmSq(rawUrl)} -o ${_sdmSq(tmp)}; ec=$?; [ "$ec" -eq 0 ] && echo __OK__ || echo __FAIL__:$ec`, 20000);
+            if (String(r?.content || '').includes('__OK__')) {
+                const rd = await _sdmRun(`cat ${_sdmSq(tmp)}`, 3000);
+                const text = String(rd?.content || '').trim();
+                await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
+                if (text && text[0] === '{') {
+                    try { const j = JSON.parse(text); if (j.rev && j.js) return j; } catch {}
+                }
+            } else { await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000); }
+            if (retry < 1) await _sdmWait(800);
+        }
+        // GitHub raw 失败，回退到 CDN
+        const bestNode = await _sdmProbeCdn();
+        const url = SDM_GH_BASE.replace(SDM_CDN_ORIGIN, bestNode) + jsonFile + '?_=' + Date.now();
         for (let retry = 0; retry < 3; retry++) {
             const r = await _sdmRun(`curl -sL --fail --connect-timeout 8 --max-time 60 ${_sdmSq(url)} -o ${_sdmSq(tmp)}; ec=$?; [ "$ec" -eq 0 ] && echo __OK__ || echo __FAIL__:$ec`, 45000);
             if (String(r?.content || '').includes('__OK__')) {
