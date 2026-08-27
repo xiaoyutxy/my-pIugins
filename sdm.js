@@ -8,7 +8,7 @@ try {
     let DIAG_LOG = []
     let SCAN_INTERVAL_MS = 10000
     let _isScanning = false
-    const PLUGIN_VERSION = '3.4.4'
+    const PLUGIN_VERSION = '3.5.0'
 
     // ════════════════════════════════════════════════════════════
     // 自有更新推送机制 ★ 改成你自己的 GitHub 仓库 ★
@@ -156,11 +156,49 @@ try {
         return 0;
     };
 
-    // 获取版本清单：先试 v{当前版本}.json 入口，拿不到就回退 _latest.json（永远存在的总入口）
+    // 获取版本清单：先试 v{当前版本}.json 入口，拿不到或版本不高于当前时再用 _latest.json 兜底
+    // 这样发新版只需更新 _latest.json + sdm.js + 对应版本文件，不必修改所有历史版本文件
     const _sdmGetManifest = async (curVer) => {
-        let m = await _sdmFetchManifest('v' + (curVer || PLUGIN_VERSION) + '.json');
-        if (!m) m = await _sdmFetchManifest('_latest.json');
-        return m;
+        const cur = curVer || PLUGIN_VERSION;
+        const verM = await _sdmFetchManifest('v' + cur + '.json');
+        if (verM && _sdmCmpVer(verM.rev, cur) > 0) return verM;
+        const latestM = await _sdmFetchManifest('_latest.json');
+        if (latestM && _sdmCmpVer(latestM.rev, cur) > 0) return latestM;
+        // 都没有更新时返回一个当前版本的占位，调用方会提示已是最新
+        return latestM || verM || null;
+    };
+
+    const _sdmShowChangelog = (ver, manifest) => {
+        const cl = manifest?.changelog || [];
+        const notes = manifest?.notes || '修复了一些已知问题';
+        let bodyHtml = '';
+        if (cl && cl.length > 0) {
+            bodyHtml = cl.map(item => {
+                const title = item.title || '更新内容';
+                const items = item.items || [];
+                const itemsHtml = items.map(it => `<li>${it}</li>`).join('');
+                return `<div class="sdm-changelog-item"><div class="sdm-changelog-item-title"><span class="dot"></span>${title}</div><ul>${itemsHtml}</ul></div>`;
+            }).join('');
+        } else {
+            bodyHtml = `<div class="sdm-changelog-item"><div class="sdm-changelog-item-title"><span class="dot"></span>本次更新</div><ul><li>${notes}</li></ul></div>`;
+        }
+        const mask = document.createElement('div');
+        mask.className = 'sdm-changelog-mask';
+        mask.innerHTML = `<div class="sdm-changelog-box">
+            <div class="sdm-changelog-header">
+                <div class="sdm-changelog-title">🎉 更新成功 <span class="sdm-changelog-ver">v${ver}</span></div>
+                <div class="sdm-changelog-sub">新版本已安装完成，点击下方按钮刷新生效</div>
+            </div>
+            <div class="sdm-changelog-body">${bodyHtml}</div>
+            <div class="sdm-changelog-footer">
+                <button class="sdm-changelog-btn primary" id="sdm_changelog_refresh">立即刷新</button>
+            </div>
+        </div>`;
+        document.body.appendChild(mask);
+        mask.querySelector('#sdm_changelog_refresh').onclick = () => {
+            mask.style.animation = 'sdm_fade_in .25s ease reverse';
+            setTimeout(() => { mask.remove(); location.reload(); }, 200);
+        };
     };
 
     // 检查更新（主入口，绑定到 UI 按钮）
@@ -168,20 +206,23 @@ try {
         if (_sdmUpdating) return createToast('正在更新中，请稍候', 'yellow');
         if (typeof checkAdvancedFunc === 'function' && !(await checkAdvancedFunc())) return;
         _sdmUpdating = true;
+        const btn = document.querySelector('#sdm_check_update_btn');
+        if (btn) btn.classList.add('loading');
         const flow = _sdmShowProgress();
         try {
             const prevVer = await _sdmReadVer();
             const curVer = prevVer || PLUGIN_VERSION;
             flow.setStep('manifest', 'running');
             const raw = await _sdmGetManifest(curVer);
-            if (!raw) { flow.fail('无法获取版本信息，可能网络不通或仓库未配置'); _sdmUpdating = false; return; }
+            if (!raw) { flow.fail('无法获取版本信息，可能网络不通或仓库未配置'); _sdmUpdating = false; if (btn) btn.classList.remove('loading'); return; }
             _sdmManifest = raw;
             flow.setStep('manifest', 'done');
 
             if (_sdmCmpVer(raw.rev, curVer) <= 0) {
                 flow.close();
                 createToast('当前已是最新版本 v' + curVer, 'green', 3000);
-                _sdmUpdating = false; return;
+                if (btn) { btn.classList.remove('has-update'); const bdg = document.querySelector('#sdm_update_badge'); if (bdg) bdg.remove(); }
+                _sdmUpdating = false; if (btn) btn.classList.remove('loading'); return;
             }
 
             flow.setStep('dl_js', 'running');
@@ -210,12 +251,12 @@ try {
 
             flow.setStep('complete', 'done');
             flow.done();
-            createToast('更新完成，2秒后刷新', 'green', 2000);
-            setTimeout(() => location.reload(), 2000);
+            setTimeout(() => _sdmShowChangelog(raw.rev, raw), 500);
         } catch (e) {
             flow.fail(e?.message || String(e));
         } finally {
             _sdmUpdating = false;
+            if (btn) btn.classList.remove('loading');
         }
     };
 
@@ -227,8 +268,11 @@ try {
                 if (!raw || _sdmCmpVer(raw.rev, devVer) <= 0) return;
                 _sdmManifest = raw;
                 const btn = document.querySelector('#sdm_check_update_btn');
-                if (btn && !document.querySelector('#sdm_update_badge')) {
-                    btn.insertAdjacentHTML('beforeend', ` <span id="sdm_update_badge" style="font-size:.38rem;color:white;font-weight:700;background:linear-gradient(135deg,#f59e0b,#ef4444);padding:2px 7px;border-radius:9px;box-shadow:0 2px 6px rgba(239,68,68,.4);animation:sdm_pulse 1.5s ease-in-out infinite;">NEW v${raw.rev}</span>`);
+                if (btn) {
+                    btn.classList.add('has-update');
+                    if (!document.querySelector('#sdm_update_badge')) {
+                        btn.insertAdjacentHTML('beforeend', `<span id="sdm_update_badge" class="sdm-update-badge">NEW</span>`);
+                    }
                 }
             }).catch(() => {});
         });
@@ -1738,6 +1782,44 @@ try {
 }
 @keyframes smart_action_ripple{0%{transform:scale(0);opacity:.6}100%{transform:scale(2.5);opacity:0}}
 @keyframes sdm_pulse{0%,100%{transform:scale(1);box-shadow:0 2px 6px rgba(239,68,68,.4)}50%{transform:scale(1.1);box-shadow:0 3px 12px rgba(239,68,68,.6)}}
+@keyframes sdm_btn_breath{0%,100%{box-shadow:0 2px 8px rgba(52,211,153,.35),0 0 0 0 rgba(52,211,153,.4)}50%{box-shadow:0 3px 14px rgba(52,211,153,.5),0 0 12px 2px rgba(52,211,153,.35)}}
+@keyframes sdm_btn_shine{0%{background-position:-200% center}100%{background-position:200% center}}
+@keyframes sdm_btn_new_pulse{0%,100%{box-shadow:0 2px 8px rgba(239,68,68,.4),0 0 0 0 rgba(239,68,68,.5);transform:scale(1)}25%{transform:scale(1.03)}50%{box-shadow:0 4px 18px rgba(239,68,68,.6),0 0 20px 4px rgba(245,158,11,.45);transform:scale(1.06)}75%{transform:scale(1.03)}}
+@keyframes sdm_spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+@keyframes sdm_badge_bounce{0%,100%{transform:scale(1)}50%{transform:scale(1.15)}}
+.sdm-check-btn{font-size:.45rem;font-weight:bold;margin-left:6px;cursor:pointer;background:linear-gradient(135deg,#34d399,#10b981,#059669,#34d399);background-size:300% 100%;color:white;padding:4px 14px;border-radius:14px;box-shadow:0 2px 8px rgba(52,211,153,.35);border:1px solid rgba(255,255,255,.25);transition:all .25s ease;display:inline-flex;align-items:center;gap:4px;user-select:none;animation:sdm_btn_breath 2.5s ease-in-out infinite,sdm_btn_shine 4s linear infinite;position:relative;overflow:hidden}
+.sdm-check-btn:hover{transform:scale(1.06);box-shadow:0 4px 16px rgba(52,211,153,.55)}
+.sdm-check-btn:active{transform:scale(.94)}
+.sdm-check-btn.has-update{background:linear-gradient(135deg,#f59e0b,#ef4444,#dc2626,#f59e0b);background-size:300% 100%;border-color:rgba(255,255,255,.3);animation:sdm_btn_new_pulse 1.8s ease-in-out infinite,sdm_btn_shine 2.5s linear infinite}
+.sdm-check-btn.has-update:hover{transform:scale(1.08);box-shadow:0 5px 20px rgba(239,68,68,.6)}
+.sdm-check-btn .sdm-btn-icon{display:inline-flex;align-items:center;justify-content:center}
+.sdm-check-btn.loading .sdm-btn-icon{animation:sdm_spin 1s linear infinite}
+.sdm-update-badge{font-size:.36rem;color:white;font-weight:700;background:linear-gradient(135deg,#fff,#fef3c7);color:#dc2626;padding:1px 6px;border-radius:8px;box-shadow:0 2px 6px rgba(0,0,0,.2);animation:sdm_badge_bounce 1.2s ease-in-out infinite;margin-left:2px;line-height:1.3}
+@keyframes sdm_changelog_pop{0%{transform:scale(.8);opacity:0}100%{transform:scale(1);opacity:1}}
+@keyframes sdm_changelog_shine{0%{background-position:-100% 0}100%{background-position:200% 0}}
+.sdm-changelog-mask{position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(6px);z-index:10000;display:flex;align-items:center;justify-content:center;animation:sdm_fade_in .3s ease}
+@keyframes sdm_fade_in{from{opacity:0}to{opacity:1}}
+.sdm-changelog-box{width:86vw;max-width:380px;background:linear-gradient(160deg,rgba(30,41,59,.98),rgba(15,23,42,.98));border:1px solid rgba(99,102,241,.3);border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,.5),0 0 40px rgba(99,102,241,.2);overflow:hidden;animation:sdm_changelog_pop .4s cubic-bezier(.34,1.56,.64,1)}
+.sdm-changelog-header{padding:18px 18px 14px;background:linear-gradient(135deg,rgba(99,102,241,.15),rgba(236,72,153,.1));border-bottom:1px solid rgba(255,255,255,.06);position:relative;overflow:hidden}
+.sdm-changelog-header::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,#6366f1,#ec4899,#f59e0b,#10b981,#6366f1);background-size:300% 100%;animation:sdm_changelog_shine 3s linear infinite}
+.sdm-changelog-title{font-size:.8rem;font-weight:bold;color:white;display:flex;align-items:center;gap:8px}
+.sdm-changelog-ver{font-size:.5rem;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:white;padding:2px 10px;border-radius:10px;font-weight:600}
+.sdm-changelog-sub{font-size:.5rem;color:#94a3b8;margin-top:6px}
+.sdm-changelog-body{padding:16px 18px;max-height:50vh;overflow-y:auto}
+.sdm-changelog-body::-webkit-scrollbar{width:4px}
+.sdm-changelog-body::-webkit-scrollbar-thumb{background:rgba(99,102,241,.4);border-radius:2px}
+.sdm-changelog-item{margin-bottom:12px}
+.sdm-changelog-item:last-child{margin-bottom:0}
+.sdm-changelog-item-title{font-size:.58rem;font-weight:bold;color:#a5b4fc;margin-bottom:6px;display:flex;align-items:center;gap:6px}
+.sdm-changelog-item-title .dot{width:6px;height:6px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#ec4899)}
+.sdm-changelog-item ul{margin:0;padding-left:18px;font-size:.56rem;color:#cbd5e1;line-height:1.7}
+.sdm-changelog-item li{margin-bottom:3px}
+.sdm-changelog-item li::marker{color:#818cf8}
+.sdm-changelog-footer{padding:12px 18px 16px;display:flex;gap:10px;justify-content:flex-end;border-top:1px solid rgba(255,255,255,.06)}
+.sdm-changelog-btn{padding:8px 20px;border-radius:12px;font-size:.6rem;font-weight:600;cursor:pointer;transition:all .2s ease;border:none}
+.sdm-changelog-btn.primary{background:linear-gradient(135deg,#6366f1,#8b5cf6);color:white;box-shadow:0 4px 12px rgba(99,102,241,.4)}
+.sdm-changelog-btn.primary:hover{transform:translateY(-2px);box-shadow:0 6px 18px rgba(99,102,241,.55)}
+.sdm-changelog-btn.primary:active{transform:translateY(0)}
 #smart_sakura_container{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:9999;overflow:hidden}
 #smart_sakura_canvas{position:absolute;top:0;left:0;width:100%;height:100%;display:block}
 .smart_sakura{position:absolute;top:0;left:0;animation:petal_fall linear infinite;will-change:transform,opacity;filter:drop-shadow(0 0 2px rgba(255,182,193,.4))}
@@ -1838,7 +1920,7 @@ try {
         <strong class="smart-grad-text">🌸 智能设备管理器</strong>
         <span style="font-size:.4rem;opacity:.8;margin-left:6px;background:linear-gradient(135deg,#ff9ecd,#c44fc4);color:white;padding:2px 8px;border-radius:10px;box-shadow:0 2px 6px rgba(255,158,205,.3);">用户插件</span>
         <span style="font-size:.55rem;font-weight:bold;margin-left:8px;background:linear-gradient(135deg,#3b82f6,#1d4ed8);color:white;padding:2px 10px;border-radius:10px;box-shadow:0 2px 8px rgba(59,130,246,.4);border:1px solid rgba(147,197,253,.3);">📦 v${PLUGIN_VERSION}</span>
-        <span id="sdm_check_update_btn" style="font-size:.45rem;font-weight:bold;margin-left:6px;cursor:pointer;background:linear-gradient(135deg,#34d399,#10b981);color:white;padding:3px 12px;border-radius:12px;box-shadow:0 2px 8px rgba(52,211,153,.35);border:1px solid rgba(255,255,255,.2);transition:all .2s ease;display:inline-flex;align-items:center;gap:3px;user-select:none;" onmouseover="this.style.transform='scale(1.05)';this.style.boxShadow='0 3px 12px rgba(52,211,153,.5)'" onmouseout="this.style.transform='scale(1)';this.style.boxShadow='0 2px 8px rgba(52,211,153,.35)'" onmousedown="this.style.transform='scale(.95)'" onmouseup="this.style.transform='scale(1.05)'">🔄 检查更新</span>
+        <span id="sdm_check_update_btn" class="sdm-check-btn"><span class="sdm-btn-icon">🔄</span>检查更新</span>
         <span style="font-size:.4rem;opacity:.35;margin-left:4px">QQ 1085465022</span>
         <span style="display:inline-flex;align-items:center;gap:3px;margin-left:6px;vertical-align:middle;">
             <span style="font-size:.4rem;opacity:.5;">作者</span>
