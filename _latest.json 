@@ -3,7 +3,7 @@
   "guard": "",
   "diag": "",
   "deploy": "",
-  "js": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-plugins@main/sdm.js",
+  "js": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-pIugins@main/sdm.js",
   "md5": "",
   "notes": "首个版本：集成自有更新推送机制"
 }
