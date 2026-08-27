@@ -14,7 +14,7 @@ try {
     // 自有更新推送机制 ★ 改成你自己的 GitHub 仓库 ★
     // ════════════════════════════════════════════════════════════
     const SDM_CDN_ORIGIN = 'cdn.jsdelivr.net';
-    const SDM_CDN_MIRRORS = ['cdn.jsdmirror.com', 'jsd.onmicrosoft.cn'];
+    const SDM_CDN_MIRRORS = ['fastly.jsdelivr.net', 'testingcf.jsdelivr.net', 'cdn.jsdmirror.com', 'jsd.onmicrosoft.cn'];
     const SDM_GH_BASE = `https://${SDM_CDN_ORIGIN}/gh/xiaoyutxy/my-pIugins@main/`;
     const SDM_RAW_BASE = 'https://raw.githubusercontent.com/xiaoyutxy/my-pIugins/main/';
     let _sdmBestNode = null;
