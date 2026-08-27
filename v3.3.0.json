@@ -2,8 +2,8 @@
   "rev": "3.3.0",
   "guard": "",
   "diag": "",
-  "deploy": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-plugins@refs/heads/main/deploy.b64",
-  "js": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-plugins@refs/heads/main/plugin.js",
+  "deploy": "",
+  "js": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-plugins@refs/heads/main/sdm.js",
   "md5": "",
-  "notes": "初始版本"
+  "notes": "首个版本：集成自有更新推送机制"
 }
