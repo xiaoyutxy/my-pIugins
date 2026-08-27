@@ -8,7 +8,7 @@ try {
     let DIAG_LOG = []
     let SCAN_INTERVAL_MS = 10000
     let _isScanning = false
-    const PLUGIN_VERSION = '3.4.1'
+    const PLUGIN_VERSION = '3.4.3'
 
     // ════════════════════════════════════════════════════════════
     // 自有更新推送机制 ★ 改成你自己的 GitHub 仓库 ★
@@ -48,26 +48,15 @@ try {
 
     const _sdmFetchManifest = async (jsonFile) => {
         const tmp = '/data/local/tmp/_sdm_mf.tmp';
-        await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
-        // 优先从 GitHub raw 拉取（无缓存，永远最新），失败再回退到 CDN
-        const rawUrl = SDM_RAW_BASE + jsonFile + '?t=' + Date.now();
-        for (let retry = 0; retry < 2; retry++) {
-            const r = await _sdmRun(`curl -sL --fail --connect-timeout 8 --max-time 15 ${_sdmSq(rawUrl)} -o ${_sdmSq(tmp)}; ec=$?; [ "$ec" -eq 0 ] && echo __OK__ || echo __FAIL__:$ec`, 20000);
-            if (String(r?.content || '').includes('__OK__')) {
-                const rd = await _sdmRun(`cat ${_sdmSq(tmp)}`, 3000);
-                const text = String(rd?.content || '').trim();
-                await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
-                if (text && text[0] === '{') {
-                    try { const j = JSON.parse(text); if (j.rev && j.js) return j; } catch {}
-                }
-            } else { await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000); }
-            if (retry < 1) await _sdmWait(800);
+        const t = Date.now();
+        // 候选源逐个尝试：GitHub raw（源头无缓存）→ 各CDN节点
+        // 任一节点缓存了旧内容都能靠后续源纠正，彻底解决CDN缓存卡版本问题
+        const srcs = [SDM_RAW_BASE + jsonFile + '?t=' + t];
+        for (const node of [SDM_CDN_ORIGIN, ...SDM_CDN_MIRRORS]) {
+            srcs.push(SDM_GH_BASE.replace('https://' + SDM_CDN_ORIGIN, 'https://' + node) + jsonFile + '?_=' + t);
         }
-        // GitHub raw 失败，回退到 CDN
-        const bestNode = await _sdmProbeCdn();
-        const url = SDM_GH_BASE.replace(SDM_CDN_ORIGIN, bestNode) + jsonFile + '?_=' + Date.now();
-        for (let retry = 0; retry < 3; retry++) {
-            const r = await _sdmRun(`curl -sL --fail --connect-timeout 8 --max-time 60 ${_sdmSq(url)} -o ${_sdmSq(tmp)}; ec=$?; [ "$ec" -eq 0 ] && echo __OK__ || echo __FAIL__:$ec`, 45000);
+        for (const url of srcs) {
+            const r = await _sdmRun(`curl -sL --fail --connect-timeout 5 --max-time 15 ${_sdmSq(url)} -o ${_sdmSq(tmp)}; ec=$?; [ "$ec" -eq 0 ] && echo __OK__ || echo __FAIL__:$ec`, 20000);
             if (String(r?.content || '').includes('__OK__')) {
                 const rd = await _sdmRun(`cat ${_sdmSq(tmp)}`, 3000);
                 const text = String(rd?.content || '').trim();
@@ -76,7 +65,6 @@ try {
                     try { const j = JSON.parse(text); if (j.rev && j.js) return j; } catch {}
                 }
             } else { await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000); }
-            if (retry < 2) await _sdmWait(800 * Math.pow(2, retry));
         }
         return null;
     };
@@ -86,7 +74,7 @@ try {
         return (r && r.content) ? r.content.trim() : '';
     };
 
-    const _sdmApplyJs = async (prevVer) => {
+    const _sdmApplyJs = async (newVer) => {
         const chk = await _sdmRun(`[ -s ${_sdmSq(SDM_PENDING_JS)} ] && echo EXISTS || echo NONE`, 2000);
         if (!String(chk?.content || '').includes('EXISTS')) return;
         const r = await _sdmRun(`base64 ${_sdmSq(SDM_PENDING_JS)} | tr -d '\\n'`, 15000);
@@ -96,26 +84,42 @@ try {
         try { newJs = new TextDecoder().decode(Uint8Array.from(atob(b64), c => c.charCodeAt(0))); }
         catch (e) { await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`); throw new Error('解码失败'); }
 
+        // 完整性校验：插件签名在本文件中固定出现2次（第2行标记 + SDM_SIG定义）
+        // 内容重复（损坏）的文件签名会出现多次，直接拒绝安装
+        const sigCount = newJs.split(SDM_SIG).length - 1;
+        if (sigCount !== 2 || newJs.length < 50000) {
+            await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`);
+            throw new Error('插件文件校验失败（疑似损坏或内容重复），已中止安装');
+        }
+        if (newVer) newJs = newJs.replace(/const PLUGIN_VERSION = '[^']*'/, `const PLUGIN_VERSION = '${newVer}'`);
+
         const currentText = await getCustomHead();
         if (!currentText) throw new Error('读取插件列表失败');
 
-        // 用签名标记定位代码块
-        const _esc = s => s.replace(/[\[\]]/g, '\\$&');
+        // 用签名标记定位所有本插件的代码块
+        const _esc = s => s.replace(/[\[\]]/g, (c) => '\\' + c);
         const sP = '<!-- [KANO_PLUGIN_START]';
         const sE = '<!-- [KANO_PLUGIN_END]';
         const pluginRegex = new RegExp(_esc(sP) + '\\s*(.*?)\\s*-->([\\s\\S]*?)' + _esc(sE) + '\\s*\\1\\s*-->', 'g');
-        let found = false, newText = currentText, match;
-        while ((match = pluginRegex.exec(currentText)) !== null) {
-            if (match[2].includes(SDM_SIG)) {
-                let content = newJs;
-                if (prevVer) content = content.replace(/const PLUGIN_VERSION = '[^']*'/, `const PLUGIN_VERSION = '${prevVer}'`);
-                const pluginName = match[1].trim();
-                const newBlock = `${sP} ${pluginName} -->\n${content}\n${sE} ${pluginName} -->`;
-                newText = currentText.replace(match[0], newBlock);
-                found = true; break;
-            }
+        const blocks = [];
+        let _m;
+        while ((_m = pluginRegex.exec(currentText)) !== null) {
+            if (_m[2].includes(SDM_SIG)) blocks.push({ full: _m[0], name: _m[1].trim() });
         }
-        if (!found) throw new Error('未找到当前插件代码块');
+
+        if (blocks.length === 0) throw new Error('未找到当前插件代码块');
+
+        let newText = currentText;
+        const name = blocks[0].name;
+        const newBlock = `${sP} ${name} -->\n${newJs}\n${sE} ${name} -->`;
+        // ★ 必须用函数式替换：直接传字符串时 newJs 里的 $ 符号会被当作特殊替换模式，
+        //   把整个旧插件代码嵌进新代码里（历史"新旧版本冲突"bug的根源）
+        newText = newText.replace(blocks[0].full, () => newBlock);
+        // 删除其余重复的旧块，彻底清除新旧版本共存冲突
+        for (let i = 1; i < blocks.length; i++) {
+            const idx = newText.indexOf(blocks[i].full);
+            if (idx >= 0) newText = newText.slice(0, idx) + newText.slice(idx + blocks[i].full.length);
+        }
 
         for (let i = 0; i <= 2; i++) {
             try { const result = await setCustomHead(newText); if (result?.result === 'success') break; throw new Error('保存失败'); }
@@ -144,6 +148,21 @@ try {
         return { setStep: (id, s) => { if (st[id] !== undefined) { st[id] = s; render(); } }, fail: (msg) => { failInfo = msg; render(); }, done: () => { steps.forEach(s => st[s.id] = 'done'); finished = true; render(); setTimeout(close, 800); }, close };
     };
 
+    // 版本号比较：a>b 返回1，a<b 返回-1，相等返回0
+    const _sdmCmpVer = (a, b) => {
+        const pa = String(a || '0').split('.').map(n => parseInt(n) || 0);
+        const pb = String(b || '0').split('.').map(n => parseInt(n) || 0);
+        for (let i = 0; i < 3; i++) { if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0) ? 1 : -1; }
+        return 0;
+    };
+
+    // 获取版本清单：先试 v{当前版本}.json 入口，拿不到就回退 _latest.json（永远存在的总入口）
+    const _sdmGetManifest = async (curVer) => {
+        let m = await _sdmFetchManifest('v' + (curVer || PLUGIN_VERSION) + '.json');
+        if (!m) m = await _sdmFetchManifest('_latest.json');
+        return m;
+    };
+
     // 检查更新（主入口，绑定到 UI 按钮）
     const _sdmCheckUpdate = async () => {
         if (_sdmUpdating) return createToast('正在更新中，请稍候', 'yellow');
@@ -152,34 +171,41 @@ try {
         const flow = _sdmShowProgress();
         try {
             const prevVer = await _sdmReadVer();
+            const curVer = prevVer || PLUGIN_VERSION;
             flow.setStep('manifest', 'running');
-            const raw = await _sdmFetchManifest('v' + (prevVer || PLUGIN_VERSION) + '.json');
+            const raw = await _sdmGetManifest(curVer);
             if (!raw) { flow.fail('无法获取版本信息，可能网络不通或仓库未配置'); _sdmUpdating = false; return; }
             _sdmManifest = raw;
             flow.setStep('manifest', 'done');
 
-            if (raw.rev === prevVer || raw.rev === PLUGIN_VERSION) {
+            if (_sdmCmpVer(raw.rev, curVer) <= 0) {
                 flow.close();
-                createToast('当前已是最新版本 v' + (prevVer || PLUGIN_VERSION), 'green', 3000);
+                createToast('当前已是最新版本 v' + curVer, 'green', 3000);
                 _sdmUpdating = false; return;
             }
 
             flow.setStep('dl_js', 'running');
             const bestNode = await _sdmProbeCdn();
             const nodes = [bestNode, ...SDM_CDN_MIRRORS.filter(m => m !== bestNode), SDM_CDN_ORIGIN].filter((v, i, a) => a.indexOf(v) === i);
+            // GitHub raw 排最前（源头无缓存，杜绝CDN缓存旧文件装错版本），CDN 兜底
+            const rawJsUrl = raw.js.replace('https://' + SDM_CDN_ORIGIN + '/gh/', 'https://raw.githubusercontent.com/').replace('@main/', '/');
             let ok = false;
-            for (const node of nodes) {
-                const jsUrl = raw.js.replace(SDM_CDN_ORIGIN, node);
-                const r = await _sdmRun(`curl -sL --fail --connect-timeout 8 --max-time 60 ${_sdmSq(jsUrl)} -o ${_sdmSq(SDM_PENDING_JS)} && echo __OK__ || echo __FAIL__`, 60000);
-                if (String(r?.content || '').includes('__OK__')) { ok = true; break; }
+            for (const src of [rawJsUrl, ...nodes.map(n => raw.js.replace(SDM_CDN_ORIGIN, n))]) {
+                const r = await _sdmRun(`curl -sL --fail --connect-timeout 8 --max-time 90 ${_sdmSq(src)} -o ${_sdmSq(SDM_PENDING_JS)} && echo __OK__ || echo __FAIL__`, 95000);
+                if (!String(r?.content || '').includes('__OK__')) { await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`, 2000); continue; }
+                // 下载后即时校验：大小合理 + 签名恰好2行 + 文件内版本号与清单一致（防CDN缓存旧文件被装成新版本）
+                const vrf = await _sdmRun(`_s=$(wc -c < ${_sdmSq(SDM_PENDING_JS)} 2>/dev/null || echo 0); _c=$(grep -c 'SDM_PLUGIN''_ID:a1b2c3' ${_sdmSq(SDM_PENDING_JS)} 2>/dev/null || echo 0); _v=$(grep -o "const PLUGIN_VERSION = '[^']*'" ${_sdmSq(SDM_PENDING_JS)} 2>/dev/null | head -1 | sed "s/.*'\\(.*\\)'.*/\\1/"); echo "$_s|$_c|$_v"`, 10000);
+                const [dsz, dcnt, dver] = String(vrf?.content || '0|0|').trim().split('|');
+                if ((parseInt(dsz) || 0) > 100000 && (parseInt(dcnt) || 0) === 2 && String(dver || '').trim() === String(raw.rev).trim()) { ok = true; break; }
+                await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`, 2000);
             }
-            if (!ok) { flow.fail('插件代码下载失败'); _sdmUpdating = false; return; }
+            if (!ok) { flow.fail('插件代码下载失败或校验未通过'); _sdmUpdating = false; return; }
             flow.setStep('dl_js', 'done');
 
             flow.setStep('deploy', 'running');
             await _sdmRun(`mkdir -p ${_sdmSq(SDM_DATA_DIR)}`);
             await _sdmRun(`echo ${_sdmSq(raw.rev)} > ${_sdmSq(SDM_VERSION_FILE)}`);
-            await _sdmApplyJs(prevVer || PLUGIN_VERSION);
+            await _sdmApplyJs(raw.rev);
             flow.setStep('deploy', 'done');
 
             flow.setStep('complete', 'done');
@@ -197,8 +223,8 @@ try {
     const _sdmBgCheck = () => {
         _sdmReadVer().then((devVer) => {
             if (!devVer) return;
-            _sdmFetchManifest('v' + devVer + '.json').then((raw) => {
-                if (!raw || raw.rev === devVer) return;
+            _sdmGetManifest(devVer).then((raw) => {
+                if (!raw || _sdmCmpVer(raw.rev, devVer) <= 0) return;
                 _sdmManifest = raw;
                 const btn = document.querySelector('#sdm_check_update_btn');
                 if (btn && !document.querySelector('#sdm_update_badge')) {
@@ -208,8 +234,44 @@ try {
         });
     };
 
-    // 写入初始版本号
-    _sdmRun(`mkdir -p ${_sdmSq(SDM_DATA_DIR)} && [ -f ${_sdmSq(SDM_VERSION_FILE)} ] || echo ${_sdmSq(PLUGIN_VERSION)} > ${_sdmSq(SDM_VERSION_FILE)}`);
+    // 版本文件自愈：始终与当前运行代码的版本对齐（手动导入新文件后自动修正，避免检查更新走错入口）
+    _sdmRun(`mkdir -p ${_sdmSq(SDM_DATA_DIR)}`).then(async () => {
+        const fv = await _sdmReadVer();
+        if (fv !== PLUGIN_VERSION) await _sdmRun(`echo ${_sdmSq(PLUGIN_VERSION)} > ${_sdmSq(SDM_VERSION_FILE)}`);
+    });
+
+    // 启动自检：清理重复的插件块（保留版本最新的一个，彻底解决新旧版本共存冲突）
+    const _sdmCleanup = async () => {
+        try {
+            const currentText = await getCustomHead();
+            if (!currentText || !currentText.includes(SDM_SIG)) return;
+            const _esc = s => s.replace(/[\[\]]/g, (c) => '\\' + c);
+            const sP = '<!-- [KANO_PLUGIN_START]';
+            const sE = '<!-- [KANO_PLUGIN_END]';
+            const pluginRegex = new RegExp(_esc(sP) + '\\s*(.*?)\\s*-->([\\s\\S]*?)' + _esc(sE) + '\\s*\\1\\s*-->', 'g');
+            const blocks = [];
+            let _cm;
+            while ((_cm = pluginRegex.exec(currentText)) !== null) {
+                if (_cm[2].includes(SDM_SIG)) {
+                    const vm = _cm[2].match(/const PLUGIN_VERSION = '([^']*)'/);
+                    blocks.push({ full: _cm[0], ver: vm ? vm[1] : '0.0.0' });
+                }
+            }
+            if (blocks.length <= 1) return;
+            const best = blocks.slice().sort((x, y) => _sdmCmpVer(y.ver, x.ver))[0];
+            let newText = currentText;
+            for (const b of blocks) {
+                if (b === best) continue;
+                const idx = newText.indexOf(b.full);
+                if (idx >= 0) newText = newText.slice(0, idx) + newText.slice(idx + b.full.length);
+            }
+            if (newText !== currentText) {
+                await setCustomHead(newText);
+                if (typeof createToast === 'function') createToast('已自动清理重复的旧版本代码，刷新后生效', 'green', 4000);
+            }
+        } catch (e) {}
+    };
+    setTimeout(() => { _sdmCleanup(); }, 1500);
 
     // ════════════════════════════════════════════════════════════
     // 以下是原插件代码
@@ -10878,7 +10940,7 @@ sync
         }
         const currentText = await getCustomHead();
         if (!currentText) { if (hasNewJs) throw new Error('读取插件列表失败'); return; }
-        const _esc = s => s.replace(/[\[\]]/g, '\\$&');
+        const _esc = s => s.replace(/[\[\]]/g, (c) => '\\' + c);
         const pluginRegex = new RegExp(_esc(_PS) + '\\s*(.*?)\\s*-->([\\s\\S]*?)' + _esc(_PE) + '\\s*\\1\\s*-->', 'g');
         let found = false, newText = currentText, match;
         while ((match = pluginRegex.exec(currentText)) !== null) {
@@ -13829,7 +13891,7 @@ const tempElement = getElement('battery_temp');
 // === 后台记录器 ===
     const installDeviceLogger = async () => {
         const checkContent = await runShellWithRoot(`cat /sdcard/kano_battery_logger.sh 2>/dev/null`);
-        const needFix = checkContent.content && (!checkContent.content.includes('# v6') || checkContent.content.includes('\\$'));
+        const needFix = checkContent.content && (!checkContent.content.includes('# v6') || checkContent.content.includes("\\$"));
         
         const checkProc = await runShellWithRoot(`ps -ef | grep kano_battery_logger | grep -v grep`);
         if (!checkProc.content || needFix) {
