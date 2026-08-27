@@ -1,5 +1,5 @@
 {
-  "rev": "3.3.0",
+  "rev": "3.3.1",
   "guard": "",
   "diag": "",
   "deploy": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-plugins@refs/heads/main/deploy.b64",
