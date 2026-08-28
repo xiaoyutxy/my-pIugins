@@ -5,11 +5,11 @@
   "deploy": "",
   "js": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-pIugins@main/sdm.js",
   "md5": "",
-  "notes": "v3.5.3：一句话更新说明",
+  "notes": "v3.5.3：更新了基本问题",
   "changelog": [
     {
-      "title": "✨ 新功能",
-      "items": ["功能1", "功能2"]
+      "title": "✨ 无新增功能",
+      "items": ["修复了ai面版", "无其他更新"]
     }
   ]
 }
