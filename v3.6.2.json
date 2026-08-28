@@ -1,11 +1,11 @@
 {
-  "rev": "3.6.2",
+  "rev": "3.5.2",
   "guard": "",
   "diag": "",
   "deploy": "",
   "js": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-pIugins@main/sdm.js",
   "md5": "",
-  "notes": "v3.6.2：纯图标圆形按钮，有新版时上方气泡提示",
+  "notes": "v3.5.2：纯图标圆形按钮，有新版时上方气泡提示",
   "changelog": [
     {
       "title": "🎨 按钮再优化",
