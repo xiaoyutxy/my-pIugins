@@ -8,7 +8,7 @@ try {
     let DIAG_LOG = []
     let SCAN_INTERVAL_MS = 10000
     let _isScanning = false
-    const PLUGIN_VERSION = '3.5.0'
+    const PLUGIN_VERSION = '3.5.1'
 
     // ════════════════════════════════════════════════════════════
     // 自有更新推送机制 ★ 改成你自己的 GitHub 仓库 ★
@@ -7136,28 +7136,51 @@ try {
         // 打开 PicoClaw 面板
         var openPanelBtn = document.getElementById('picoclaw_open_panel')
         if (openPanelBtn) {
-            openPanelBtn.onclick = function() {
+            openPanelBtn.onclick = async function() {
+                // 按钮点击反馈
+                openPanelBtn.textContent = '检测中...';
+                openPanelBtn.style.opacity = '0.6';
+                // 重新检测状态
+                await checkPicoClawStatus();
+                openPanelBtn.textContent = '打开面板';
+                openPanelBtn.style.opacity = '1';
+                // 根据最新状态切换视图
                 if (_picoclawConfigured) {
-                    // 配置了就显示聊天
-                    showChatView('chat')
+                    showChatView('chat');
+                    var chatInput = document.getElementById('chat_input');
+                    if (chatInput) chatInput.focus();
+                    showToast('AI 聊天已就绪', 'green', 2000);
                 } else if (_picoclawInstalled) {
-                    // 安装了但没配置，显示本地工具箱
-                    showChatView('local')
+                    // 已安装但没配置，显示配置页而不是本地工具箱
+                    showChatView('config');
+                    var cfgInput = document.getElementById('pc_config_api_input');
+                    if (cfgInput) cfgInput.focus();
+                    showToast('请配置 API Key 后使用', 'yellow', 2500);
                 } else {
-                    // 没安装显示安装页
-                    showChatView('install')
+                    // 没安装，显示安装页并滚动到安装按钮
+                    showChatView('install');
+                    var installBtn = document.getElementById('pc_oneclick_install_btn');
+                    if (installBtn) {
+                        installBtn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        installBtn.style.animation = 'smart_action_ripple 0.6s ease';
+                        setTimeout(function() { installBtn.style.animation = ''; }, 600);
+                    }
+                    showToast('PicoClaw 未安装，请先安装', 'red', 2500);
                 }
             }
         }
 
         // 打开 PicoClaw 面板的通用函数（兼容旧调用）
-        var openPicoClawPanel = function() {
+        var openPicoClawPanel = async function() {
+            await checkPicoClawStatus();
             if (_picoclawConfigured) {
-                showChatView('chat')
+                showChatView('chat');
+                var chatInput = document.getElementById('chat_input');
+                if (chatInput) chatInput.focus();
             } else if (_picoclawInstalled) {
-                showChatView('local')
+                showChatView('config');
             } else {
-                showChatView('install')
+                showChatView('install');
             }
         }
 
