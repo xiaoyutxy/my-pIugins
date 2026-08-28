@@ -8,7 +8,7 @@ try {
     let DIAG_LOG = []
     let SCAN_INTERVAL_MS = 10000
     let _isScanning = false
-    const PLUGIN_VERSION = '3.5.1'
+    const PLUGIN_VERSION = '3.5.2'
 
     // ════════════════════════════════════════════════════════════
     // 自有更新推送机制 ★ 改成你自己的 GitHub 仓库 ★
@@ -221,7 +221,7 @@ try {
             if (_sdmCmpVer(raw.rev, curVer) <= 0) {
                 flow.close();
                 createToast('当前已是最新版本 v' + curVer, 'green', 3000);
-                if (btn) { btn.classList.remove('has-update'); const bdg = document.querySelector('#sdm_update_badge'); if (bdg) bdg.remove(); }
+                if (btn) { btn.classList.remove('has-update'); const icon = btn.querySelector('.sdm-btn-icon'); if (icon) icon.textContent = '📦'; const bdg = document.querySelector('#sdm_update_badge'); if (bdg) bdg.remove(); }
                 _sdmUpdating = false; if (btn) btn.classList.remove('loading'); return;
             }
 
@@ -270,6 +270,8 @@ try {
                 const btn = document.querySelector('#sdm_check_update_btn');
                 if (btn) {
                     btn.classList.add('has-update');
+                    const icon = btn.querySelector('.sdm-btn-icon');
+                    if (icon) icon.textContent = '🎉';
                     if (!document.querySelector('#sdm_update_badge')) {
                         btn.insertAdjacentHTML('beforeend', `<span id="sdm_update_badge" class="sdm-update-badge">NEW</span>`);
                     }
@@ -1782,19 +1784,39 @@ try {
 }
 @keyframes smart_action_ripple{0%{transform:scale(0);opacity:.6}100%{transform:scale(2.5);opacity:0}}
 @keyframes sdm_pulse{0%,100%{transform:scale(1);box-shadow:0 2px 6px rgba(239,68,68,.4)}50%{transform:scale(1.1);box-shadow:0 3px 12px rgba(239,68,68,.6)}}
-@keyframes sdm_btn_breath{0%,100%{box-shadow:0 2px 8px rgba(52,211,153,.35),0 0 0 0 rgba(52,211,153,.4)}50%{box-shadow:0 3px 14px rgba(52,211,153,.5),0 0 12px 2px rgba(52,211,153,.35)}}
-@keyframes sdm_btn_shine{0%{background-position:-200% center}100%{background-position:200% center}}
-@keyframes sdm_btn_new_pulse{0%,100%{box-shadow:0 2px 8px rgba(239,68,68,.4),0 0 0 0 rgba(239,68,68,.5);transform:scale(1)}25%{transform:scale(1.03)}50%{box-shadow:0 4px 18px rgba(239,68,68,.6),0 0 20px 4px rgba(245,158,11,.45);transform:scale(1.06)}75%{transform:scale(1.03)}}
+@keyframes sdm_btn_breath{0%,100%{box-shadow:0 2px 8px rgba(255,255,255,.1),inset 0 1px 0 rgba(255,255,255,.2)}50%{box-shadow:0 3px 14px rgba(255,255,255,.15),inset 0 1px 0 rgba(255,255,255,.3)}}
 @keyframes sdm_spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
-@keyframes sdm_badge_bounce{0%,100%{transform:scale(1)}50%{transform:scale(1.15)}}
-.sdm-check-btn{font-size:.45rem;font-weight:bold;margin-left:6px;cursor:pointer;background:linear-gradient(135deg,#34d399,#10b981,#059669,#34d399);background-size:300% 100%;color:white;padding:4px 14px;border-radius:14px;box-shadow:0 2px 8px rgba(52,211,153,.35);border:1px solid rgba(255,255,255,.25);transition:all .25s ease;display:inline-flex;align-items:center;gap:4px;user-select:none;animation:sdm_btn_breath 2.5s ease-in-out infinite,sdm_btn_shine 4s linear infinite;position:relative;overflow:hidden}
-.sdm-check-btn:hover{transform:scale(1.06);box-shadow:0 4px 16px rgba(52,211,153,.55)}
-.sdm-check-btn:active{transform:scale(.94)}
-.sdm-check-btn.has-update{background:linear-gradient(135deg,#f59e0b,#ef4444,#dc2626,#f59e0b);background-size:300% 100%;border-color:rgba(255,255,255,.3);animation:sdm_btn_new_pulse 1.8s ease-in-out infinite,sdm_btn_shine 2.5s linear infinite}
-.sdm-check-btn.has-update:hover{transform:scale(1.08);box-shadow:0 5px 20px rgba(239,68,68,.6)}
-.sdm-check-btn .sdm-btn-icon{display:inline-flex;align-items:center;justify-content:center}
+@keyframes sdm_star_sparkle{0%,100%{opacity:0;transform:scale(0) rotate(0deg)}50%{opacity:1;transform:scale(1) rotate(180deg)}}
+@keyframes sdm_float_up{0%{opacity:0;transform:translateY(8px) scale(.8)}40%{opacity:.8}100%{opacity:0;transform:translateY(-12px) scale(1)}}
+@keyframes sdm_ring_pulse{0%{box-shadow:0 0 0 0 rgba(251,191,36,.6)}70%{box-shadow:0 0 0 8px rgba(251,191,36,0)}100%{box-shadow:0 0 0 0 rgba(251,191,36,0)}}
+@keyframes sdm_bounce_in{0%{transform:scale(0)}50%{transform:scale(1.2)}100%{transform:scale(1)}}
+@keyframes sdm_shake{0%,100%{transform:translateX(0) rotate(0)}25%{transform:translateX(-1px) rotate(-2deg)}75%{transform:translateX(1px) rotate(2deg)}}
+@keyframes sdm_glow_line{0%,100%{opacity:.3}50%{opacity:.8}}
+.sdm-check-btn{font-size:.45rem;font-weight:600;margin-left:6px;cursor:pointer;background:rgba(255,255,255,.06);color:#e2e8f0;padding:3px;border-radius:50%;box-shadow:0 2px 8px rgba(0,0,0,.15),inset 0 1px 0 rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.12);transition:all .25s cubic-bezier(.34,1.56,.64,1);display:inline-flex;align-items:center;justify-content:center;user-select:none;position:relative;overflow:visible;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);width:28px;height:28px;flex-shrink:0;vertical-align:middle}
+.sdm-check-btn .sdm-btn-icon-wrap{width:22px;height:22px;border-radius:50%;background:rgba(99,102,241,.15);display:flex;align-items:center;justify-content:center;flex-shrink:0;position:relative;border:1px solid rgba(99,102,241,.25)}
+.sdm-check-btn .sdm-btn-icon{font-size:.55rem;display:inline-flex;align-items:center;justify-content:center}
+.sdm-check-btn::before{content:'';position:absolute;inset:0;border-radius:50%;padding:1px;background:linear-gradient(135deg,rgba(99,102,241,.4),rgba(147,197,253,.2),rgba(99,102,241,.4));-webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);-webkit-mask-composite:xor;mask-composite:exclude;opacity:.6;pointer-events:none}
+.sdm-check-btn:hover{transform:translateY(-1px) scale(1.1);background:rgba(255,255,255,.1);box-shadow:0 4px 16px rgba(99,102,241,.3),inset 0 1px 0 rgba(255,255,255,.15)}
+.sdm-check-btn:hover .sdm-btn-icon-wrap{background:rgba(99,102,241,.25);transform:rotate(15deg) scale(1.1)}
+.sdm-check-btn:active{transform:translateY(0) scale(.92)}
+.sdm-check-btn .sdm-deco-1,.sdm-check-btn .sdm-deco-2{position:absolute;font-size:.28rem;pointer-events:none;opacity:0;animation:sdm_star_sparkle 3s ease-in-out infinite}
+.sdm-check-btn .sdm-deco-1{top:-3px;right:-1px;animation-delay:.5s}
+.sdm-check-btn .sdm-deco-2{bottom:-2px;left:0px;animation-delay:1.5s}
+.sdm-update-tip{position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%) translateY(4px);background:rgba(251,191,36,.95);color:#1a1a2e;font-size:.32rem;font-weight:700;padding:3px 8px;border-radius:8px;white-space:nowrap;opacity:0;pointer-events:none;transition:all .3s cubic-bezier(.34,1.56,.64,1);box-shadow:0 3px 10px rgba(251,191,36,.4);z-index:10}
+.sdm-update-tip::after{content:'';position:absolute;top:100%;left:50%;transform:translateX(-50%);border:4px solid transparent;border-top-color:rgba(251,191,36,.95)}
+.sdm-check-btn.has-update{background:rgba(251,191,36,.1);border-color:rgba(251,191,36,.3);animation:sdm_ring_pulse 2s ease-out infinite}
+.sdm-check-btn.has-update::before{background:linear-gradient(135deg,rgba(251,191,36,.5),rgba(249,115,22,.4),rgba(251,191,36,.5));opacity:.8}
+.sdm-check-btn.has-update .sdm-btn-icon-wrap{background:rgba(251,191,36,.2);border-color:rgba(251,191,36,.4);animation:sdm_shake 1.5s ease-in-out infinite}
+.sdm-check-btn.has-update .sdm-btn-icon{animation:none}
+.sdm-check-btn.has-update .sdm-btn-icon-wrap .sdm-btn-icon{font-size:.6rem}
+.sdm-check-btn.has-update .sdm-deco-1{animation-duration:1.5s;animation-delay:0s}
+.sdm-check-btn.has-update .sdm-deco-2{animation-duration:1.5s;animation-delay:.7s}
+.sdm-check-btn.has-update .sdm-update-tip{opacity:1;transform:translateX(-50%) translateY(0);animation:sdm_tip_float 2s ease-in-out infinite}
+@keyframes sdm_tip_float{0%,100%{transform:translateX(-50%) translateY(0)}50%{transform:translateX(-50%) translateY(-3px)}}
+.sdm-check-btn.has-update:hover{background:rgba(251,191,36,.15);box-shadow:0 4px 18px rgba(251,191,36,.35),inset 0 1px 0 rgba(255,255,255,.1)}
 .sdm-check-btn.loading .sdm-btn-icon{animation:sdm_spin 1s linear infinite}
-.sdm-update-badge{font-size:.36rem;color:white;font-weight:700;background:linear-gradient(135deg,#fff,#fef3c7);color:#dc2626;padding:1px 6px;border-radius:8px;box-shadow:0 2px 6px rgba(0,0,0,.2);animation:sdm_badge_bounce 1.2s ease-in-out infinite;margin-left:2px;line-height:1.3}
+.sdm-update-badge{position:absolute;top:-4px;right:-4px;font-size:.28rem;color:#fff;font-weight:800;background:rgba(239,68,68,.9);padding:0 5px;border-radius:10px;border:1px solid rgba(255,255,255,.5);line-height:1.5;z-index:5;animation:sdm_bounce_in .5s cubic-bezier(.34,1.56,.64,1);box-shadow:0 2px 6px rgba(239,68,68,.4)}
+.sdm-update-badge::before{content:'';position:absolute;inset:0;border-radius:10px;box-shadow:0 0 8px rgba(251,191,36,.6);animation:sdm_ring_pulse 1.5s ease-out infinite}
 @keyframes sdm_changelog_pop{0%{transform:scale(.8);opacity:0}100%{transform:scale(1);opacity:1}}
 @keyframes sdm_changelog_shine{0%{background-position:-100% 0}100%{background-position:200% 0}}
 .sdm-changelog-mask{position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(6px);z-index:10000;display:flex;align-items:center;justify-content:center;animation:sdm_fade_in .3s ease}
@@ -1920,7 +1942,7 @@ try {
         <strong class="smart-grad-text">🌸 智能设备管理器</strong>
         <span style="font-size:.4rem;opacity:.8;margin-left:6px;background:linear-gradient(135deg,#ff9ecd,#c44fc4);color:white;padding:2px 8px;border-radius:10px;box-shadow:0 2px 6px rgba(255,158,205,.3);">用户插件</span>
         <span style="font-size:.55rem;font-weight:bold;margin-left:8px;background:linear-gradient(135deg,#3b82f6,#1d4ed8);color:white;padding:2px 10px;border-radius:10px;box-shadow:0 2px 8px rgba(59,130,246,.4);border:1px solid rgba(147,197,253,.3);">📦 v${PLUGIN_VERSION}</span>
-        <span id="sdm_check_update_btn" class="sdm-check-btn"><span class="sdm-btn-icon">🔄</span>检查更新</span>
+        <span id="sdm_check_update_btn" class="sdm-check-btn" title="检查更新"><span class="sdm-btn-icon-wrap"><span class="sdm-btn-icon">📦</span></span><span class="sdm-deco-1">✨</span><span class="sdm-deco-2">💫</span><span class="sdm-update-tip">有新版！</span></span>
         <span style="font-size:.4rem;opacity:.35;margin-left:4px">QQ 1085465022</span>
         <span style="display:inline-flex;align-items:center;gap:3px;margin-left:6px;vertical-align:middle;">
             <span style="font-size:.4rem;opacity:.5;">作者</span>
