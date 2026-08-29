@@ -1,15 +1,15 @@
 {
-  "rev": "3.5.4",
+  "rev": "3.5.3",
   "guard": "",
   "diag": "",
   "deploy": "",
   "js": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-pIugins@main/sdm.js",
   "md5": "",
-  "notes": "v3.5.4：更新了基本问题",
+  "notes": "v3.5.3：一句话更新说明",
   "changelog": [
     {
-      "title": "✨ 无新增功能",
-      "items": ["修复了ai面版", "无其他更新"]
+      "title": "✨ 其他",
+      "items": ["无", "无"]
     }
   ]
 }
