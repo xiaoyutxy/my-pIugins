@@ -2086,6 +2086,7 @@ html.sdm-no-fx .sdm-check-btn.loading .sdm-btn-icon{animation:sdm_spin 1s linear
     <div class="sdm2-title-underline"></div>
     <div class="title" style="margin:6px 0;">
         <span id="sdm_check_update_btn" class="sdm-check-btn" title="检查更新"><span class="sdm-btn-icon-wrap"><span class="sdm-btn-icon">📦</span></span><span class="sdm-deco-1">✨</span><span class="sdm-deco-2">💫</span><span class="sdm-update-tip">有新版！</span></span>
+        <span id="sdm_version_badge" title="当前插件版本" style="display:inline-block;vertical-align:middle;font-size:.45rem;font-weight:bold;color:#fff;margin-left:6px;background:linear-gradient(135deg,#a78bfa,#f472b6);padding:2px 9px;border-radius:10px;box-shadow:0 1px 6px rgba(244,114,182,.35);border:1px solid rgba(255,214,232,.35);letter-spacing:.5px;opacity:.92;">v${PLUGIN_VERSION}</span>
         <span style="font-size:.4rem;opacity:.35;margin-left:4px">QQ 1085465022</span>
         <span style="display:inline-flex;align-items:center;gap:3px;margin-left:6px;vertical-align:middle;">
             <span style="font-size:.4rem;opacity:.5;">作者</span>
@@ -2190,7 +2191,7 @@ html.sdm-no-fx .sdm-check-btn.loading .sdm-btn-icon{animation:sdm_spin 1s linear
             </div>
         </div>
         <div id="SMART_action_box" style="margin-bottom:10px;display:flex;gap:8px;flex-wrap:wrap"></div>
-        <div style="margin-top:8px;text-align:right;font-size:.45rem;opacity:.75;">Smart Device Manager <span style="font-weight:bold;background:linear-gradient(135deg,#c084fc,#ff6fae);background-size:200% 100%;animation:sdm2_rainbow_flow 5s linear infinite;color:white;padding:1px 8px;border-radius:8px;font-size:.45rem;box-shadow:0 1px 8px rgba(255,111,174,.4);border:1px solid rgba(255,214,232,.35);">v${PLUGIN_VERSION}</span> <span style="opacity:.6;">QQ 1085465022</span> <span class="sdm2-chip-star">🌸</span></div>
+        <div style="margin-top:8px;text-align:right;font-size:.45rem;opacity:.75;">Smart Device Manager <span style="opacity:.6;">QQ 1085465022</span> <span class="sdm2-chip-star">🌸</span></div>
     </div>
     </div>
     </div>`)
