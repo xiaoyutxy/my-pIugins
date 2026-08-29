@@ -1,16 +1,16 @@
 {
-    "rev": "3.5.7",
+    "rev": "3.5.8",
     "guard": "",
     "diag": "",
     "deploy": "",
-    "js": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-pIugins@main/sdm.js",
+    "js": "https://raw.githubusercontent.com/xiaoyutxy/my-pIugins/main/sdm.js",
     "md5": "",
-    "notes": "接回官方版本序列，合并特效精简与更新诊断改动",
+    "notes": "修复致命bug：下载sdm.js时版本号必须严格匹配清单rev（否则CDN旧版会覆盖新功能）；清单js字段改指向raw源头（无缓存即时生效）",
     "changelog": [
         {
             "title": "📦 本次更新",
             "items": [
-                "接回官方版本序列，合并特效精简与更新诊断改动"
+                "修复致命bug：下载sdm.js时版本号必须严格匹配清单rev（否则CDN旧版会覆盖新功能）；清单js字段改指向raw源头（无缓存即时生效）"
             ]
         }
     ]
