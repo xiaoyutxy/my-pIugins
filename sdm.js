@@ -2075,6 +2075,11 @@ html.sdm-no-fx *,html.sdm-no-fx *::before,html.sdm-no-fx *::after{animation-dura
 html.sdm-no-fx #smart_sakura_toggle{animation-duration:1ms !important;animation-delay:0s !important;animation-iteration-count:1 !important}
 html.sdm-no-fx #smart_sakura_container,html.sdm-no-fx #smart_sakura_canvas{display:none !important}
 html.sdm-no-fx #smart_fx_toggle{background:linear-gradient(135deg,#64748b,#475569,#334155) !important;box-shadow:none !important}
+/* 兜底：基础样式 opacity:0、全靠动画点亮的元素，关特效后改为静态常显（只是不闪，不消失） */
+html.sdm-no-fx .sdm-check-btn .sdm-deco-1{opacity:.9 !important;transform:scale(1) rotate(15deg) !important}
+html.sdm-no-fx .sdm-check-btn .sdm-deco-2{opacity:.9 !important;transform:scale(1) rotate(-15deg) !important}
+/* 功能性反馈不受开关影响：loading 时仍要转，否则看不出在加载 */
+html.sdm-no-fx .sdm-check-btn.loading .sdm-btn-icon{animation:sdm_spin 1s linear infinite !important}
 </style><div id="smart_sakura_container"><canvas id="smart_sakura_canvas"></canvas></div>
 <div id="IFRAME_SMART" style="width:100%;margin-top:10px;">
     <div class="sdm2-banner"><div class="sdm2-banner-text">✧･ﾟ: *✧･ﾟ♡ 智能设备管理器 · Sakura Dream Ver ♡ﾟ･* :･ﾟ✧</div><div class="sdm2-banner-sub">🌸 星空下的梦幻设备魔法阵 · 萌力全开中 🌸</div></div>
