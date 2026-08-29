@@ -1,14 +1,14 @@
 {
-  "rev": "3.5.4",
+  "rev": "3.5.5",
   "guard": "",
   "diag": "",
   "deploy": "",
   "js": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-pIugins@main/sdm.js",
   "md5": "",
-  "notes": "v3.5.4：一句话更新说明",
+  "notes": "v3.5.4：修复bug",
   "changelog": [
     {
-      "title": "✨ 其他",
+      "title": "✨ 修复了已知bug",
       "items": ["无", "无"]
     }
   ]
