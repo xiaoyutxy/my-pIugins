@@ -8,7 +8,7 @@ try {
     let DIAG_LOG = []
     let SCAN_INTERVAL_MS = 10000
     let _isScanning = false
-    const PLUGIN_VERSION = '3.5.3'
+    const PLUGIN_VERSION = '3.5.4'
 
     // ════════════════════════════════════════════════════════════
     // 自有更新推送机制 ★ 改成你自己的 GitHub 仓库 ★
@@ -1936,12 +1936,150 @@ try {
   transition:opacity .2s;
 }
 .sm-minimize-btn:hover{opacity:1;}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║  🌸✨ 二次元美化主题 · Sakura Dream Ver. ✨🌸                        ║
+   ║  粉紫梦幻配色 · 彩虹流光边框 · 星光闪烁 · 糖果按钮 · 樱花猫爪      ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+/* ── 🌟 二次元专用动画库 ── */
+@keyframes sdm2_rainbow_flow{0%{background-position:0% 50%}100%{background-position:300% 50%}}
+@keyframes sdm2_star_twinkle{0%,100%{opacity:.25;transform:scale(.7) rotate(0deg)}50%{opacity:1;transform:scale(1.3) rotate(180deg)}}
+@keyframes sdm2_heart_float{0%{opacity:0;transform:translateY(0) scale(.6)}15%{opacity:1}85%{opacity:.8}100%{opacity:0;transform:translateY(-48px) scale(1.2)}}
+@keyframes sdm2_shine_sweep{0%{transform:translateX(-130%) skewX(-18deg)}100%{transform:translateX(340%) skewX(-18deg)}}
+@keyframes sdm2_bounce_hover{0%,100%{transform:translateY(0)}50%{transform:translateY(-4px)}}
+@keyframes sdm2_glow_breath{0%,100%{box-shadow:0 0 12px rgba(255,158,205,.28),0 0 26px rgba(167,139,250,.16)}50%{box-shadow:0 0 22px rgba(255,158,205,.5),0 0 44px rgba(167,139,250,.34)}}
+@keyframes sdm2_wiggle{0%,100%{transform:rotate(-2.5deg)}50%{transform:rotate(2.5deg)}}
+@keyframes sdm2_float_soft{0%,100%{transform:translateY(0)}50%{transform:translateY(-5px)}}
+@keyframes sdm2_hue_shift{0%{filter:hue-rotate(0deg)}100%{filter:hue-rotate(360deg)}}
+@keyframes sdm2_pet_dance{0%,100%{transform:scale(1) rotate(0deg)}25%{transform:scale(1.12) rotate(-7deg)}75%{transform:scale(1.12) rotate(7deg)}}
+@keyframes sdm2_border_spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}
+@keyframes sdm2_ribbon_wave{0%,100%{background-position:0% 50%}50%{background-position:100% 50%}}
+@keyframes sdm2_bg_aurora{0%,100%{background-position:0% 0%,100% 100%}50%{background-position:100% 0%,0% 100%}}
+@keyframes sdm2_sparkle_pop{0%{opacity:0;transform:scale(0)}50%{opacity:1;transform:scale(1.4)}100%{opacity:0;transform:scale(.9) translateY(-8px)}}
+@keyframes sdm2_cat_paw{0%,100%{opacity:.35;transform:scale(1)}50%{opacity:.75;transform:scale(1.06)}}
+
+/* ── 🎀 二次元梦幻容器背景（主面板整体） ── */
+#IFRAME_SMART{position:relative;border-radius:16px;background:linear-gradient(160deg,rgba(255,158,205,.05),rgba(167,139,250,.04) 45%,rgba(125,211,252,.05));background-size:200% 200%;animation:sdm2_bg_aurora 14s ease-in-out infinite;padding-bottom:6px}
+#IFRAME_SMART .title strong.smart-grad-text{font-size:1rem;letter-spacing:1px}
+
+/* ── 🌈 二次元流光边框卡片 ── */
+.sdm2-card{position:relative;overflow:hidden}
+.sdm2-card::before{content:'';position:absolute;inset:0;border-radius:inherit;padding:1.5px;background:linear-gradient(90deg,#ff9ecd,#c084fc,#7dd3fc,#86efac,#fde68a,#ff9ecd);background-size:300% 100%;animation:sdm2_rainbow_flow 5s linear infinite;-webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);-webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none;z-index:2;opacity:.85}
+.sdm2-card::after{content:'';position:absolute;top:0;left:0;width:45%;height:100%;background:linear-gradient(105deg,transparent,rgba(255,255,255,.15),transparent);animation:sdm2_shine_sweep 3.8s ease-in-out infinite;pointer-events:none;z-index:1}
+.sdm2-card:hover{animation:sdm2_bounce_hover 1.1s ease-in-out infinite}
+
+/* ── ✨ 二次元发光标题（摇摆+光晕） ── */
+.sdm2-title-glow{position:relative;display:inline-block;text-shadow:0 0 14px rgba(255,158,205,.6),0 0 28px rgba(167,139,250,.4) !important;animation:sdm2_wiggle 3.2s ease-in-out infinite}
+.sdm2-title-glow::after{content:'✨';position:absolute;top:-8px;right:-16px;font-size:.6rem;animation:sdm2_star_twinkle 2s ease-in-out infinite}
+.sdm2-title-glow::before{content:'🎀';position:absolute;top:-9px;left:-18px;font-size:.65rem;animation:sdm2_pet_dance 2.6s ease-in-out infinite}
+
+/* ── 🌟 装饰角标（星星·猫爪·爱心漂浮） ── */
+.sdm2-deco{position:absolute;pointer-events:none;z-index:3;animation:sdm2_star_twinkle 2.2s ease-in-out infinite;filter:drop-shadow(0 0 5px rgba(255,158,205,.7))}
+.sdm2-deco.d1{top:-4px;right:10px;animation-delay:.2s}
+.sdm2-deco.d2{top:-5px;right:36px;animation-delay:.9s;font-size:.6rem}
+.sdm2-deco.d3{bottom:-2px;right:16px;animation-delay:1.5s;font-size:.55rem}
+.sdm2-paw{position:absolute;bottom:4px;left:8px;font-size:.55rem;opacity:.5;pointer-events:none;z-index:3;animation:sdm2_cat_paw 2.8s ease-in-out infinite;filter:drop-shadow(0 0 4px rgba(125,211,252,.6))}
+
+/* ── 🎊 二次元横幅（欢迎横幅·彩虹丝带） ── */
+.sdm2-banner{position:relative;overflow:hidden;margin:2px 0 10px;padding:10px 14px;border-radius:16px;border:1px solid rgba(255,158,205,.35);background:linear-gradient(105deg,rgba(255,158,205,.15),rgba(196,164,252,.12),rgba(125,211,252,.13),rgba(134,239,172,.1),rgba(253,230,138,.12),rgba(255,158,205,.15));background-size:200% 100%;animation:sdm2_ribbon_wave 8s linear infinite;box-shadow:0 4px 18px rgba(255,158,205,.18)}
+.sdm2-banner::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,#ff9ecd,#a78bfa,#7dd3fc,#86efac,#fde68a,#ff9ecd);background-size:300% 100%;animation:sdm2_rainbow_flow 4s linear infinite}
+.sdm2-banner::after{content:'';position:absolute;top:0;left:0;width:40%;height:100%;background:linear-gradient(105deg,transparent,rgba(255,255,255,.18),transparent);animation:sdm2_shine_sweep 4.5s ease-in-out infinite}
+.sdm2-banner-text{position:relative;z-index:2;text-align:center;font-size:.62rem;font-weight:bold;letter-spacing:2px;color:#ffd6e8;background:linear-gradient(90deg,#ff9ecd,#c084fc,#7dd3fc,#86efac,#fde68a,#ff9ecd);background-size:300% 100%;animation:sdm2_rainbow_flow 6s linear infinite;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;filter:drop-shadow(0 0 8px rgba(255,158,205,.45))}
+@supports not (background-clip:text){.sdm2-banner-text{color:#ff9ecd;-webkit-text-fill-color:#ff9ecd}}
+.sdm2-banner-sub{position:relative;z-index:2;text-align:center;font-size:.42rem;opacity:.65;margin-top:3px;color:#e9d5ff;letter-spacing:1px}
+
+/* ── 🍬 糖果按钮增强（弹跳+光晕+光泽） ── */
+.smart_action_btn{position:relative;overflow:hidden;box-shadow:0 3px 14px rgba(255,158,205,.25),inset 0 1px 0 rgba(255,255,255,.25) !important;text-shadow:0 1px 3px rgba(255,255,255,.25)}
+.smart_action_btn:hover{animation:sdm2_bounce_hover .9s ease-in-out infinite;transform:scale(1.05)}
+.smart_action_btn::after{content:'';position:absolute;top:0;left:0;width:50%;height:100%;background:linear-gradient(105deg,transparent,rgba(255,255,255,.35),transparent);animation:sdm2_shine_sweep 2.8s ease-in-out infinite;pointer-events:none;transform:none !important;border-radius:0 !important}
+
+/* ── 💎 二次元徽章芯片（呼吸光晕） ── */
+.sdm2-chip{animation:sdm2_glow_breath 2.8s ease-in-out infinite;position:relative}
+.sdm2-chip-star{display:inline-block;animation:sdm2_star_twinkle 1.8s ease-in-out infinite}
+
+/* ── 🌸 樱花开关按钮二次元化 ── */
+#smart_sakura_toggle{animation:sdm2_pet_dance 2.4s ease-in-out infinite, sdm2_glow_breath 3.2s ease-in-out infinite !important}
+
+/* ── 💕 漂浮爱心装饰 ── */
+.sdm2-hearts{position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:3}
+.sdm2-hearts span{position:absolute;bottom:0;font-size:.55rem;animation:sdm2_heart_float 4.5s ease-in-out infinite;opacity:0;filter:drop-shadow(0 0 4px rgba(255,110,180,.7))}
+
+/* ── 🌠 星光闪粉层（卡片角落装饰组） ── */
+.sdm2-sparkles{position:absolute;inset:0;pointer-events:none;z-index:3}
+.sdm2-sparkles i{position:absolute;font-style:normal;font-size:.5rem;animation:sdm2_sparkle_pop 3s ease-in infinite;opacity:0;filter:drop-shadow(0 0 5px rgba(253,224,71,.8))}
+
+/* ── 📜 二次元滚动条美化 ── */
+#IFRAME_SMART ::-webkit-scrollbar{width:6px;height:6px}
+#IFRAME_SMART ::-webkit-scrollbar-track{background:rgba(255,158,205,.06);border-radius:3px}
+#IFRAME_SMART ::-webkit-scrollbar-thumb{background:linear-gradient(180deg,#ff9ecd,#a78bfa);border-radius:3px;box-shadow:0 0 6px rgba(255,158,205,.5)}
+#IFRAME_SMART ::-webkit-scrollbar-thumb:hover{background:linear-gradient(180deg,#c084fc,#ff6fae)}
+
+/* ── 🖋 二次元选中文本 ── */
+#IFRAME_SMART ::selection{background:rgba(255,158,205,.45);color:#fff;text-shadow:0 0 8px rgba(255,255,255,.6)}
+
+/* ── 🧸 输入框/文本域二次元化 ── */
+#smart_log_area,#smart_diag_log{background:linear-gradient(135deg,rgba(20,12,28,.5),rgba(30,18,44,.4)) !important;border:1px solid rgba(192,132,252,.25) !important;color:rgba(255,214,232,.75) !important;caret-color:#ff9ecd}
+#smart_log_area:focus,#smart_diag_log:focus{border-color:rgba(255,158,205,.45) !important;box-shadow:0 0 14px rgba(255,158,205,.2)}
+
+/* ── 🎀 下拉框二次元化 ── */
+#smart_scan_interval{background:rgba(255,158,205,.1) !important;border:1px solid rgba(192,132,252,.3) !important;color:#ffd6e8 !important}
+#smart_scan_interval option{background:#1e1230;color:#ffd6e8}
+
+/* ── 🌟 设备列表卡片二次元化（扫描列表条目悬浮效果） ── */
+#smart_scan_list>div{transition:all .25s cubic-bezier(.34,1.56,.64,1) !important;border:1px solid rgba(255,158,205,.1) !important}
+#smart_scan_list>div:hover{transform:translateX(4px) scale(1.01);border-color:rgba(255,158,205,.35) !important;background:rgba(255,158,205,.08) !important;box-shadow:0 3px 14px rgba(255,158,205,.2)}
+
+/* ── ✨ 品牌徽章呼吸光 ── */
+#smart_scan_list div[style*="width:36px"]{animation:sdm2_glow_breath 3.4s ease-in-out infinite}
+
+/* ── 💫 collapse_box 内部容器统一柔化 ── */
+#IFRAME_SMART .collapse_box{border-radius:16px}
+#IFRAME_SMART .collapse{transition:height .35s cubic-bezier(.34,1.56,.64,1)}
+
+/* ── 🌈 版本号徽章彩虹化 ── */
+#IFRAME_SMART .title>span[style*="linear-gradient(135deg,#3b82f6"]{background:linear-gradient(135deg,#a78bfa,#ff6fae) !important;box-shadow:0 2px 12px rgba(255,111,174,.4) !important;border:1px solid rgba(255,214,232,.4) !important;animation:sdm2_glow_breath 3s ease-in-out infinite}
+
+/* ── 🌠 音乐面板二次元加强（仅视觉层覆盖） ── */
+#smart_music_panel{box-shadow:0 12px 50px rgba(0,0,0,.65),0 0 0 1px rgba(255,158,205,.25),0 0 36px rgba(255,158,205,.22) !important;border:1px solid rgba(255,182,193,.4) !important}
+#smart_music_panel .sm-btn{transition:all .22s cubic-bezier(.34,1.56,.64,1)}
+#smart_music_panel .sm-btn:hover{transform:translateY(-2px) scale(1.06);filter:brightness(1.15)}
+#smart_music_panel .sm-btn:active{transform:scale(.94)}
+#smart_music_panel .sm-tab._active{box-shadow:0 0 12px rgba(255,158,205,.35)}
+
+/* ── 🌠 AI 面板二次元加强 ── */
+#smart_ai_panel{box-shadow:0 12px 55px rgba(0,0,0,.7),0 0 0 1px rgba(192,132,252,.3),0 0 40px rgba(167,139,250,.25) !important;border:1px solid rgba(216,180,254,.4) !important}
+#smart_ai_fab{box-shadow:0 4px 22px rgba(167,139,250,.55),0 0 0 2px rgba(216,180,254,.3),0 0 18px rgba(255,158,205,.35) !important;animation:sdm2_glow_breath 3.6s ease-in-out infinite}
+#smart_ai_fab:hover{transform:scale(1.12) rotate(8deg)}
+
+/* ── 🎀 信号监控二次元化（视觉覆盖） ── */
+#SIGNAL_MONITOR .btn{border-radius:10px !important;transition:all .22s cubic-bezier(.34,1.56,.64,1)}
+#SIGNAL_MONITOR .btn:hover{transform:translateY(-2px);filter:brightness(1.2)}
+#SIGNAL_MONITOR .kfk_cards>div{border:1px solid rgba(255,158,205,.15) !important;border-radius:14px !important;transition:all .25s ease}
+#SIGNAL_MONITOR .kfk_cards>div:hover{border-color:rgba(255,158,205,.4) !important;box-shadow:0 4px 16px rgba(255,158,205,.22);transform:translateY(-2px)}
+#update_interval_select{background:rgba(30,18,44,.9) !important;color:#ffd6e8 !important;border:1px solid rgba(192,132,252,.35) !important;border-radius:8px !important}
+
+/* ── 🌟 电池监控容器二次元化 ── */
+#BATTERY_PRO_CONTAINER{filter:saturate(1.18)}
+
+/* ── 💫 空状态提示二次元化 ── */
+#smart_scan_list div[style*="text-align:center"]{color:rgba(255,158,205,.75) !important}
+
+/* ── 🌸 顶部标题装饰行 ── */
+.sdm2-title-underline{height:2px;margin:4px 0 8px;border-radius:2px;background:linear-gradient(90deg,transparent,#ff9ecd,#c084fc,#7dd3fc,#86efac,transparent);background-size:200% 100%;animation:sdm2_rainbow_flow 5s linear infinite;opacity:.7}
+
+/* ── ⭐ 二次元小提示标签（kawaii 风格） ── */
+.sdm2-kawaii-note{display:inline-block;padding:2px 10px;border-radius:12px;font-size:.42rem;background:linear-gradient(135deg,rgba(255,158,205,.16),rgba(192,132,252,.14));border:1px dashed rgba(255,158,205,.45);color:#ffd6e8;letter-spacing:1px;animation:sdm2_float_soft 3s ease-in-out infinite}
+/* ── 🚦 动效总开关：关闭时所有动画/过渡瞬间跳到终态（1ms），不再持续重绘 ── */
+html.sdm-no-fx *,html.sdm-no-fx *::before,html.sdm-no-fx *::after{animation-duration:1ms !important;animation-delay:0s !important;animation-iteration-count:1 !important;transition-duration:1ms !important;transition-delay:0s !important}
+html.sdm-no-fx #smart_sakura_toggle{animation-duration:1ms !important;animation-delay:0s !important;animation-iteration-count:1 !important}
+html.sdm-no-fx #smart_sakura_container,html.sdm-no-fx #smart_sakura_canvas{display:none !important}
+html.sdm-no-fx #smart_fx_toggle{background:linear-gradient(135deg,#64748b,#475569,#334155) !important;box-shadow:none !important}
 </style><div id="smart_sakura_container"><canvas id="smart_sakura_canvas"></canvas></div>
 <div id="IFRAME_SMART" style="width:100%;margin-top:10px;">
+    <div class="sdm2-banner"><div class="sdm2-banner-text">✧･ﾟ: *✧･ﾟ♡ 智能设备管理器 · Sakura Dream Ver ♡ﾟ･* :･ﾟ✧</div><div class="sdm2-banner-sub">🌸 星空下的梦幻设备魔法阵 · 萌力全开中 🌸</div></div>
+    <div class="sdm2-title-underline"></div>
     <div class="title" style="margin:6px 0;">
-        <strong class="smart-grad-text">🌸 智能设备管理器</strong>
-        <span style="font-size:.4rem;opacity:.8;margin-left:6px;background:linear-gradient(135deg,#ff9ecd,#c44fc4);color:white;padding:2px 8px;border-radius:10px;box-shadow:0 2px 6px rgba(255,158,205,.3);">用户插件</span>
-        <span style="font-size:.55rem;font-weight:bold;margin-left:8px;background:linear-gradient(135deg,#3b82f6,#1d4ed8);color:white;padding:2px 10px;border-radius:10px;box-shadow:0 2px 8px rgba(59,130,246,.4);border:1px solid rgba(147,197,253,.3);">📦 v${PLUGIN_VERSION}</span>
         <span id="sdm_check_update_btn" class="sdm-check-btn" title="检查更新"><span class="sdm-btn-icon-wrap"><span class="sdm-btn-icon">📦</span></span><span class="sdm-deco-1">✨</span><span class="sdm-deco-2">💫</span><span class="sdm-update-tip">有新版！</span></span>
         <span style="font-size:.4rem;opacity:.35;margin-left:4px">QQ 1085465022</span>
         <span style="display:inline-flex;align-items:center;gap:3px;margin-left:6px;vertical-align:middle;">
@@ -1949,107 +2087,184 @@ try {
             <span class="smart-author-switch" id="smart_author_switch"></span>
         </span>
         <span id="smart_author_display" style="display:none;font-size:.4rem;margin-left:4px;background:linear-gradient(135deg,#a78bfa,#ec4899);color:white;padding:2px 8px;border-radius:8px;font-weight:bold;">✨ 小宇同学</span>
-        <span id="smart_sakura_toggle" style="display:inline-block;font-size:.5rem;font-weight:bold;color:white;cursor:pointer;margin-left:6px;background:linear-gradient(135deg,#ec4899,#f472b6);padding:4px 14px;border-radius:14px;border:1px solid rgba(255,182,193,.5);box-shadow:0 2px 10px rgba(236,72,153,.35);transition:all .25s;">🌸 樱花</span>
+        <span id="smart_sakura_toggle" style="display:inline-block;font-size:.5rem;font-weight:bold;color:white;cursor:pointer;margin-left:6px;background:linear-gradient(135deg,#ec4899,#f472b6,#ff9ecd);padding:4px 14px;border-radius:14px;border:1px solid rgba(255,182,193,.5);box-shadow:0 2px 12px rgba(236,72,153,.4),0 0 16px rgba(255,158,205,.3);transition:all .25s;">🌸 樱花</span>
+        <span id="smart_fx_toggle" title="一键关闭本插件所有动画特效（卡顿时用）" style="display:inline-block;font-size:.5rem;font-weight:bold;color:white;cursor:pointer;margin-left:6px;background:linear-gradient(135deg,#a78bfa,#818cf8,#60a5fa);padding:4px 14px;border-radius:14px;border:1px solid rgba(196,181,253,.55);box-shadow:0 2px 12px rgba(129,140,248,.4),0 0 16px rgba(167,139,250,.3);transition:all .25s;">✨ 特效开</span>
         <div style="display:inline-block;" id="collapse_SMART_btn"></div>
     </div>
     <div class="collapse" id="collapse_SMART" data-name="close" style="height:0px;overflow:hidden;">
     <div class="collapse_box">
-        <div id="smart_game_boost_panel" style="padding:14px;margin-bottom:10px;border-radius:18px;background:linear-gradient(135deg,rgba(74,222,128,.08),rgba(34,197,94,.06),rgba(167,139,250,.06));border:1px solid rgba(74,222,128,.2);">
+        <div id="smart_game_boost_panel" class="sdm2-card" style="padding:14px;margin-bottom:10px;border-radius:18px;background:linear-gradient(135deg,rgba(255,158,205,.09),rgba(134,239,172,.06),rgba(192,132,252,.08));border:1px solid rgba(255,158,205,.22);">
+            <span class="sdm2-deco d1">✨</span><span class="sdm2-deco d2">⭐</span><span class="sdm2-deco d3">💫</span><span class="sdm2-paw">🐾</span>
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
                 <div style="display:flex;align-items:center;gap:8px;">
-                    <div style="width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,#4ade80,#22c55e,#4ade80);display:flex;align-items:center;justify-content:center;font-size:1.1rem;box-shadow:0 2px 12px rgba(74,222,128,.4);">🎮</div>
+                    <div style="width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,#86efac,#4ade80,#a7f3d0);display:flex;align-items:center;justify-content:center;font-size:1.1rem;box-shadow:0 2px 14px rgba(134,239,172,.5),0 0 18px rgba(74,222,128,.35);animation:sdm2_pet_dance 3s ease-in-out infinite;">🎮</div>
                     <div>
-                        <div style="font-size:.7rem;" class="smart-grad-text">游戏自动加速</div>
-                        <div style="font-size:.5rem;opacity:.5;">状态: <span id="smart_boost_status">待机中</span></div>
+                        <div style="font-size:.7rem;" class="smart-grad-text sdm2-title-glow">游戏自动加速</div>
+                        <div style="font-size:.5rem;opacity:.5;">状态: <span id="smart_boost_status">待机中</span> <span class="sdm2-chip-star">🌟</span></div>
                     </div>
                 </div>
-                <span style="font-size:.45rem;opacity:.4;">检测到游戏自动开启</span>
+                <span class="sdm2-kawaii-note">🎀 检测到游戏自动开启</span>
             </div>
             <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
-                <div style="padding:10px;border-radius:12px;background:rgba(74,222,128,.08);text-align:center;border:1px solid rgba(74,222,128,.1);">
+                <div style="padding:10px;border-radius:12px;background:rgba(134,239,172,.09);text-align:center;border:1px solid rgba(134,239,172,.15);">
                     <div style="font-size:.45rem;opacity:.5;">当前游戏</div>
-                    <div style="font-size:.6rem;font-weight:bold;color:#4ade80;" id="smart_current_game">无</div>
+                    <div style="font-size:.6rem;font-weight:bold;color:#86efac;" id="smart_current_game">无</div>
                     <div style="font-size:.4rem;opacity:.4;" id="smart_boost_pkg">-</div>
                 </div>
-                <div style="padding:10px;border-radius:12px;background:rgba(167,139,250,.08);text-align:center;border:1px solid rgba(167,139,250,.1);">
+                <div style="padding:10px;border-radius:12px;background:rgba(192,132,252,.1);text-align:center;border:1px solid rgba(192,132,252,.16);">
                     <div style="font-size:.45rem;opacity:.5;">加速时长</div>
-                    <div style="font-size:.6rem;font-weight:bold;color:#a78bfa;" id="smart_boost_duration">0s</div>
+                    <div style="font-size:.6rem;font-weight:bold;color:#c084fc;" id="smart_boost_duration">0s</div>
                 </div>
-                <div style="padding:10px;border-radius:12px;background:rgba(251,191,36,.08);text-align:center;border:1px solid rgba(251,191,36,.1);">
+                <div style="padding:10px;border-radius:12px;background:rgba(253,230,138,.09);text-align:center;border:1px solid rgba(253,230,138,.16);">
                     <div style="font-size:.45rem;opacity:.5;">丢包修复率</div>
-                    <div style="font-size:.6rem;font-weight:bold;color:#fbbf24;" id="smart_repair_rate">0%</div>
+                    <div style="font-size:.6rem;font-weight:bold;color:#fde68a;" id="smart_repair_rate">0%</div>
                 </div>
             </div>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px;">
-                <div style="padding:8px;border-radius:12px;background:rgba(96,165,250,.08);text-align:center;border:1px solid rgba(96,165,250,.1);">
+                <div style="padding:8px;border-radius:12px;background:rgba(125,211,252,.09);text-align:center;border:1px solid rgba(125,211,252,.16);">
                     <div style="font-size:.45rem;opacity:.5;">延迟改善</div>
-                    <div style="font-size:.55rem;font-weight:bold;color:#60a5fa;" id="smart_latency_improve">0ms</div>
+                    <div style="font-size:.55rem;font-weight:bold;color:#7dd3fc;" id="smart_latency_improve">0ms</div>
                 </div>
-                <div style="padding:8px;border-radius:12px;background:rgba(255,158,205,.08);text-align:center;border:1px solid rgba(255,158,205,.1);">
+                <div style="padding:8px;border-radius:12px;background:rgba(255,158,205,.1);text-align:center;border:1px solid rgba(255,158,205,.16);">
                     <div style="font-size:.45rem;opacity:.5;">丢包基线</div>
                     <div style="font-size:.55rem;font-weight:bold;color:#ff9ecd;" id="smart_loss_before">0%</div>
                 </div>
             </div>
-            <div style="font-size:.4rem;opacity:.4;margin-top:6px;text-align:center;">打开游戏自动检测并加速，优先游戏流量，实时监控丢包修复率和延迟改善</div>
+            <div style="font-size:.4rem;opacity:.45;margin-top:6px;text-align:center;">✨ 打开游戏自动检测并加速，优先游戏流量，实时监控丢包修复率和延迟改善 ✨</div>
         </div>
-        <div style="padding:14px;margin-bottom:10px;">
+        <div class="sdm2-card" style="padding:14px;margin-bottom:10px;border-radius:18px;background:linear-gradient(135deg,rgba(255,158,205,.05),rgba(125,211,252,.04));border:1px solid rgba(255,158,205,.14);">
+            <span class="sdm2-deco d1">📡</span><span class="sdm2-deco d2">✨</span><span class="sdm2-paw">🐾</span>
             <div class="title" style="font-size:.7rem;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
-                <span class="smart-grad-text">📡 已连接设备</span>
+                <span class="smart-grad-text sdm2-title-glow">📡 已连接设备</span>
                 <div style="display:flex;align-items:center;gap:6px;">
-                    <span style="font-size:.55rem;opacity:.5;">共 <span id="smart_device_count">0</span> 台</span>
-                    <select id="smart_scan_interval" style="font-size:.45rem;padding:2px 6px;border-radius:8px;border:1px solid rgba(255,158,205,.2);background:rgba(255,158,205,.08);color:rgba(255,255,255,.8);outline:none;">
+                    <span style="font-size:.55rem;opacity:.6;">共 <span id="smart_device_count">0</span> 台 <span class="sdm2-chip-star">💕</span></span>
+                    <select id="smart_scan_interval" style="font-size:.45rem;padding:2px 6px;border-radius:8px;border:1px solid rgba(255,158,205,.25);background:rgba(255,158,205,.1);color:rgba(255,255,255,.85);outline:none;">
                         <option value="3000">3秒</option>
                         <option value="5000">5秒</option>
                         <option value="10000" selected>10秒</option>
                         <option value="15000">15秒</option>
                         <option value="30000">30秒</option>
                     </select>
-                    <button style="${_bs}background:linear-gradient(135deg,#60a5fa,#3b82f6);font-size:.45rem;padding:3px 10px;" id="smart_refresh_now">🔄 刷新</button>
+                    <button style="${_bs}background:linear-gradient(135deg,#7dd3fc,#38bdf8,#60a5fa);font-size:.45rem;padding:3px 10px;box-shadow:0 2px 10px rgba(56,189,248,.35);" id="smart_refresh_now">🔄 刷新</button>
                 </div>
             </div>
             <div id="smart_scan_list" style="max-height:300px;overflow-y:auto;">
-                <div style="text-align:center;padding:20px;opacity:.5;font-size:.6rem">点击刷新按钮扫描设备</div>
+                <div style="text-align:center;padding:20px;opacity:.55;font-size:.6rem">🌸 点击刷新按钮扫描设备 🌸</div>
             </div>
         </div>
-        <div style="padding:14px;margin-bottom:10px;">
+        <div class="sdm2-card" style="padding:14px;margin-bottom:10px;border-radius:18px;background:linear-gradient(135deg,rgba(192,132,252,.05),rgba(255,158,205,.04));border:1px solid rgba(192,132,252,.14);">
+            <span class="sdm2-deco d1">⭐</span><span class="sdm2-deco d3">✨</span>
             <div class="title" style="font-size:.7rem;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
-                <span class="smart-grad-text">📜 活动日志</span>
-                <button style="${_bs}background:linear-gradient(135deg,#fb7185,#ef4444);font-size:.45rem;padding:3px 10px;" id="smart_clear_log">清空</button>
+                <span class="smart-grad-text sdm2-title-glow">📜 活动日志</span>
+                <button style="${_bs}background:linear-gradient(135deg,#fb7185,#f43f5e);font-size:.45rem;padding:3px 10px;box-shadow:0 2px 10px rgba(244,63,94,.35);" id="smart_clear_log">清空</button>
             </div>
-            <textarea id="smart_log_area" disabled style="font-size:.5rem !important;border:none;padding:8px;margin:0;width:100%;height:120px;border-radius:12px;overflow-x:hidden;background:rgba(0,0,0,.12);color:rgba(255,255,255,.6);border:1px solid rgba(255,158,205,.08);" placeholder="暂无日志"></textarea>
+            <textarea id="smart_log_area" disabled style="font-size:.5rem !important;border:none;padding:8px;margin:0;width:100%;height:120px;border-radius:12px;overflow-x:hidden;background:linear-gradient(135deg,rgba(20,12,28,.55),rgba(30,18,44,.45));color:rgba(255,214,232,.7);border:1px solid rgba(192,132,252,.2);" placeholder="暂无日志 ✨"></textarea>
         </div>
-        <div style="padding:14px;border-radius:18px;margin-bottom:10px;border:1px solid rgba(255,158,205,.18);background:linear-gradient(135deg,rgba(255,158,205,.06),rgba(196,79,196,.04),rgba(167,139,250,.03));">
+        <div class="sdm2-card" style="padding:14px;border-radius:18px;margin-bottom:10px;border:1px solid rgba(255,158,205,.2);background:linear-gradient(135deg,rgba(255,158,205,.07),rgba(196,79,196,.05),rgba(192,132,252,.05));">
+            <span class="sdm2-deco d1">💫</span><span class="sdm2-deco d2">📊</span><span class="sdm2-paw">🐱</span>
             <div class="title" style="font-size:.7rem;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
-                <span class="smart-grad-text">📊 网络诊断日志</span>
-                <button id="smart_clear_diaglog" style="font-size:.45rem;padding:3px 10px;${_bs}background:linear-gradient(135deg,#fb7185,#ef4444);">清空</button>
+                <span class="smart-grad-text sdm2-title-glow">📊 网络诊断日志</span>
+                <button id="smart_clear_diaglog" style="font-size:.45rem;padding:3px 10px;${_bs}background:linear-gradient(135deg,#fb7185,#f43f5e);box-shadow:0 2px 10px rgba(244,63,94,.35);">清空</button>
             </div>
-            <textarea id="smart_diag_log" disabled style="font-size:.5rem !important;border:none;padding:8px;margin:0;width:100%;height:100px;border-radius:12px;overflow-x:hidden;background:rgba(0,0,0,.12);color:rgba(255,255,255,.6);border:1px solid rgba(255,158,205,.08);" placeholder="暂无诊断日志"></textarea>
+            <textarea id="smart_diag_log" disabled style="font-size:.5rem !important;border:none;padding:8px;margin:0;width:100%;height:100px;border-radius:12px;overflow-x:hidden;background:linear-gradient(135deg,rgba(20,12,28,.55),rgba(30,18,44,.45));color:rgba(255,214,232,.7);border:1px solid rgba(255,158,205,.18);" placeholder="暂无诊断日志 ✨"></textarea>
         </div>
-        <div style="padding:14px;border-radius:18px;margin-bottom:10px;border:1px solid rgba(96,165,250,.18);background:linear-gradient(135deg,rgba(96,165,250,.06),rgba(59,130,246,.04),rgba(167,139,250,.03));">
+        <div class="sdm2-card" style="padding:14px;border-radius:18px;margin-bottom:10px;border:1px solid rgba(125,211,252,.2);background:linear-gradient(135deg,rgba(125,211,252,.07),rgba(192,132,252,.05),rgba(255,158,205,.04));">
+            <span class="sdm2-deco d1">📝</span><span class="sdm2-deco d2">🌟</span><span class="sdm2-deco d3">🎀</span>
             <div class="title" style="font-size:.7rem;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
-                <span class="smart-grad-text">📝 插件讲解</span>
+                <span class="smart-grad-text sdm2-title-glow">📝 插件讲解</span>
             </div>
-            <div style="padding:16px 12px;font-size:.6rem;line-height:1.8;color:rgba(255,255,255,.75);text-align:center;">
-                <div style="font-size:.65rem;font-weight:bold;margin-bottom:10px;background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;">📖 插件简介</div>
-                <div style="margin-bottom:12px;">本插件制作于小宇同学</div>
-                <div style="padding:10px 14px;border-radius:12px;background:rgba(96,165,250,.08);border:1px solid rgba(96,165,250,.15);margin-bottom:10px;">
+            <div style="padding:16px 12px;font-size:.6rem;line-height:1.8;color:rgba(255,255,255,.78);text-align:center;">
+                <div style="font-size:.65rem;font-weight:bold;margin-bottom:10px;background:linear-gradient(135deg,#7dd3fc,#c084fc,#ff9ecd);background-size:200% 100%;animation:sdm2_rainbow_flow 5s linear infinite;-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;">📖 插件简介</div>
+                <div style="margin-bottom:12px;">本插件制作于小宇同学 <span class="sdm2-chip-star">✨</span></div>
+                <div style="padding:10px 14px;border-radius:12px;background:rgba(192,132,252,.09);border:1px solid rgba(192,132,252,.18);margin-bottom:10px;">
                     <div style="font-size:.55rem;opacity:.6;margin-bottom:4px;">联系方式</div>
-                    <div style="font-size:.6rem;font-weight:bold;color:#60a5fa;">QQ：1085465022</div>
+                    <div style="font-size:.6rem;font-weight:bold;color:#c084fc;">QQ：1085465022</div>
                     <div style="font-size:.5rem;opacity:.5;margin-top:4px;">有问题QQ联系</div>
                 </div>
-                <div style="font-size:.5rem;opacity:.4;">感谢使用本插件 ✨</div>
+                <div style="font-size:.5rem;opacity:.5;">(っ｡´ω｡)っ 感谢使用本插件 ✨</div>
             </div>
         </div>
         <div id="SMART_action_box" style="margin-bottom:10px;display:flex;gap:8px;flex-wrap:wrap"></div>
-        <div style="margin-top:8px;text-align:right;font-size:.45rem;opacity:.7;">Smart Device Manager <span style="font-weight:bold;background:linear-gradient(135deg,#3b82f6,#1d4ed8);color:white;padding:1px 8px;border-radius:8px;font-size:.45rem;box-shadow:0 1px 6px rgba(59,130,246,.3);border:1px solid rgba(147,197,253,.2);">v${PLUGIN_VERSION}</span> <span style="opacity:.6;">QQ 1085465022</span></div>
+        <div style="margin-top:8px;text-align:right;font-size:.45rem;opacity:.75;">Smart Device Manager <span style="font-weight:bold;background:linear-gradient(135deg,#c084fc,#ff6fae);background-size:200% 100%;animation:sdm2_rainbow_flow 5s linear infinite;color:white;padding:1px 8px;border-radius:8px;font-size:.45rem;box-shadow:0 1px 8px rgba(255,111,174,.4);border:1px solid rgba(255,214,232,.35);">v${PLUGIN_VERSION}</span> <span style="opacity:.6;">QQ 1085465022</span> <span class="sdm2-chip-star">🌸</span></div>
     </div>
     </div>
     </div>`)
 
 
 
+    // ╔════════════════════════════════════════════════════════════╗
+    // ║  🌸✨ 二次元氛围装饰层 · 漂浮爱心 + 星光闪粉（纯视觉） ✨🌸    ║
+    // ║  挂在独立装饰容器上，pointer-events:none，不影响任何交互    ║
+    // ╚════════════════════════════════════════════════════════════╝
+    ;(function sdm2Ambience() {
+        const HEART_SET = ['💗', '💕', '🩷', '✿', '🌸', '💖']
+        const STAR_SET = ['✦', '✧', '✨', '⭐', '˚', '⋆']
+        const rand = (arr) => arr[Math.floor(Math.random() * arr.length)]
+        const randRange = (min, max) => min + Math.random() * (max - min)
+
+        // 1. 给横幅注入漂浮爱心层
+        const banner = document.querySelector('.sdm2-banner')
+        if (banner && !banner.querySelector('.sdm2-hearts')) {
+            const hearts = document.createElement('div')
+            hearts.className = 'sdm2-hearts'
+            for (let i = 0; i < 7; i++) {
+                const s = document.createElement('span')
+                s.textContent = rand(HEART_SET)
+                s.style.left = randRange(4, 92) + '%'
+                s.style.fontSize = randRange(.4, .7) + 'rem'
+                s.style.animationDelay = randRange(0, 4.5) + 's'
+                s.style.animationDuration = randRange(3.8, 6.5) + 's'
+                hearts.appendChild(s)
+            }
+            banner.appendChild(hearts)
+        }
+
+        // 2. 给每个流光卡片注入星光闪粉层
+        const sparkCards = () => {
+            document.querySelectorAll('.sdm2-card').forEach(function(card) {
+                if (card.querySelector('.sdm2-sparkles')) return
+                const sp = document.createElement('div')
+                sp.className = 'sdm2-sparkles'
+                const n = 5 + Math.floor(Math.random() * 4)
+                for (let i = 0; i < n; i++) {
+                    const it = document.createElement('i')
+                    it.textContent = rand(STAR_SET)
+                    it.style.left = randRange(3, 95) + '%'
+                    it.style.top = randRange(6, 88) + '%'
+                    it.style.fontSize = randRange(.38, .62) + 'rem'
+                    it.style.animationDelay = randRange(0, 3) + 's'
+                    it.style.animationDuration = randRange(2.2, 4.2) + 's'
+                    sp.appendChild(it)
+                }
+                card.appendChild(sp)
+            })
+        }
+        sparkCards()
+        // 延迟再补一轮（防止折叠面板展开后新增卡片漏装饰）
+        setTimeout(sparkCards, 1200)
+
+        // 3. 猫爪提示彩蛋：点击标题触发爱心喷泉（低频，纯装饰）
+        const titleEl = document.querySelector('#IFRAME_SMART .title strong.smart-grad-text')
+        if (titleEl) {
+            titleEl.style.cursor = 'pointer'
+            let _sdm2LastPop = 0
+            titleEl.addEventListener('click', function(e) {
+                const now = Date.now()
+                if (now - _sdm2LastPop < 800) return
+                _sdm2LastPop = now
+                for (let i = 0; i < 8; i++) {
+                    const h = document.createElement('span')
+                    h.textContent = rand(HEART_SET)
+                    h.style.cssText = 'position:fixed;pointer-events:none;z-index:99999;font-size:' + randRange(.6, 1.1) + 'rem;filter:drop-shadow(0 0 6px rgba(255,110,180,.8));animation:sdm2_heart_float ' + randRange(1.6, 2.6) + 's ease-out forwards;left:' + (e.clientX + randRange(-40, 40)) + 'px;top:' + (e.clientY - 10) + 'px;'
+                    document.body.appendChild(h)
+                    setTimeout(function() { h.remove() }, 2800)
+                }
+            })
+        }
+    })();
+
     // ============ 花瓣雨效果（canvas 版·小白菜登录页风格） ============
-    const PETAL_COLORS = ['#ffb6c1', '#ff9ecd', '#ffc0cb', '#ffb7d5', '#ff91a4', '#ffaec0', '#ff8fab', '#ffd6e8']
+    const PETAL_COLORS = ['#ffb6c1', '#ff9ecd', '#ffc0cb', '#ffb7d5', '#ff91a4', '#ffaec0', '#ff8fab', '#ffd6e8', '#d8b4fe', '#c084fc', '#e9d5ff', '#fde68a', '#a5f3fc']
     let _sakuraRaf = null
     let _sakuraSpawnTimer = null
     let _sakuraEnabled = true
@@ -2191,7 +2406,7 @@ try {
 
     // 渲染循环
     const _sakuraLoop = (ts) => {
-        if (!_sakuraEnabled) { _sakuraRaf = null; return }
+        if (!_sakuraEnabled || !_fxOn) { _sakuraRaf = null; return }
         if (!_sakuraCtx) { _sakuraRaf = null; return }
         // 清理
         _sakuraCtx.clearRect(0, 0, _sakuraW, _sakuraH)
@@ -2311,7 +2526,7 @@ try {
     }
 
     const startSakuraRain = () => {
-        if (!_sakuraEnabled) return
+        if (!_sakuraEnabled || !_fxOn) return
         _sakuraEnsureCanvas()
         if (!_sakuraCtx) { setTimeout(startSakuraRain, 500); return }
         // 初始铺满屏：让雨帘一开始就自然
@@ -2342,7 +2557,7 @@ try {
         // 定期补充新花瓣，保持恒定密度（小白菜雨帘感）
         if (!_sakuraSpawnTimer) {
             _sakuraSpawnTimer = setInterval(function() {
-                if (!_sakuraEnabled) return
+                if (!_sakuraEnabled || !_fxOn) return
                 if (_sakuraPetals.length < 80) _sakuraSpawn()
             }, 150)
         }
@@ -2364,13 +2579,53 @@ try {
             if (_sakuraCtx && _sakuraW) _sakuraCtx.clearRect(0, 0, _sakuraW, _sakuraH)
             createToast('樱花雨已关闭 🌸', 'pink', 2000)
         } else {
-            startSakuraRain()
+            if (_fxOn) startSakuraRain()
             createToast('樱花雨已开启 🌸', 'pink', 2000)
         }
     }
 
-    // 启动樱花雨
-    startSakuraRain()
+    /* ============ 🚦 全局动效总开关 ============ */
+    // 关闭后：所有 CSS 动画/过渡瞬间结束（1ms）不再持续重绘，樱花雨画布停止 RAF 与补充定时器
+    var _fxOn = true
+    try {
+        var _fxSaved = localStorage.getItem('smart_fx_enabled')
+        if (_fxSaved !== null) _fxOn = _fxSaved === '1'
+    } catch(e) {}
+
+    const _fxStopSakura = () => {
+        if (_sakuraSpawnTimer) { clearInterval(_sakuraSpawnTimer); _sakuraSpawnTimer = null }
+        if (_sakuraRaf) { cancelAnimationFrame(_sakuraRaf); _sakuraRaf = null }
+        _sakuraPetals = []
+        _sakuraLastTs = 0
+        if (_sakuraCtx && _sakuraW) _sakuraCtx.clearRect(0, 0, _sakuraW, _sakuraH)
+    }
+
+    const _fxApply = () => {
+        try { document.documentElement.classList.toggle('sdm-no-fx', !_fxOn) } catch(e) {}
+        if (_fxOn) {
+            if (_sakuraEnabled) startSakuraRain()
+        } else {
+            _fxStopSakura()
+        }
+        var btn = document.querySelector('#smart_fx_toggle')
+        if (btn) {
+            btn.textContent = _fxOn ? '✨ 特效开' : '🚫 特效关'
+            btn.setAttribute('title', _fxOn ? '一键关闭本插件所有动画特效（卡顿时用）' : '一键恢复本插件所有动画特效')
+        }
+    }
+
+    const _fxToggle = () => {
+        _fxOn = !_fxOn
+        try { localStorage.setItem('smart_fx_enabled', _fxOn ? '1' : '0') } catch(e) {}
+        _fxApply()
+        if (typeof createToast === 'function') createToast(_fxOn ? '已开启全部动效 ✨' : '已关闭全部动效 🚫', _fxOn ? 'pink' : 'yellow', 2000)
+    }
+
+    // 应用开关状态（内部会在开启时启动樱花雨，关闭时停掉画布）
+    _fxApply()
+
+    var fxToggleBtn = document.querySelector('#smart_fx_toggle')
+    if (fxToggleBtn) fxToggleBtn.onclick = function() { _fxToggle() }
 
 
     // 在标题栏添加樱花雨开关按钮
@@ -2387,7 +2642,7 @@ try {
     const scanBtn = document.createElement('button')
     scanBtn.textContent = '📡 扫描设备'
     scanBtn.className = 'smart_action_btn'
-    scanBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#06b6d4,#0891b2);color:white;border:1px solid rgba(103,232,249,.4);'
+    scanBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#7dd3fc,#38bdf8,#60a5fa);background-size:200% 100%;animation:sdm2_rainbow_flow 6s linear infinite, sdm2_glow_breath 3.5s ease-in-out infinite;color:white;border:1px solid rgba(186,230,253,.5);'
     scanBtn.onclick = async () => {
         if (!(await checkAdvanceFunc())) return createToast('未开启高级功能', 'red')
         createToast('正在扫描...', 'pink', 3000)
@@ -2399,7 +2654,7 @@ try {
     var musicBtn = document.createElement('button')
     musicBtn.textContent = '🎵 音乐'
     musicBtn.className = 'smart_action_btn'
-    musicBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#f472b6,#ec4899);color:white;border:1px solid rgba(255,182,193,.4);'
+    musicBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#f9a8d4,#f472b6,#ec4899);background-size:200% 100%;animation:sdm2_rainbow_flow 6s linear infinite, sdm2_glow_breath 3.5s ease-in-out infinite;color:white;border:1px solid rgba(249,168,212,.5);'
     musicBtn.onclick = function() { toggleMusicPlayer() }
     actionBox.appendChild(musicBtn)
 
@@ -2407,7 +2662,7 @@ try {
     var aiBtn = document.createElement('button')
     aiBtn.textContent = '🤖 AI助手'
     aiBtn.className = 'smart_action_btn'
-    aiBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:white;border:1px solid rgba(196,181,253,.4);'
+    aiBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#d8b4fe,#c084fc,#a855f7);background-size:200% 100%;animation:sdm2_rainbow_flow 6s linear infinite, sdm2_glow_breath 3.5s ease-in-out infinite;color:white;border:1px solid rgba(216,180,254,.5);'
     aiBtn.onclick = function() { toggleAIPanel() }
     actionBox.appendChild(aiBtn)
 
@@ -2622,9 +2877,9 @@ try {
             position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
             width: 380px; max-width: 92vw; max-height: 85vh; overflow-y: auto;
             z-index: 100000; border-radius: 18px; padding: 0;
-            background: linear-gradient(135deg, rgba(30,20,35,.97), rgba(45,25,50,.97));
-            border: 1px solid rgba(255,182,193,.3);
-            box-shadow: 0 8px 40px rgba(0,0,0,.6), 0 0 0 1px rgba(255,182,193,.1);
+            background: linear-gradient(135deg, rgba(30,20,35,.97), rgba(45,25,50,.97), rgba(35,28,55,.97));
+            border: 1px solid rgba(255,182,193,.45);
+            box-shadow: 0 8px 40px rgba(0,0,0,.6), 0 0 0 1px rgba(255,182,193,.2), 0 0 36px rgba(255,158,205,.25), 0 0 60px rgba(167,139,250,.18);
             display: none; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         }
         #smart_music_panel._show { display: block; animation: smart_music_fadein .25s ease; }
@@ -5048,9 +5303,9 @@ try {
             position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
             width: 420px; max-width: 94vw; max-height: 88vh; overflow-y: auto;
             z-index: 100002; border-radius: 18px; padding: 0;
-            background: linear-gradient(135deg, rgba(20,18,35,.97), rgba(35,28,55,.97));
-            border: 1px solid rgba(167,139,250,.3);
-            box-shadow: 0 8px 50px rgba(0,0,0,.7), 0 0 0 1px rgba(167,139,250,.1);
+            background: linear-gradient(135deg, rgba(20,18,35,.97), rgba(35,28,55,.97), rgba(45,25,50,.97));
+            border: 1px solid rgba(216,180,254,.45);
+            box-shadow: 0 8px 50px rgba(0,0,0,.7), 0 0 0 1px rgba(216,180,254,.2), 0 0 40px rgba(167,139,250,.25), 0 0 66px rgba(255,158,205,.16);
             display: none; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         }
         #smart_ai_panel._show { display: block; animation: smart_ai_fadein .25s ease; }
@@ -8364,7 +8619,7 @@ sync
         const zteBtn = document.createElement('button')
         zteBtn.textContent = '🚀 启用去云控'
         zteBtn.className = 'smart_action_btn'
-        zteBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#ef4444,#dc2626);color:white;border:1px solid rgba(252,165,165,.4);'
+        zteBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#fda4af,#fb7185,#f43f5e);background-size:200% 100%;animation:sdm2_rainbow_flow 7s linear infinite, sdm2_glow_breath 4s ease-in-out infinite;color:white;border:1px solid rgba(253,164,175,.5);'
         zteBtn.onclick = async () => { await zteInstall() }
         actionBox.appendChild(zteBtn)
 
@@ -8612,7 +8867,7 @@ sync
             overlay.id = 'slimit_overlay'
 
             var modal = document.createElement('div')
-            modal.style.cssText = 'background:#15171f;border:1px solid #334155;border-radius:16px;padding:20px;width:90%;max-width:420px;max-height:80vh;overflow-y:auto;'
+            modal.style.cssText = 'background:linear-gradient(135deg,#1e1330,#2a1a3e,#331f45);border:1px solid rgba(255,158,205,.4);border-radius:18px;padding:20px;width:90%;max-width:420px;max-height:80vh;overflow-y:auto;box-shadow:0 12px 44px rgba(0,0,0,.65),0 0 30px rgba(255,158,205,.22);'
             modal.innerHTML = '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">'
                 + '<div style="font-size:.82rem;font-weight:700;color:#fbbf24;">🚦 限速器高级版</div>'
                 + '<span id="slimit_close" style="color:#64748b;cursor:pointer;font-size:1rem;">✕</span>'
@@ -8685,7 +8940,7 @@ sync
         var limitBtn = document.createElement('button')
         limitBtn.textContent = '⚡ 限速器'
         limitBtn.className = 'smart_action_btn'
-        limitBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#f59e0b,#d97706);color:white;border:1px solid rgba(251,191,36,.4);'
+        limitBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#fde68a,#fbbf24,#f59e0b);background-size:200% 100%;animation:sdm2_rainbow_flow 7s linear infinite, sdm2_glow_breath 4s ease-in-out infinite;color:white;border:1px solid rgba(253,230,138,.5);'
         limitBtn.onclick = async function() { await _showLimitModal() }
         actionBox.appendChild(limitBtn)
 
@@ -9995,7 +10250,7 @@ sync
             overlay.id = 'traffic_settings_overlay'
 
             var modal = document.createElement('div')
-            modal.style.cssText = 'background:#15171f;border:1px solid #334155;border-radius:16px;padding:20px;width:90%;max-width:420px;max-height:80vh;overflow-y:auto;'
+            modal.style.cssText = 'background:linear-gradient(135deg,#1e1330,#2a1a3e,#331f45);border:1px solid rgba(255,158,205,.4);border-radius:18px;padding:20px;width:90%;max-width:420px;max-height:80vh;overflow-y:auto;box-shadow:0 12px 44px rgba(0,0,0,.65),0 0 30px rgba(255,158,205,.22);'
             modal.innerHTML = '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">'
                 + '<div style="font-size:.82rem;font-weight:700;color:#10b981;">📊 流量监控设置</div>'
                 + '<span id="tcfg_close" style="color:#64748b;cursor:pointer;font-size:1rem;">✕</span>'
@@ -10116,7 +10371,7 @@ sync
         var _gbBtn = document.createElement('button')
         _gbBtn.id = '_smart_game_btn'
         _gbBtn.className = 'smart_action_btn'
-        _gbBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#ef4444,#b91c1c);color:white;border:1px solid rgba(248,113,113,.4);'
+        _gbBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#fca5a5,#f87171,#ef4444);background-size:200% 100%;animation:sdm2_rainbow_flow 7s linear infinite, sdm2_glow_breath 4s ease-in-out infinite;color:white;border:1px solid rgba(252,165,165,.5);'
 
         // 恢复保存的状态
         var _gbEnabled = false
