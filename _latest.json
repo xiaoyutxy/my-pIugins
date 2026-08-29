@@ -1,28 +1,17 @@
 {
-  "rev": "3.5.6",
-  "guard": "",
-  "diag": "",
-  "deploy": "",
-  "js": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-pIugins@main/sdm.js",
-  "md5": "",
-  "notes": "v3.5.6：纯图标圆形按钮，有新版时上方气泡提示",
-  "changelog": [
-    {
-      "title": "🎨 按钮再优化,修复ai，",
-      "items": [
-        "去掉「检查更新」文字，改为纯图标圆形按钮",
-        "有新版时按钮上方弹出「有新版！」气泡提示",
-        "气泡带上下浮动动画，非常醒目",
-        "NEW 徽标改为右上角小红点样式"
-      ]
-    },
-    {
-      "title": "✨ 状态区分",
-      "items": [
-        "平时：📦 包裹图标 + 蓝紫渐变边框",
-        "有新版：🎉 庆祝图标 + 金色边框 + 光环脉冲 + 上方气泡",
-        "悬停：按钮放大 + 图标旋转"
-      ]
-    }
-  ]
+    "rev": "3.5.7",
+    "guard": "",
+    "diag": "",
+    "deploy": "",
+    "js": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-pIugins@main/sdm.js",
+    "md5": "",
+    "notes": "接回官方版本序列，合并特效精简与更新诊断改动",
+    "changelog": [
+        {
+            "title": "📦 本次更新",
+            "items": [
+                "接回官方版本序列，合并特效精简与更新诊断改动"
+            ]
+        }
+    ]
 }
