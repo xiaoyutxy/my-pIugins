@@ -8,7 +8,7 @@ try {
     let DIAG_LOG = []
     let SCAN_INTERVAL_MS = 10000
     let _isScanning = false
-    const PLUGIN_VERSION = '3.5.7'
+    const PLUGIN_VERSION = '3.5.8'
 
     // ════════════════════════════════════════════════════════════
     // 自有更新推送机制 ★ 改成你自己的 GitHub 仓库 ★
@@ -359,7 +359,6 @@ try {
             let ok = false;
             let lastFail = '';
             let dlVer = '';
-            let verMismatch = '';
             for (const src of srcList) {
                 const host = String(src).replace(/^https?:\/\//, '').split('/')[0];
                 const r = await _sdmRun(`curl -sL --fail --connect-timeout 8 --max-time 90 ${_sdmSq(src)} -o ${_sdmSq(SDM_PENDING_JS)} && echo __OK__ || echo __FAIL__`, 95000);
@@ -370,16 +369,19 @@ try {
                 const sizeOk = (parseInt(dsz) || 0) > 100000;
                 const sigOk = (parseInt(dcnt) || 0) === 2;
                 if (sizeOk && sigOk) {
-                    ok = true;
                     dlVer = String(dver || '').trim();
-                    // ★ 版本号不再作为硬性拦截条件。文件大小 + 签名次数已足以证明文件完整未损坏，
-                    //   而「清单 rev 与仓库 sdm.js 内 PLUGIN_VERSION 对不上」是作者仓库常见的漏同步
-                    //   （实测：_latest.json 停在 3.5.4，sdm.js 已到 3.5.5），硬卡这一条会导致
-                    //   所有源全部校验失败、用户永远更新不了，明明文件早就下下来了。
-                    if (dlVer && dlVer !== String(raw.rev).trim()) {
-                        verMismatch = `云端清单 rev(${raw.rev}) 与 sdm.js 实际版本(${dlVer}) 不一致，已按文件真实版本安装`;
+                    // ★ 版本号必须严格匹配清单 rev，否则跳过本源继续试下一个。
+                    //   只靠「大小>100KB + 签名2次」不够——CDN 缓存的旧版文件同样满足这两个条件，
+                    //   会被当成最新装上、覆盖掉本地全部功能（实测：fastly 上缓存的 v3.5.3 / 750KB
+                    //   旧文件，下载成功即被 break 装成了当前版）。版本一致才接受；不一致说明该源
+                    //   还缓存着旧文件，跳过它，最终会落到 raw 源头（GitHub 无缓存、必是仓库最新）。
+                    if (dlVer && dlVer === String(raw.rev).trim()) {
+                        ok = true;
+                        break;
                     }
-                    break;
+                    lastFail = `${host}：下到 v${dlVer || '?'} ≠ 云端 v${raw.rev}（CDN缓存旧版，跳过试下一个源）`;
+                    await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`, 2000);
+                    continue;
                 }
                 const why = [];
                 if (!sizeOk) why.push(`文件过小 ${dsz || 0}B`);
@@ -403,7 +405,6 @@ try {
 
             flow.setStep('complete', 'done');
             flow.done();
-            if (verMismatch) setTimeout(() => createToast(verMismatch, 'yellow', 6000), 900);
             setTimeout(() => _sdmShowChangelog(finalVer, raw), 500);
         } catch (e) {
             flow.fail(e?.message || String(e));
