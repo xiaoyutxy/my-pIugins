@@ -1,0 +1,17 @@
+{
+    "rev": "3.5.7",
+    "guard": "",
+    "diag": "",
+    "deploy": "",
+    "js": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-pIugins@main/sdm.js",
+    "md5": "",
+    "notes": "接回官方版本序列，合并特效精简与更新诊断改动",
+    "changelog": [
+        {
+            "title": "📦 本次更新",
+            "items": [
+                "接回官方版本序列，合并特效精简与更新诊断改动"
+            ]
+        }
+    ]
+}
