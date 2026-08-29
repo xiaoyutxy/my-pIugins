@@ -8,7 +8,7 @@ try {
     let DIAG_LOG = []
     let SCAN_INTERVAL_MS = 10000
     let _isScanning = false
-    const PLUGIN_VERSION = '3.5.4'
+    const PLUGIN_VERSION = '3.5.5'
 
     // ════════════════════════════════════════════════════════════
     // 自有更新推送机制 ★ 改成你自己的 GitHub 仓库 ★
@@ -46,27 +46,54 @@ try {
         return _sdmBestNode;
     };
 
+    // 主动刷新 jsDelivr 官方节点（Cloudflare / Fastly）的 CDN 缓存
+    // 解决「刚推送的新版本被边缘节点 12 小时缓存挡住、客户端死活拉不到」的问题。
+    // 实测：purge 接口用 GET 方法（POST 会返回 405）；只覆盖 CF/FY 两家，
+    // testingcf / jsdmirror / onmicrosoft 属第三方镜像，不受管辖，靠多源取最新兜底。
+    const SDM_PURGE_BASE = 'https://purge.jsdelivr.net/gh/xiaoyutxy/my-pIugins@main/';
+    const SDM_PURGE_FILES = ['_latest.json', 'sdm.js'];
+    let _sdmLastPurgeTs = 0;
+
+    const _sdmPurgeCache = async (extraFiles) => {
+        try {
+            // 节流：60 秒内不重复刷新，避免连点检查更新时触发 jsDelivr 限流
+            const now = Date.now();
+            if (now - _sdmLastPurgeTs < 60000) { await _sdmWait(600); return false; }
+            _sdmLastPurgeTs = now;
+            const files = (SDM_PURGE_FILES.concat(extraFiles || [])).filter((v, i, a) => a.indexOf(v) === i);
+            // 并发刷新：网络不通时最坏只等一轮超时，不会串行累加
+            await Promise.all(files.map(f =>
+                _sdmRun(`curl -sL --connect-timeout 4 --max-time 10 ${_sdmSq(SDM_PURGE_BASE + f)} -o /dev/null`, 12000)
+            ));
+            await _sdmWait(1800);   // 等边缘节点回源完成
+            return true;
+        } catch (e) { return false; }   // 清缓存失败不阻断更新，后续多源取最新仍会兜底
+    };
+
     const _sdmFetchManifest = async (jsonFile) => {
-        const tmp = '/data/local/tmp/_sdm_mf.tmp';
         const t = Date.now();
-        // 候选源逐个尝试：GitHub raw（源头无缓存）→ 各CDN节点
-        // 任一节点缓存了旧内容都能靠后续源纠正，彻底解决CDN缓存卡版本问题
+        // 候选源：GitHub raw（源头无缓存）→ 各CDN节点
+        // 注意：jsDelivr 忽略 query string 做缓存 key，?t= 这类时间戳对穿透 CDN 缓存无效，
+        // 真正的解法是「并发问所有源，取 rev 最高的那份」——任一节点缓存了旧清单，
+        // 只要有一个节点已刷新，就能拿到新版本，不必等所有节点缓存到期。
         const srcs = [SDM_RAW_BASE + jsonFile + '?t=' + t];
         for (const node of [SDM_CDN_ORIGIN, ...SDM_CDN_MIRRORS]) {
             srcs.push(SDM_GH_BASE.replace('https://' + SDM_CDN_ORIGIN, 'https://' + node) + jsonFile + '?_=' + t);
         }
-        for (const url of srcs) {
+        const jobs = srcs.map(async (url, i) => {
+            const tmp = '/data/local/tmp/_sdm_mf_' + i + '.tmp';
             const r = await _sdmRun(`curl -sL --fail --connect-timeout 5 --max-time 15 ${_sdmSq(url)} -o ${_sdmSq(tmp)}; ec=$?; [ "$ec" -eq 0 ] && echo __OK__ || echo __FAIL__:$ec`, 20000);
-            if (String(r?.content || '').includes('__OK__')) {
-                const rd = await _sdmRun(`cat ${_sdmSq(tmp)}`, 3000);
-                const text = String(rd?.content || '').trim();
-                await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
-                if (text && text[0] === '{') {
-                    try { const j = JSON.parse(text); if (j.rev && j.js) return j; } catch {}
-                }
-            } else { await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000); }
-        }
-        return null;
+            if (!String(r?.content || '').includes('__OK__')) { await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000); return null; }
+            const rd = await _sdmRun(`cat ${_sdmSq(tmp)}`, 3000);
+            const text = String(rd?.content || '').trim();
+            await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
+            if (!text || text[0] !== '{') return null;
+            try { const j = JSON.parse(text); return (j.rev && j.js) ? j : null; } catch { return null; }
+        });
+        const got = await Promise.all(jobs);
+        let best = null;
+        for (const j of got) { if (j && (!best || _sdmCmpVer(j.rev, best.rev) > 0)) best = j; }
+        return best;
     };
 
     const _sdmReadVer = async () => {
@@ -129,7 +156,7 @@ try {
     };
 
     const _sdmShowProgress = () => {
-        const steps = [{ id: 'manifest', label: '获取版本信息' }, { id: 'dl_js', label: '下载插件代码' }, { id: 'deploy', label: '安装' }, { id: 'complete', label: '完成' }];
+        const steps = [{ id: 'purge', label: '刷新CDN缓存' }, { id: 'manifest', label: '获取版本信息' }, { id: 'dl_js', label: '下载插件代码' }, { id: 'deploy', label: '安装' }, { id: 'complete', label: '完成' }];
         const st = {}; steps.forEach(s => st[s.id] = 'pending');
         let finished = false, failInfo = null;
         const ICONS = { pending: '<span style="color:#94a3b8">○</span>', running: '<span style="animation:sdm_spin 1s linear infinite;display:inline-block">⏳</span>', done: '<span style="color:#86efac">✓</span>', failed: '<span style="color:#f87171">✗</span>' };
@@ -212,6 +239,10 @@ try {
         try {
             const prevVer = await _sdmReadVer();
             const curVer = prevVer || PLUGIN_VERSION;
+            // 先刷新 CDN 缓存，确保刚推送的版本能立刻被拉到（无需手动去 purge）
+            flow.setStep('purge', 'running');
+            await _sdmPurgeCache(['v' + curVer + '.json']);
+            flow.setStep('purge', 'done');
             flow.setStep('manifest', 'running');
             const raw = await _sdmGetManifest(curVer);
             if (!raw) { flow.fail('无法获取版本信息，可能网络不通或仓库未配置'); _sdmUpdating = false; if (btn) btn.classList.remove('loading'); return; }
@@ -231,16 +262,30 @@ try {
             // GitHub raw 排最前（源头无缓存，杜绝CDN缓存旧文件装错版本），CDN 兜底
             const rawJsUrl = raw.js.replace('https://' + SDM_CDN_ORIGIN + '/gh/', 'https://raw.githubusercontent.com/').replace('@main/', '/');
             let ok = false;
+            let lastFail = '';
             for (const src of [rawJsUrl, ...nodes.map(n => raw.js.replace(SDM_CDN_ORIGIN, n))]) {
+                const host = String(src).replace(/^https?:\/\//, '').split('/')[0];
                 const r = await _sdmRun(`curl -sL --fail --connect-timeout 8 --max-time 90 ${_sdmSq(src)} -o ${_sdmSq(SDM_PENDING_JS)} && echo __OK__ || echo __FAIL__`, 95000);
-                if (!String(r?.content || '').includes('__OK__')) { await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`, 2000); continue; }
+                if (!String(r?.content || '').includes('__OK__')) { lastFail = `下载失败（源 ${host}）`; await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`, 2000); continue; }
                 // 下载后即时校验：大小合理 + 签名恰好2行 + 文件内版本号与清单一致（防CDN缓存旧文件被装成新版本）
                 const vrf = await _sdmRun(`_s=$(wc -c < ${_sdmSq(SDM_PENDING_JS)} 2>/dev/null || echo 0); _c=$(grep -c 'SDM_PLUGIN''_ID:a1b2c3' ${_sdmSq(SDM_PENDING_JS)} 2>/dev/null || echo 0); _v=$(grep -o "const PLUGIN_VERSION = '[^']*'" ${_sdmSq(SDM_PENDING_JS)} 2>/dev/null | head -1 | sed "s/.*'\\(.*\\)'.*/\\1/"); echo "$_s|$_c|$_v"`, 10000);
                 const [dsz, dcnt, dver] = String(vrf?.content || '0|0|').trim().split('|');
                 if ((parseInt(dsz) || 0) > 100000 && (parseInt(dcnt) || 0) === 2 && String(dver || '').trim() === String(raw.rev).trim()) { ok = true; break; }
+                // 记录具体卡在哪一项，便于排查（最常见：清单 rev 与仓库 sdm.js 里的 PLUGIN_VERSION 不一致）
+                const why = [];
+                if (!((parseInt(dsz) || 0) > 100000)) why.push(`文件过小 ${dsz || 0}B`);
+                if (!((parseInt(dcnt) || 0) === 2)) why.push(`签名出现 ${dcnt || 0} 次(应为2)`);
+                if (!(String(dver || '').trim() === String(raw.rev).trim())) why.push(`文件版本号 "${String(dver || '').trim() || '未取到'}" ≠ 清单 rev "${raw.rev}"`);
+                lastFail = `${host}：${why.join('；')}`;
                 await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`, 2000);
             }
-            if (!ok) { flow.fail('插件代码下载失败或校验未通过'); _sdmUpdating = false; return; }
+            if (!ok) {
+                const hint = String(lastFail).indexOf('≠') >= 0
+                    ? '请检查仓库 sdm.js 里的 PLUGIN_VERSION 是否与清单 rev 一致'
+                    : '若为刚推送的版本，可能是 CDN 缓存未刷新，请稍后重试或到 purge.jsdelivr.net 手动刷新';
+                flow.fail(`更新中止：${lastFail || '无可用下载源'}。${hint}`);
+                _sdmUpdating = false; return;
+            }
             flow.setStep('dl_js', 'done');
 
             flow.setStep('deploy', 'running');
