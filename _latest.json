@@ -1,16 +1,16 @@
 {
-    "rev": "3.5.8",
+    "rev": "3.5.10",
     "guard": "",
     "diag": "",
     "deploy": "",
     "js": "https://raw.githubusercontent.com/xiaoyutxy/my-pIugins/main/sdm.js",
     "md5": "",
-    "notes": "修复致命bug：下载sdm.js时版本号必须严格匹配清单rev（否则CDN旧版会覆盖新功能）；清单js字段改指向raw源头（无缓存即时生效）",
+    "notes": "移除废弃版本黑名单（3.5.0~3.5.5），恢复这些历史版本可正常自动更新；版本防错装仍由 v3.5.8 的版本硬校验保障",
     "changelog": [
         {
             "title": "📦 本次更新",
             "items": [
-                "修复致命bug：下载sdm.js时版本号必须严格匹配清单rev（否则CDN旧版会覆盖新功能）；清单js字段改指向raw源头（无缓存即时生效）"
+                "移除废弃版本黑名单（3.5.0~3.5.5），恢复这些历史版本可正常自动更新；版本防错装仍由 v3.5.8 的版本硬校验保障"
             ]
         }
     ]
