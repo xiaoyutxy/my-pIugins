@@ -1,0 +1,2658 @@
+//<script>
+//@@SDM_PLUGIN_ID:a1b2c3@@
+(async () => {
+try {
+    let SCAN_INTERVAL = null
+    let GAME_MONITOR_INTERVAL = null
+    let ACTIVITY_LOG = []
+    let DIAG_LOG = []
+    let SCAN_INTERVAL_MS = 10000
+    let _isScanning = false
+    const PLUGIN_VERSION = '3.6.9'
+
+    // ════════════════════════════════════════════════════════════
+    // 自有更新推送机制 ★ 改成你自己的 GitHub 仓库 ★
+    // ════════════════════════════════════════════════════════════
+    const SDM_CDN_ORIGIN = 'cdn.jsdelivr.net';
+    const SDM_CDN_MIRRORS = ['fastly.jsdelivr.net', 'testingcf.jsdelivr.net', 'cdn.jsdmirror.com', 'jsd.onmicrosoft.cn'];
+    const SDM_GH_BASE = `https://${SDM_CDN_ORIGIN}/gh/xiaoyutxy/my-pIugins@main/`;
+    const SDM_RAW_BASE = 'https://raw.githubusercontent.com/xiaoyutxy/my-pIugins/main/';
+    let _sdmBestNode = null;
+    let _sdmManifest = null;
+    let _sdmUpdating = false;
+    const SDM_VERSION_FILE = '/data/sdm/.version';
+    const SDM_DATA_DIR = '/data/sdm';
+    const SDM_PENDING_JS = '/data/local/tmp/_sdm_pending.js';
+    const SDM_SIG = '@@SDM_PLUGIN_ID:a1b2c3@@';
+
+    const _sdmSq = (v) => `'${String(v ?? '').replace(/'/g, `'\''`)}'`;
+    const _sdmWait = (ms) => new Promise(r => setTimeout(r, ms));
+    const _sdmRun = async (cmd, timeout = 30000) => {
+        try { const r = await runShellWithRoot(cmd, timeout); return r || { success: false, content: '' }; }
+        catch (e) { return { success: false, content: '', error: e?.message || String(e) }; }
+    };
+
+    let _sdmProbeTs = 0;
+    const _sdmProbeCdn = async () => {
+        // 缓存5分钟，过期后重新探测（网络环境变化能自适应，不会永久锁死在一个节点上）
+        if (_sdmBestNode && Date.now() - _sdmProbeTs < 300000) return _sdmBestNode;
+        const candidates = [SDM_CDN_ORIGIN, ...SDM_CDN_MIRRORS];
+        // 并发测速：所有节点同时发请求，最快返回200的胜出。
+        // 串行测6个节点最坏30秒，并发只需最慢一个的超时时间（5秒）。
+        const probeOne = async (node) => {
+            const testUrl = `https://${node}/gh/xiaoyutxy/my-pIugins@main/_latest.json?_=${Date.now()}`;
+            const start = Date.now();
+            const r = await _sdmRun(`curl -sL --connect-timeout 3 --max-time 5 -w '%{http_code}' -o /dev/null ${_sdmSq(testUrl)}`, 8000).catch(() => ({ content: '0' }));
+            return { node, rtt: Date.now() - start, ok: String(r?.content || '').trim() === '200' };
+        };
+        const results = await Promise.all(candidates.map(probeOne));
+        const ok = results.filter(r => r.ok).sort((a, b) => a.rtt - b.rtt);
+        _sdmBestNode = ok.length > 0 ? ok[0].node : SDM_CDN_MIRRORS[0];
+        _sdmProbeTs = Date.now();
+        return _sdmBestNode;
+    };
+
+    // 主动刷新 jsDelivr 官方节点（Cloudflare / Fastly）的 CDN 缓存
+    // 解决「刚推送的新版本被边缘节点 12 小时缓存挡住、客户端死活拉不到」的问题。
+    // 实测：purge 接口用 GET 方法（POST 会返回 405）；只覆盖 CF/FY 两家，
+    // testingcf / jsdmirror / onmicrosoft 属第三方镜像，不受管辖，靠多源取最新兜底。
+    const SDM_PURGE_BASE = 'https://purge.jsdelivr.net/gh/xiaoyutxy/my-pIugins@main/';
+    const SDM_PURGE_FILES = ['_latest.json', 'sdm.js'];
+    let _sdmLastPurgeTs = 0;
+
+    const _sdmPurgeCache = async (extraFiles) => {
+        try {
+            // 节流：60 秒内不重复刷新，避免连点检查更新时触发 jsDelivr 限流
+            const now = Date.now();
+            if (now - _sdmLastPurgeTs < 60000) { await _sdmWait(600); return false; }
+            _sdmLastPurgeTs = now;
+            const files = (SDM_PURGE_FILES.concat(extraFiles || [])).filter((v, i, a) => a.indexOf(v) === i);
+            // 并发刷新：网络不通时最坏只等一轮超时，不会串行累加
+            await Promise.all(files.map(f =>
+                _sdmRun(`curl -sL --connect-timeout 4 --max-time 10 ${_sdmSq(SDM_PURGE_BASE + f)} -o /dev/null`, 12000)
+            ));
+            await _sdmWait(1800);   // 等边缘节点回源完成
+            return true;
+        } catch (e) { return false; }   // 清缓存失败不阻断更新，后续多源取最新仍会兜底
+    };
+
+    // 诊断日志：记录最近一次各源实际返回的 rev。
+    // 「点检查更新却说已是最新」时，先看这张表就能判断是「云端文件没更新」还是「CDN 节点缓存旧」。
+    //   各源 rev 一致且都低于本地  → 云端文件本身没更新，purge 缓存没用，得去推文件
+    //   各源 rev 不一致（有的高）  → 确实是 CDN 缓存问题，多源取最高已自动兜底
+    let _sdmProbeLog = [];
+
+    // curl 退出码 → 中文提示，让用户看到"网络连接超时"而不是一脸懵的"__FAIL__:28"
+    const _sdmCurlErrMap = { 6:'网络域名解析失败', 7:'无法连接到服务器', 22:'服务器返回错误', 28:'网络连接超时', 35:'网络安全连接失败', 56:'网络连接中断（网络不稳定，可稍后重试）', 92:'HTTP/2帧错误（网络异常）' };
+    const _sdmCurlErrText = (c) => _sdmCurlErrMap[parseInt(c)] || ('网络传输异常(码' + c + ')');
+    // 可续传的 curl 退出码：这些码意味着下载已部分完成，用 -C - 可以接着下而不必从头来
+    const _sdmCurlResumeEcs = new Set(['18','28','56','92']);
+
+    const _sdmFetchManifest = async (jsonFile) => {
+        const t = Date.now();
+        // 候选源：GitHub raw（源头无缓存）→ 各CDN节点
+        // 注意：jsDelivr 忽略 query string 做缓存 key，?t= 这类时间戳对穿透 CDN 缓存无效，
+        // 真正的解法是「并发问所有源，取 rev 最高的那份」——任一节点缓存了旧清单，
+        // 只要有一个节点已刷新，就能拿到新版本，不必等所有节点缓存到期。
+        const srcs = [SDM_RAW_BASE + jsonFile + '?t=' + t];
+        const labels = ['raw(源头)'];
+        for (const node of [SDM_CDN_ORIGIN, ...SDM_CDN_MIRRORS]) {
+            srcs.push(SDM_GH_BASE.replace('https://' + SDM_CDN_ORIGIN, 'https://' + node) + jsonFile + '?_=' + t);
+            labels.push(node.replace('cdn.jsdelivr.net', 'cdn-cf').replace('fastly.jsdelivr.net', 'fastly-fy')
+                             .replace('testingcf.jsdelivr.net', 'testingcf').replace('cdn.jsdmirror.com', 'jsdmirror')
+                             .replace('jsd.onmicrosoft.cn', 'onmicrosoft'));
+        }
+        const jobs = srcs.map(async (url, i) => {
+            const tmp = '/data/local/tmp/_sdm_mf_' + i + '.tmp';
+            const r = await _sdmRun(`curl -sL --fail --connect-timeout 5 --max-time 15 ${_sdmSq(url)} -o ${_sdmSq(tmp)}; ec=$?; [ "$ec" -eq 0 ] && echo __OK__ || echo __FAIL__:$ec`, 20000);
+            const rec = { file: jsonFile, src: labels[i] || ('src' + i), rev: null, ok: false };
+            if (!String(r?.content || '').includes('__OK__')) { await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000); _sdmProbeLog.push(rec); return null; }
+            const rd = await _sdmRun(`cat ${_sdmSq(tmp)}`, 3000);
+            const text = String(rd?.content || '').trim();
+            await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
+            if (!text || text[0] !== '{') { _sdmProbeLog.push(rec); return null; }
+            try {
+                const j = JSON.parse(text);
+                const good = !!(j.rev && j.js);
+                rec.rev = j.rev || null; rec.ok = good;
+                _sdmProbeLog.push(rec);
+                return good ? j : null;
+            } catch { _sdmProbeLog.push(rec); return null; }
+        });
+        const got = await Promise.all(jobs);
+        let best = null;
+        for (const j of got) { if (j && (!best || _sdmCmpVer(j.rev, best.rev) > 0)) best = j; }
+        return best;
+    };
+
+    const _sdmReadVer = async () => {
+        const r = await _sdmRun(`timeout 2s awk '{print}' ${_sdmSq(SDM_VERSION_FILE)} 2>/dev/null || echo ''`, 5000);
+        return (r && r.content) ? r.content.trim() : '';
+    };
+
+    const _sdmApplyJs = async (newVer) => {
+        const chk = await _sdmRun(`[ -s ${_sdmSq(SDM_PENDING_JS)} ] && echo EXISTS || echo NONE`, 2000);
+        if (!String(chk?.content || '').includes('EXISTS')) return;
+        const r = await _sdmRun(`base64 ${_sdmSq(SDM_PENDING_JS)} | tr -d '\\n'`, 15000);
+        const b64 = String(r?.content || '').trim();
+        if (!b64 || b64.length < 200) { await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`); throw new Error('插件文件异常'); }
+        let newJs;
+        try { newJs = new TextDecoder().decode(Uint8Array.from(atob(b64), c => c.charCodeAt(0))); }
+        catch (e) { await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`); throw new Error('解码失败'); }
+
+        // 完整性校验：插件签名在本文件中固定出现2次（第2行标记 + SDM_SIG定义）
+        // 内容重复（损坏）的文件签名会出现多次，直接拒绝安装
+        const sigCount = newJs.split(SDM_SIG).length - 1;
+        if (sigCount !== 2 || newJs.length < 50000) {
+            await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`);
+            throw new Error('插件文件校验失败（疑似损坏或内容重复），已中止安装');
+        }
+        if (newVer) newJs = newJs.replace(/const PLUGIN_VERSION = '[^']*'/, `const PLUGIN_VERSION = '${newVer}'`);
+
+        const currentText = await getCustomHead();
+        if (!currentText) throw new Error('读取插件列表失败');
+
+        // 用签名标记定位所有本插件的代码块
+        const _esc = s => s.replace(/[\[\]]/g, (c) => '\\' + c);
+        const sP = '<!-- [KANO_PLUGIN_START]';
+        const sE = '<!-- [KANO_PLUGIN_END]';
+        const pluginRegex = new RegExp(_esc(sP) + '\\s*(.*?)\\s*-->([\\s\\S]*?)' + _esc(sE) + '\\s*\\1\\s*-->', 'g');
+        const blocks = [];
+        let _m;
+        while ((_m = pluginRegex.exec(currentText)) !== null) {
+            if (_m[2].includes(SDM_SIG)) blocks.push({ full: _m[0], name: _m[1].trim() });
+        }
+
+        if (blocks.length === 0) throw new Error('未找到当前插件代码块');
+
+        let newText = currentText;
+        const name = blocks[0].name;
+        const newBlock = `${sP} ${name} -->\n${newJs}\n${sE} ${name} -->`;
+        // ★ 必须用函数式替换：直接传字符串时 newJs 里的 $ 符号会被当作特殊替换模式，
+        //   把整个旧插件代码嵌进新代码里（历史"新旧版本冲突"bug的根源）
+        newText = newText.replace(blocks[0].full, () => newBlock);
+        // 删除其余重复的旧块，彻底清除新旧版本共存冲突
+        for (let i = 1; i < blocks.length; i++) {
+            const idx = newText.indexOf(blocks[i].full);
+            if (idx >= 0) newText = newText.slice(0, idx) + newText.slice(idx + blocks[i].full.length);
+        }
+
+        for (let i = 0; i <= 2; i++) {
+            try { const result = await setCustomHead(newText); if (result?.result === 'success') break; throw new Error('保存失败'); }
+            catch (e) { if (i < 2) await _sdmWait(1000 * Math.pow(2, i)); else throw e; }
+        }
+        await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`);
+    };
+
+    const _sdmShowProgress = () => {
+        const steps = [{ id: 'purge', label: '刷新CDN缓存' }, { id: 'manifest', label: '获取版本信息' }, { id: 'dl_js', label: '下载插件代码' }, { id: 'deploy', label: '安装' }, { id: 'complete', label: '完成' }];
+        const st = {}; steps.forEach(s => st[s.id] = 'pending');
+        let finished = false, failInfo = null;
+        const ICONS = { pending: '<span style="color:#94a3b8">○</span>', running: '<span style="animation:sdm_spin 1s linear infinite;display:inline-block">⏳</span>', done: '<span style="color:#86efac">✓</span>', failed: '<span style="color:#f87171">✗</span>' };
+        const { el, close } = createFixedToast('sdm_update_flow', '<div id="sdm_flow_box" style="pointer-events:all;width:88vw;max-width:360px"></div>');
+        const box = el.querySelector('#sdm_flow_box');
+        const render = () => {
+            const pct = finished ? 100 : Math.round(steps.filter(s => st[s.id] === 'done').length / steps.length * 100);
+            const rows = steps.map(s => `<div style="display:flex;align-items:center;gap:8px;padding:3px 0;font-size:.6rem;${st[s.id]==='running'?'color:#60a5fa;':''}">${ICONS[st[s.id]]} ${s.label}</div>`).join('');
+            let failHtml = '';
+            if (failInfo) failHtml = `<div style="margin-top:8px;color:#f87171;font-size:.58rem">${failInfo}</div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px"><button id="sdm_retry" style="font-size:.58rem;padding:4px 12px;border-radius:6px;border:1px solid rgba(34,197,94,.4);background:rgba(34,197,94,.2);color:#86efac">重试</button><button id="sdm_close" style="font-size:.58rem;padding:4px 12px;border-radius:6px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06)">关闭</button></div>`;
+            box.innerHTML = `<div class="title" style="margin:0 0 6px">检查更新</div><div style="height:4px;background:rgba(255,255,255,.1);border-radius:2px;margin:6px 0;overflow:hidden"><div style="height:100%;width:${pct}%;background:#4ade80;transition:width .3s"></div></div>${rows}${failHtml}`;
+            box.querySelector('#sdm_retry')?.addEventListener('click', () => { close(); _sdmCheckUpdate(); });
+            box.querySelector('#sdm_close')?.addEventListener('click', () => close());
+        };
+        render();
+        return { setStep: (id, s) => { if (st[id] !== undefined) { st[id] = s; render(); } }, fail: (msg) => { failInfo = msg; render(); }, done: () => { steps.forEach(s => st[s.id] = 'done'); finished = true; render(); setTimeout(close, 800); }, close };
+    };
+
+    // 「本地版本领先云端」诊断面板
+    // 触发条件：代码里写死的 PLUGIN_VERSION 比云端清单 rev 还高。
+    // 这不是 CDN 缓存问题 —— 源头文件本身就是旧的，刷新缓存救不了，必须去推文件。
+    // 面板直接列出各源实际返回的 rev，一眼看清到底是哪一环没同步。
+    const _sdmShowAheadDiag = (curVer, cloudRev, localRev) => {
+        // 建议的下一个版本号：末位 +1（3.8.2 → 3.8.3）
+        const _np = String(localRev || '0.0.0').split('.').map(n => parseInt(n) || 0);
+        while (_np.length < 3) _np.push(0);
+        _np[2] = (_np[2] || 0) + 1;
+        const _nextV = _np.join('.');
+        const rows = (_sdmProbeLog || []).slice(-12).map(p => {
+            const color = !p.ok ? '#64748b' : (String(p.rev) === String(cloudRev) ? '#86efac' : '#fbbf24');
+            return `<div style="display:flex;justify-content:space-between;font-size:.52rem;padding:2px 0;border-bottom:1px solid rgba(255,255,255,.05)">
+                <span style="color:#94a3b8">${p.file} · ${p.src}</span>
+                <span style="color:${color};font-weight:700">${p.ok ? 'v' + p.rev : '拉取失败'}</span>
+            </div>`;
+        }).join('') || '<div style="font-size:.52rem;color:#64748b">（无源响应记录）</div>';
+
+        const uniq = Array.from(new Set((_sdmProbeLog || []).filter(p => p.ok).map(p => String(p.rev))));
+        const allSame = uniq.length <= 1;
+        const verdict = allSame
+            ? `所有源返回的都是 <b style="color:#fbbf24">v${cloudRev}</b>，说明仓库里的文件本身就是旧的。<br>刷新 CDN 缓存<b>没用</b> —— 源头就没新东西。`
+            : `各源返回不一致（${uniq.map(v => 'v' + v).join(' / ')}），存在 CDN 缓存差异。<br>但即便取最高的 v${cloudRev}，仍低于本地，所以关键还是<b style="color:#fbbf24">仓库文件没更新</b>。`;
+
+        const html = `<div style="pointer-events:all;width:92vw;max-width:400px;max-height:74vh;overflow:auto">
+            <div style="font-size:.66rem;font-weight:800;color:#fbbf24;margin-bottom:6px">⚠️ 本地版本领先云端</div>
+            <div style="font-size:.56rem;line-height:1.7;color:#cbd5e1;margin-bottom:8px">
+                本地插件：<b style="color:#f87171">v${localRev}</b>　云端最新：<b style="color:#86efac">v${cloudRev}</b><br>
+                ${verdict}
+            </div>
+            <div style="font-size:.56rem;font-weight:700;color:#c084fc;margin:8px 0 4px">要修复，需要在仓库里做三件事：</div>
+            <div style="font-size:.54rem;line-height:1.75;color:#94a3b8;background:rgba(0,0,0,.25);padding:7px 9px;border-radius:8px">
+                1. 把本地 sdm.js 推上去（当前仓库那份是旧的）<br>
+                2. <b style="color:#e2e8f0">_latest.json</b> 的 <b style="color:#e2e8f0">rev</b> 改成新版本号<br>
+                3. 新版本号必须 <b style="color:#e2e8f0">大于</b> 本地 v${localRev}，例如 <b style="color:#e2e8f0">v${_nextV}</b>
+            </div>
+            <div style="font-size:.56rem;font-weight:700;color:#c084fc;margin:8px 0 4px">各源实际返回：</div>
+            ${rows}
+            <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">
+                <button id="sdm_diag_copy" style="font-size:.56rem;padding:4px 12px;border-radius:6px;border:1px solid rgba(96,165,250,.4);background:rgba(96,165,250,.18);color:#93c5fd">复制诊断</button>
+                <button id="sdm_diag_close" style="font-size:.56rem;padding:4px 12px;border-radius:6px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.06)">关闭</button>
+            </div>
+        </div>`;
+        const { el, close } = createFixedToast('sdm_ahead_diag', html);
+        el.querySelector('#sdm_diag_close')?.addEventListener('click', () => close());
+        el.querySelector('#sdm_diag_copy')?.addEventListener('click', () => {
+            const txt = ['【SDM 更新诊断】',
+                '本地插件版本: v' + localRev,
+                '设备记录版本: v' + curVer,
+                '云端最新 rev: v' + cloudRev,
+                '结论: ' + (allSame ? '仓库文件未更新（非缓存问题）' : '存在 CDN 缓存差异，但根因仍是仓库文件未更新'),
+                '', '各源返回:'].concat(
+                (_sdmProbeLog || []).map(p => '  ' + p.file + ' · ' + p.src + ' = ' + (p.ok ? 'v' + p.rev : '拉取失败'))
+            ).join('\n');
+            try { navigator.clipboard?.writeText(txt); createToast('诊断信息已复制', 'green', 2000); }
+            catch (e) { createToast('复制失败，请手动截图', 'yellow', 2000); }
+        });
+    };
+
+    // 版本号比较：a>b 返回1，a<b 返回-1，相等返回0
+    const _sdmCmpVer = (a, b) => {
+        const pa = String(a || '0').split('.').map(n => parseInt(n) || 0);
+        const pb = String(b || '0').split('.').map(n => parseInt(n) || 0);
+        for (let i = 0; i < 3; i++) { if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0) ? 1 : -1; }
+        return 0;
+    };
+
+    // 获取版本清单：先试 v{当前版本}.json 入口，拿不到或版本不高于当前时再用 _latest.json 兜底
+    // 这样发新版只需更新 _latest.json + sdm.js + 对应版本文件，不必修改所有历史版本文件
+    const _sdmGetManifest = async (curVer) => {
+        const cur = curVer || PLUGIN_VERSION;
+        const verM = await _sdmFetchManifest('v' + cur + '.json');
+        if (verM && _sdmCmpVer(verM.rev, cur) > 0) return verM;
+        const latestM = await _sdmFetchManifest('_latest.json');
+        if (latestM && _sdmCmpVer(latestM.rev, cur) > 0) return latestM;
+        // 都没有更新时返回一个当前版本的占位，调用方会提示已是最新
+        return latestM || verM || null;
+    };
+
+    const _sdmShowChangelog = (ver, manifest) => {
+        const cl = manifest?.changelog || [];
+        const notes = manifest?.notes || '修复了一些已知问题';
+        let bodyHtml = '';
+        if (cl && cl.length > 0) {
+            bodyHtml = cl.map(item => {
+                const title = item.title || '更新内容';
+                const items = item.items || [];
+                const itemsHtml = items.map(it => `<li>${it}</li>`).join('');
+                return `<div class="sdm-changelog-item"><div class="sdm-changelog-item-title"><span class="dot"></span>${title}</div><ul>${itemsHtml}</ul></div>`;
+            }).join('');
+        } else {
+            bodyHtml = `<div class="sdm-changelog-item"><div class="sdm-changelog-item-title"><span class="dot"></span>本次更新</div><ul><li>${notes}</li></ul></div>`;
+        }
+        const mask = document.createElement('div');
+        mask.className = 'sdm-changelog-mask';
+        mask.innerHTML = `<div class="sdm-changelog-box">
+            <div class="sdm-changelog-header">
+                <div class="sdm-changelog-title">🎉 更新成功 <span class="sdm-changelog-ver">v${ver}</span></div>
+                <div class="sdm-changelog-sub">新版本已安装完成，点击下方按钮刷新生效</div>
+            </div>
+            <div class="sdm-changelog-body">${bodyHtml}</div>
+            <div class="sdm-changelog-footer">
+                <button class="sdm-changelog-btn primary" id="sdm_changelog_refresh">立即刷新</button>
+            </div>
+        </div>`;
+        document.body.appendChild(mask);
+        mask.querySelector('#sdm_changelog_refresh').onclick = () => {
+            mask.style.animation = 'sdm_fade_in .25s ease reverse';
+            setTimeout(() => { mask.remove(); location.reload(); }, 200);
+        };
+    };
+
+    // 检查更新（主入口，绑定到 UI 按钮）
+    const _sdmCheckUpdate = async () => {
+        if (_sdmUpdating) return createToast('正在更新中，请稍候', 'yellow');
+        if (typeof checkAdvancedFunc === 'function' && !(await checkAdvancedFunc())) return;
+        _sdmUpdating = true;
+        _sdmProbeLog = [];   // 每次检查前清空源诊断日志，避免混入上次结果
+        const btn = document.querySelector('#sdm_check_update_btn');
+        if (btn) btn.classList.add('loading');
+        const flow = _sdmShowProgress();
+        try {
+            const prevVer = await _sdmReadVer();
+            const curVer = prevVer || PLUGIN_VERSION;
+            // 先刷新 CDN 缓存，确保刚推送的版本能立刻被拉到（无需手动去 purge）
+            flow.setStep('purge', 'running');
+            await _sdmPurgeCache(['v' + curVer + '.json']);
+            flow.setStep('purge', 'done');
+            flow.setStep('manifest', 'running');
+            const raw = await _sdmGetManifest(curVer);
+            if (!raw) { flow.fail('无法获取版本信息，可能网络不通或仓库未配置'); _sdmUpdating = false; if (btn) btn.classList.remove('loading'); return; }
+            _sdmManifest = raw;
+            flow.setStep('manifest', 'done');
+
+            if (_sdmCmpVer(raw.rev, curVer) <= 0) {
+                flow.close();
+                // 关键区分：云端 rev 低，到底是「确实没发新版」，还是「云端文件根本没推上去」？
+                // 后者表现为：本地 PLUGIN_VERSION 反而高于云端 rev —— 这时刷 CDN 缓存毫无意义，
+                // 因为源头文件就是旧的，必须去把 sdm.js 和 _latest.json 推上去。
+                if (_sdmCmpVer(PLUGIN_VERSION, String(raw.rev).trim()) > 0) {
+                    _sdmShowAheadDiag(curVer, String(raw.rev).trim(), PLUGIN_VERSION);
+                } else {
+                    createToast('当前已是最新版本 v' + curVer, 'green', 3000);
+                }
+                if (btn) { btn.classList.remove('has-update'); const icon = btn.querySelector('.sdm-btn-icon'); if (icon) icon.textContent = '📦'; const bdg = document.querySelector('#sdm_update_badge'); if (bdg) bdg.remove(); }
+                _sdmUpdating = false; if (btn) btn.classList.remove('loading'); return;
+            }
+
+            // 保护本地定制版：代码内写死的版本高于云端时，更新等于降级并覆盖本地修改，直接拦下。
+            // 走到这里说明 raw.rev > curVer 但 PLUGIN_VERSION > raw.rev，
+            // 即「设备记录的版本最旧 < 云端 < 本地代码」——典型是本地改了没推，或仓库 rev 没同步。
+            if (_sdmCmpVer(PLUGIN_VERSION, String(raw.rev).trim()) > 0) {
+                flow.fail(`版本三者对不上：本地代码 v${PLUGIN_VERSION} ＞ 云端 v${raw.rev} ＞ 设备记录 v${curVer}。安装云端版会覆盖本地修改并降级，已阻止。<br>常见原因：① 本地是未推送的定制版；② 仓库推了新版但 _latest.json 的 rev 忘了同步。<br>确需回退官方版，请手动导入仓库的 sdm.js。`);
+                _sdmUpdating = false; if (btn) btn.classList.remove('loading'); return;
+            }
+
+            flow.setStep('dl_js', 'running');
+            const bestNode = await _sdmProbeCdn();
+            const nodes = [bestNode, ...SDM_CDN_MIRRORS.filter(m => m !== bestNode), SDM_CDN_ORIGIN].filter((v, i, a) => a.indexOf(v) === i);
+            // ★ 规范化 manifest 的 js 地址：兼容误填 raw.githubusercontent.com 的情况。
+            //   历史 bug：清单 js 字段填了 raw 地址，replace(SDM_CDN_ORIGIN) 全部无效，
+            //   srcList 变成 6 个相同的 raw 地址（国内不可达），所有设备更新必败。
+            const _sdmParseGhUrl = (u) => {
+                const s = String(u || '');
+                let m = s.match(/cdn\.jsdelivr\.net\/gh\/([^/]+\/[^/@]+)@([^/]+)\/(\S+)/);
+                if (m) return { repo: m[1], ref: m[2], path: m[3] };
+                m = s.match(/raw\.githubusercontent\.com\/([^/]+\/[^/]+)\/([^/]+)\/(\S+)/);
+                if (m) return { repo: m[1], ref: m[2], path: m[3] };
+                return null;
+            };
+            const _gh = _sdmParseGhUrl(raw.js);
+            // CDN 节点优先（国内可达），raw 兜底（源头无缓存）
+            const cdnJsUrl = _gh ? `https://${SDM_CDN_ORIGIN}/gh/${_gh.repo}@${_gh.ref}/${_gh.path}` : String(raw.js);
+            const rawJsUrl = _gh ? `https://raw.githubusercontent.com/${_gh.repo}/${_gh.ref}/${_gh.path}` : String(raw.js);
+            const srcList = [...nodes.map(n => cdnJsUrl.replace(SDM_CDN_ORIGIN, n)), rawJsUrl].filter((v, i, a) => a.indexOf(v) === i);
+            let ok = false;
+            let lastFail = '';
+            let dlVer = '';
+            for (const src of srcList) {
+                const host = String(src).replace(/^https?:\/\//, '').split('/')[0];
+                // 断点续传 + 指数退避重试：同一源最多重试3次，第一次失败后用 -C - 接着下（不从头来），
+                // 退避间隔 800ms→1600ms→3200ms，给网络波动恢复的时间。
+                let dlOk = false;
+                for (let retry = 0; retry < 3; retry++) {
+                    const resumeFlag = retry > 0 ? '-C - ' : '';
+                    const dlR = await _sdmRun(`curl -sL --fail ${resumeFlag}--connect-timeout 8 --max-time 90 --speed-limit 1 --speed-time 45 ${_sdmSq(src)} -o ${_sdmSq(SDM_PENDING_JS)}; ec=$?; [ "$ec" -eq 0 ] && echo __OK__ || echo "__FAIL__:$ec"`, 95000);
+                    const out = String(dlR?.content || '');
+                    if (out.includes('__OK__')) { dlOk = true; break; }
+                    // 提取 curl 退出码，映射成中文
+                    const m = out.match(/__FAIL__:(\d+)/);
+                    const ec = m?.[1] || '?';
+                    if (!_sdmCurlResumeEcs.has(ec)) { await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`, 2000); }  // 不可续传的码删掉残文件
+                    lastFail = `${host}：${_sdmCurlErrText(ec)}` + (retry < 2 ? `（重试${retry+1}/3中…）` : '');
+                    if (retry < 2) await _sdmWait(800 * Math.pow(2, retry));  // 800ms→1600ms→3200ms
+                }
+                if (!dlOk) { lastFail = lastFail || `下载失败（源 ${host}）`; await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`, 2000); continue; }
+                // 下载后即时校验：大小合理 + 签名恰好2行（防CDN缓存旧文件被装成新版本 / 文件损坏 / 内容重复）
+                const vrf = await _sdmRun(`_s=$(wc -c < ${_sdmSq(SDM_PENDING_JS)} 2>/dev/null || echo 0); _c=$(grep -c 'SDM_PLUGIN''_ID:a1b2c3' ${_sdmSq(SDM_PENDING_JS)} 2>/dev/null || echo 0); _v=$(grep -o "const PLUGIN_VERSION = '[^']*'" ${_sdmSq(SDM_PENDING_JS)} 2>/dev/null | head -1 | sed "s/.*'\\(.*\\)'.*/\\1/"); echo "$_s|$_c|$_v"`, 10000);
+                const [dsz, dcnt, dver] = String(vrf?.content || '0|0|').trim().split('|');
+                const sizeOk = (parseInt(dsz) || 0) > 100000;
+                const sigOk = (parseInt(dcnt) || 0) === 2;
+                if (sizeOk && sigOk) {
+                    dlVer = String(dver || '').trim();
+                    // ★ 版本号必须严格匹配清单 rev，否则跳过本源继续试下一个。
+                    //   只靠「大小>100KB + 签名2次」不够——CDN 缓存的旧版文件同样满足这两个条件，
+                    //   会被当成最新装上、覆盖掉本地全部功能（实测：fastly 上缓存的 v3.5.3 / 750KB
+                    //   旧文件，下载成功即被 break 装成了当前版）。版本一致才接受；不一致说明该源
+                    //   还缓存着旧文件，跳过它，最终会落到 raw 源头（GitHub 无缓存、必是仓库最新）。
+                    if (dlVer && dlVer === String(raw.rev).trim()) {
+                        ok = true;
+                        break;
+                    }
+                    lastFail = `${host}：下到 v${dlVer || '?'} ≠ 云端 v${raw.rev}（CDN缓存旧版，跳过试下一个源）`;
+                    await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`, 2000);
+                    continue;
+                }
+                const why = [];
+                if (!sizeOk) why.push(`文件过小 ${dsz || 0}B`);
+                if (!sigOk) why.push(`签名出现 ${dcnt || 0} 次(应为2，文件可能损坏或内容重复)`);
+                lastFail = `${host}：${why.join('；')}`;
+                await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`, 2000);
+            }
+            if (!ok) {
+                flow.fail(`更新中止：${lastFail || '无可用下载源'}。若为刚推送的版本，可能是 CDN 缓存未刷新，请稍后重试`);
+                _sdmUpdating = false; return;
+            }
+            flow.setStep('dl_js', 'done');
+
+            // 以文件真实版本为准，避免把 3.5.5 的文件登记成 3.5.4 导致反复提示更新
+            const finalVer = dlVer || String(raw.rev).trim();
+            flow.setStep('deploy', 'running');
+            await _sdmRun(`mkdir -p ${_sdmSq(SDM_DATA_DIR)}`);
+            await _sdmRun(`echo ${_sdmSq(finalVer)} > ${_sdmSq(SDM_VERSION_FILE)}`);
+            await _sdmApplyJs(finalVer);
+            flow.setStep('deploy', 'done');
+
+            flow.setStep('complete', 'done');
+            flow.done();
+            setTimeout(() => _sdmShowChangelog(finalVer, raw), 500);
+        } catch (e) {
+            flow.fail(e?.message || String(e));
+        } finally {
+            _sdmUpdating = false;
+            if (btn) btn.classList.remove('loading');
+        }
+    };
+
+    // 后台静默检查（面板展开时触发）
+    const _sdmBgCheck = () => {
+        _sdmReadVer().then((devVer) => {
+            if (!devVer) return;
+            _sdmGetManifest(devVer).then((raw) => {
+                if (!raw || _sdmCmpVer(raw.rev, devVer) <= 0) return;
+                _sdmManifest = raw;
+                const btn = document.querySelector('#sdm_check_update_btn');
+                if (btn) {
+                    btn.classList.add('has-update');
+                    const icon = btn.querySelector('.sdm-btn-icon');
+                    if (icon) icon.textContent = '🎉';
+                    if (!document.querySelector('#sdm_update_badge')) {
+                        btn.insertAdjacentHTML('beforeend', `<span id="sdm_update_badge" class="sdm-update-badge">NEW</span>`);
+                    }
+                }
+            }).catch(() => {});
+        });
+    };
+
+    // 版本文件自愈：始终与当前运行代码的版本对齐（手动导入新文件后自动修正，避免检查更新走错入口）
+    _sdmRun(`mkdir -p ${_sdmSq(SDM_DATA_DIR)}`).then(async () => {
+        const fv = await _sdmReadVer();
+        if (fv !== PLUGIN_VERSION) await _sdmRun(`echo ${_sdmSq(PLUGIN_VERSION)} > ${_sdmSq(SDM_VERSION_FILE)}`);
+    });
+
+    // 启动自检：清理重复的插件块（保留版本最新的一个，彻底解决新旧版本共存冲突）
+    const _sdmCleanup = async () => {
+        try {
+            const currentText = await getCustomHead();
+            if (!currentText || !currentText.includes(SDM_SIG)) return;
+            const _esc = s => s.replace(/[\[\]]/g, (c) => '\\' + c);
+            const sP = '<!-- [KANO_PLUGIN_START]';
+            const sE = '<!-- [KANO_PLUGIN_END]';
+            const pluginRegex = new RegExp(_esc(sP) + '\\s*(.*?)\\s*-->([\\s\\S]*?)' + _esc(sE) + '\\s*\\1\\s*-->', 'g');
+            const blocks = [];
+            let _cm;
+            while ((_cm = pluginRegex.exec(currentText)) !== null) {
+                if (_cm[2].includes(SDM_SIG)) {
+                    const vm = _cm[2].match(/const PLUGIN_VERSION = '([^']*)'/);
+                    blocks.push({ full: _cm[0], ver: vm ? vm[1] : '0.0.0' });
+                }
+            }
+            if (blocks.length <= 1) return;
+            const best = blocks.slice().sort((x, y) => _sdmCmpVer(y.ver, x.ver))[0];
+            let newText = currentText;
+            for (const b of blocks) {
+                if (b === best) continue;
+                const idx = newText.indexOf(b.full);
+                if (idx >= 0) newText = newText.slice(0, idx) + newText.slice(idx + b.full.length);
+            }
+            if (newText !== currentText) {
+                await setCustomHead(newText);
+                if (typeof createToast === 'function') createToast('已自动清理重复的旧版本代码，刷新后生效', 'green', 4000);
+            }
+        } catch (e) {}
+    };
+    setTimeout(() => { _sdmCleanup(); }, 1500);
+
+    // ════════════════════════════════════════════════════════════
+    // 以下是原插件代码
+    // ════════════════════════════════════════════════════════════
+    // ===== 热点流量监控数据文件（从第二个插件读取，不修改第二个插件） =====
+    const HOTSPOT_DATA_FILE = '/data/hotspot_traffic/data.json'
+    const HOTSPOT_DATA_FALLBACK = '/sdcard/hotspot_traffic_data.json'
+    const HOTSPOT_POLICY_FILE = '/data/hotspot_traffic/device_policy.json'
+    const HOTSPOT_PID_FILE = '/data/hotspot_traffic/.pid'
+    const HOTSPOT_TRAFFIC_PROC = '/data/local/tmp/hotspot_traffic'
+    const HOTSPOT_BIN_FILE = '/sdcard/hotspot_traffic'
+    const HOTSPOT_BOOT_SH = '/sdcard/ufi_tools_boot.sh'
+    const HOTSPOT_BOOT_LINE = 'cp /sdcard/hotspot_traffic ' + HOTSPOT_TRAFFIC_PROC + ' && chmod 755 ' + HOTSPOT_TRAFFIC_PROC + ' && nohup ' + HOTSPOT_TRAFFIC_PROC + ' >/dev/null 2>&1 &'
+
+    // ============ 热点流量监控数据读取（完全按照第二个插件的方式，不修改第二个插件） ============
+    const HOTSPOT_CUSTOM_NAMES_FILE = '/data/hotspot_traffic/custom_names.txt'
+    const HOTSPOT_LS_PN_PREFIX = 'hotspot_traffic_pn_'
+    let _hotspotNameMap = {}
+    let _hotspotNameMapCacheTime = 0
+    const HOTSPOT_NAME_CACHE_TTL = 30000 // 【网络优化】30秒缓存，避免每次扫描都读取文件
+
+    // 读取自定义设备名称文件（和热点监控插件一致）
+    const loadHotspotNameMap = async () => {
+        try {
+            // 【网络优化】缓存有效期内直接复用，减少shell调用
+            if (Date.now() - _hotspotNameMapCacheTime < HOTSPOT_NAME_CACHE_TTL) return
+            var r = await runShellWithRoot("timeout 2s awk '{print}' " + HOTSPOT_CUSTOM_NAMES_FILE + " 2>/dev/null || echo ''")
+            var map = {}
+            var lines = (r && r.content) ? r.content.split('\n') : []
+            for (var i = 0; i < lines.length; i++) {
+                var line = lines[i]
+                var idx = line.indexOf('|')
+                if (idx > 0) map[line.slice(0, idx).toUpperCase()] = line.slice(idx + 1).trim()
+            }
+            _hotspotNameMap = map
+            _hotspotNameMapCacheTime = Date.now()
+        } catch(e) {
+            _hotspotNameMap = {}
+        }
+    }
+
+    // 完全按照热点监控插件的 resolveDisplayName 逻辑
+    const resolveDisplayName = (device) => {
+        var uMac = (device.mac || '').toUpperCase()
+        // 检查 localStorage 待提交名称（和热点监控插件同一个 key）
+        var pendingKey = HOTSPOT_LS_PN_PREFIX + uMac
+        var pending = null
+        try { pending = localStorage.getItem(pendingKey) } catch(e) {}
+        if (pending !== null) {
+            return pending || ((device.hostname || '').trim() || '未知设备')
+        }
+        // 先用自定义名称文件
+        var customName = (device.customName || '').trim()
+        if (!customName && _hotspotNameMap[uMac]) {
+            customName = _hotspotNameMap[uMac]
+        }
+        return customName || ((device.hostname || '').trim() || '未知设备')
+    }
+
+    // 读取热点流量数据（完全按照热点监控插件的 readStatus 方式，用 awk 而非 cat）
+    const readHotspotTrafficData = async () => {
+        try {
+            // 按照热点监控插件方式：awk '{print}' 比 cat 更可靠
+            var res = await runShellWithRoot("echo __DATA__ && timeout 3s awk '{print}' " + HOTSPOT_DATA_FILE + " 2>/dev/null || timeout 2s awk '{print}' " + HOTSPOT_DATA_FALLBACK + " 2>/dev/null || echo ''")
+            var text = (res && res.content) ? res.content.trim() : ''
+            // 提取 __DATA__ 后的内容
+            if (text.indexOf('__DATA__') >= 0) {
+                text = text.split('__DATA__')[1] || ''
+                text = text.trim()
+            }
+            if (text && text[0] === '{') {
+                var parsed = JSON.parse(text)
+                if (parsed && parsed.devices && typeof parsed.devices === 'object') {
+                    // 同时加载自定义名称文件
+                    await loadHotspotNameMap()
+                    return parsed
+                }
+            }
+        } catch(e) {
+            addDiagLog('读取热点流量数据失败: ' + String(e), 'error')
+        }
+        return null
+    }
+
+    // 同时也检查热点监控版本号
+    const readHotspotVersion = async () => {
+        try {
+            var res = await runShellWithRoot("timeout 2s awk '{print}' /data/hotspot_traffic/.version 2>/dev/null || echo ''")
+            return (res && res.content) ? res.content.trim().replace(/^pending:/, '') : ''
+        } catch(e) { return '' }
+    }
+
+    const readHotspotPolicy = async () => {
+        try {
+            var res = await runShellWithRoot("timeout 2s awk '{print}' " + HOTSPOT_POLICY_FILE + " 2>/dev/null || echo ''")
+            var text = (res && res.content) ? res.content.trim() : ''
+            if (text && (text[0] === '{' || text[0] === '[')) {
+                return JSON.parse(text)
+            }
+        } catch(e) {}
+        return {}
+    }
+
+    // ============ 热点流量监控二进制守护进程管理（完全按照热点监控插件方式） ============
+    let _hotspotDaemonChecked = false
+    let _hotspotLastRecoverTs = 0
+    const checkHotspotDaemon = async () => {
+        try {
+            // 按照热点监控插件方式：用 awk '{print}' 读取 PID，然后 kill -0 检查
+            var checkRes = await runShellWithRoot(
+                "_p=$(timeout 1s awk '{print}' " + HOTSPOT_PID_FILE + " 2>/dev/null); " +
+                "[ -n \"$_p\" ] && kill -0 \"$_p\" 2>/dev/null && echo running=1 || echo running=0"
+            )
+            var checkText = (checkRes.content || '').trim()
+            if (checkText === 'running=1') return true
+
+            // 冷却 30 秒，避免频繁重启尝试
+            if (Date.now() - _hotspotLastRecoverTs < 30000) return false
+            _hotspotLastRecoverTs = Date.now()
+
+            // 检查二进制文件是否存在
+            var binRes = await runShellWithRoot('[ -f ' + HOTSPOT_BIN_FILE + ' ] && echo exists || echo none')
+            if ((binRes.content || '').trim() === 'none') {
+                addDiagLog('热点流量监控二进制文件不存在(/sdcard/hotspot_traffic)，请先安装热点流量监控插件', 'error')
+                return false
+            }
+
+            // 尝试启动（和热点监控插件 recoverDaemonOnce 一致）
+            addDiagLog('热点流量监控守护进程未运行，尝试启动...', 'net')
+            await runShellWithRoot(
+                'cp ' + HOTSPOT_BIN_FILE + ' ' + HOTSPOT_TRAFFIC_PROC + ' && ' +
+                'chmod 755 ' + HOTSPOT_TRAFFIC_PROC + ' && ' +
+                'nohup ' + HOTSPOT_TRAFFIC_PROC + ' >/dev/null 2>&1 &'
+            )
+            // 等待守护进程写入 PID
+            await new Promise(function(r) { setTimeout(r, 1500) })
+
+            // 重新检查
+            var recheckRes = await runShellWithRoot(
+                "_p=$(timeout 1s awk '{print}' " + HOTSPOT_PID_FILE + " 2>/dev/null); " +
+                "[ -n \"$_p\" ] && kill -0 \"$_p\" 2>/dev/null && echo running=1 || echo running=0"
+            )
+            if ((recheckRes.content || '').trim() === 'running=1') {
+                addDiagLog('热点流量监控守护进程已自动恢复启动', 'success')
+                return true
+            }
+            addDiagLog('热点流量监控守护进程启动失败', 'error')
+        } catch(e) {
+            addDiagLog('热点守护进程检查失败: ' + String(e), 'error')
+        }
+        return false
+    }
+
+    const collectDeviceInfo = async () => {
+        try {
+            // 【网络优化】合并5个串行shell调用为1个批量命令，减少网络往返
+            var batchCmd = 'echo __PROPS__\n' +
+                'getprop ro.product.brand 2>/dev/null; echo "---"; getprop ro.product.model 2>/dev/null; echo "---"; getprop ro.product.device 2>/dev/null; echo "---"; getprop ro.build.version.release 2>/dev/null; echo "---"; getprop ro.board.platform 2>/dev/null; echo "---"; getprop ro.product.manufacturer 2>/dev/null\n' +
+                'echo __MAC__\n' +
+                'cat /sys/class/net/wlan0/address 2>/dev/null || ip link show wlan0 2>/dev/null | grep ether | awk \'{print $2}\' || echo ""\n' +
+                'echo __IP__\n' +
+                'ip addr show wlan0 2>/dev/null | grep "inet " | awk \'{print $2}\' | cut -d/ -f1 || echo ""\n' +
+                'echo __CARRIER__\n' +
+                'getprop gsm.operator.alpha 2>/dev/null || echo ""\n' +
+                'echo __ARP__\n' +
+                'cat /proc/net/arp 2>/dev/null | grep -v "00:00:00:00:00:00" | grep -v IP | wc -l\n' +
+                'echo __END__'
+            var batchRes = await runShellWithRoot(batchCmd)
+            var batchText = (batchRes.content || '')
+
+            // 解析批量返回的各部分
+            var propsText = '', macText = '', ipText = '', carrierText = '', arpText = ''
+            if (batchText.indexOf('__PROPS__') >= 0) {
+                propsText = batchText.split('__PROPS__')[1] || ''
+                propsText = propsText.split('__MAC__')[0] || ''
+            }
+            if (batchText.indexOf('__MAC__') >= 0) {
+                macText = batchText.split('__MAC__')[1] || ''
+                macText = macText.split('__IP__')[0] || ''
+            }
+            if (batchText.indexOf('__IP__') >= 0) {
+                ipText = batchText.split('__IP__')[1] || ''
+                ipText = ipText.split('__CARRIER__')[0] || ''
+            }
+            if (batchText.indexOf('__CARRIER__') >= 0) {
+                carrierText = batchText.split('__CARRIER__')[1] || ''
+                carrierText = carrierText.split('__ARP__')[0] || ''
+            }
+            if (batchText.indexOf('__ARP__') >= 0) {
+                arpText = batchText.split('__ARP__')[1] || ''
+                arpText = arpText.split('__END__')[0] || ''
+            }
+
+            var parts = propsText.split('---').map(function(s) { return s.trim() })
+            var brand = parts[0] || '未知'
+            var model = parts[1] || '未知'
+            var device = parts[2] || '未知'
+            var androidVersion = parts[3] || '未知'
+            var cpu = parts[4] || '未知'
+            var manufacturer = parts[5] || brand
+            var mac = macText.trim()
+            var wifiIp = ipText.trim()
+            var carrier = carrierText.trim() || '无SIM'
+            var connectedDevices = parseInt(arpText.trim()) || 0
+            var deviceBrand = getBrandByMac(mac) || brand
+            if (deviceBrand === '网络设备') deviceBrand = brand
+            var report = {
+                device: {
+                    brand: brand,
+                    model: model,
+                    device: device,
+                    manufacturer: manufacturer,
+                    androidVersion: androidVersion,
+                    cpu: cpu,
+                    mac: mac,
+                    deviceBrand: deviceBrand
+                },
+                network: {
+                    wifiIp: wifiIp,
+                    carrier: carrier,
+                    connectedDevices: connectedDevices
+                },
+                activity: {
+                    isGame: GAME_BOOST_ACTIVE,
+                    name: GAME_BOOST_CURRENT || (GAME_BOOST_ACTIVE ? '游戏中' : '空闲'),
+                    gamePkg: GAME_BOOST_PKG || ''
+                },
+                gameBoost: {
+                    active: GAME_BOOST_ACTIVE,
+                    currentGame: GAME_BOOST_CURRENT,
+                    duration: GAME_BOOST_START_TIME > 0 ? Math.floor((Date.now() - GAME_BOOST_START_TIME) / 1000) : 0,
+                    packetRepairRate: PACKET_REPAIR_RATE.toFixed(1) + '%',
+                    latencyBefore: LATENCY_BEFORE,
+                    latencyAfter: LATENCY_AFTER
+                },
+                pluginVersion: PLUGIN_VERSION,
+                timestamp: new Date().toLocaleString()
+            }
+            return report
+        } catch(e) {
+            addDiagLog('收集设备信息失败: '+String(e), 'error')
+            return null
+        }
+    }
+
+    const TICKET_FILE = '/data/sdm_admin/user_tickets.json'
+    const TICKET_FALLBACK = '/sdcard/sdm_tickets.json'
+    let USER_TICKETS = []
+
+    const loadTickets = async () => {
+        try {
+            var res = await runShellWithRoot('timeout 2s cat ' + TICKET_FILE + ' 2>/dev/null || timeout 2s cat ' + TICKET_FALLBACK + ' 2>/dev/null || echo ""')
+            var text = (res.content || '').trim()
+            if (text && text[0] === '[') {
+                USER_TICKETS = JSON.parse(text)
+            } else if (text && text[0] === '{') {
+                USER_TICKETS = [JSON.parse(text)]
+            } else {
+                USER_TICKETS = []
+            }
+        } catch(e) {
+            USER_TICKETS = []
+        }
+        renderTickets()
+    }
+
+    const renderTickets = () => {
+        var listEl = document.querySelector('#smart_ticket_list')
+        var countEl = document.querySelector('#smart_ticket_count')
+        if (!listEl) return
+        if (countEl) countEl.textContent = '已提交 ' + USER_TICKETS.length + ' 条'
+        if (USER_TICKETS.length === 0) {
+            listEl.innerHTML = '<div style="text-align:center;padding:12px;opacity:.4;font-size:.55rem">暂无工单，在下面提交你的建议</div>'
+            return
+        }
+        var typeMap = { suggestion: '💡 功能建议', bug: '🐛 问题反馈', other: '💬 其他' }
+        var statusMap = { pending: '待处理', processing: '处理中', done: '已处理', rejected: '已驳回' }
+        var statusColor = { pending: '#fbbf24', processing: '#60a5fa', done: '#4ade80', rejected: '#ef4444' }
+        listEl.innerHTML = USER_TICKETS.slice(0, 20).map(function(t) {
+            var typeName = typeMap[t.type] || '💬 其他'
+            var status = t.status || 'pending'
+            var statusName = statusMap[status] || '待处理'
+            var sColor = statusColor[status] || '#fbbf24'
+            var adminReply = t.adminReply ? '<div style="font-size:.45rem;opacity:.7;margin-top:3px;padding:4px 6px;border-radius:6px;background:rgba(167,139,250,.08);border-left:2px solid #a78bfa;">管理员回复: ' + t.adminReply + '</div>' : ''
+            return '<div style="padding:8px;margin-bottom:6px;border-radius:10px;background:rgba(96,165,250,.06);border:1px solid rgba(96,165,250,.1);">' +
+                '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;">' +
+                    '<span style="font-size:.5rem;font-weight:bold;color:#60a5fa;">' + typeName + '</span>' +
+                    '<span style="font-size:.4rem;padding:1px 6px;border-radius:6px;background:' + sColor + '22;color:' + sColor + ';">' + statusName + '</span>' +
+                '</div>' +
+                '<div style="font-size:.5rem;opacity:.8;">' + (t.content || '') + '</div>' +
+                adminReply +
+                '<div style="font-size:.4rem;opacity:.3;text-align:right;margin-top:2px;">' + (t.timestamp || '') + '</div>' +
+            '</div>'
+        }).join('')
+    }
+
+    const submitTicket = async () => {
+        var typeEl = document.querySelector('#smart_ticket_type')
+        var inputEl = document.querySelector('#smart_ticket_input')
+        if (!typeEl || !inputEl) return
+        var type = typeEl.value || 'suggestion'
+        var content = inputEl.value.trim()
+        if (!content) {
+            createToast('请输入内容', 'red', 3000)
+            return
+        }
+        if (content.length > 500) {
+            createToast('内容过长，请精简到500字以内', 'red', 3000)
+            return
+        }
+        createToast('正在提交工单...', 'pink', 3000)
+        var deviceInfo = await collectDeviceInfo()
+        var ticket = {
+            id: 'TK' + Date.now(),
+            type: type,
+            content: content,
+            status: 'pending',
+            timestamp: new Date().toLocaleString(),
+            device: deviceInfo ? deviceInfo.device.brand + ' ' + deviceInfo.device.model : '未知设备',
+            pluginVersion: PLUGIN_VERSION,
+            adminReply: ''
+        }
+        USER_TICKETS.unshift(ticket)
+        var json = JSON.stringify(USER_TICKETS)
+        var escaped = json.replace(/'/g, "'\\''")
+        try {
+            var res = await runShellWithRoot("mkdir -p /data/sdm_admin 2>/dev/null; echo '" + escaped + "' > " + TICKET_FILE + " 2>/dev/null; echo '" + escaped + "' > " + TICKET_FALLBACK + " 2>/dev/null; chmod 644 " + TICKET_FALLBACK + " 2>/dev/null; echo TICKET_OK")
+            if (res.content && res.content.includes('TICKET_OK')) {
+                inputEl.value = ''
+                renderTickets()
+                createToast('工单已提交，感谢你的反馈！', 'green', 4000)
+                addLog('提交工单: [' + type + '] ' + content.substring(0, 30))
+                addDiagLog('工单已提交: ' + ticket.id, 'success')
+            } else {
+                createToast('提交失败，请重试', 'red', 3000)
+                addDiagLog('工单提交失败', 'error')
+            }
+        } catch(e) {
+            createToast('提交异常: ' + e, 'red', 3000)
+            addDiagLog('工单异常: ' + String(e), 'error')
+        }
+    }
+
+    const checkAdvanceFunc = async () => {
+        try {
+            const res = await runShellWithRoot('whoami')
+            if (res.content && res.content.includes('root')) return true
+        } catch(e) {}
+        return false
+    }
+
+    // 【内存优化】缓存日志DOM元素，避免每次查询
+    let _logAreaEl = null
+    let _diagLogEl = null
+    const LOG_MAX_LEN = 200
+
+    const addLog = (msg) => {
+        const now = new Date()
+        const time = String(now.getHours()).padStart(2,'0')+':'+String(now.getMinutes()).padStart(2,'0')+':'+String(now.getSeconds()).padStart(2,'0')
+        ACTIVITY_LOG.unshift('['+time+'] '+msg)
+        // 【内存优化】用length截断替代slice，不创建新数组，减少GC压力
+        if (ACTIVITY_LOG.length > LOG_MAX_LEN) ACTIVITY_LOG.length = LOG_MAX_LEN
+        if (!_logAreaEl) _logAreaEl = document.querySelector("#smart_log_area")
+        if (_logAreaEl) {
+            _logAreaEl.value = ACTIVITY_LOG.join('\n')
+            _logAreaEl.scrollTop = 0
+        }
+    }
+
+    const addDiagLog = (msg, level) => {
+        const now = new Date()
+        const time = String(now.getHours()).padStart(2,'0')+':'+String(now.getMinutes()).padStart(2,'0')+':'+String(now.getSeconds()).padStart(2,'0')
+        const tag = level === 'game' ? '[GAME]' : level === 'net' ? '[NET]' : level === 'warn' ? '[WARN]' : level === 'error' ? '[ERR]' : level === 'success' ? '[OK]' : '[INFO]'
+        DIAG_LOG.unshift('['+time+']'+tag+' '+msg)
+        if (DIAG_LOG.length > LOG_MAX_LEN) DIAG_LOG.length = LOG_MAX_LEN
+        if (!_diagLogEl) _diagLogEl = document.querySelector('#smart_diag_log')
+        if (_diagLogEl) {
+            _diagLogEl.value = DIAG_LOG.join('\n')
+            _diagLogEl.scrollTop = 0
+        }
+    }
+
+    const MAC_OUI_DB = {
+        // Apple
+        'AC:DE:48':'Apple','A4:5E:60':'Apple','DC:A4:CA':'Apple','F0:18:98':'Apple','28:E0:2C':'Apple','3C:07:54':'Apple','AC:3C:0A':'Apple','70:73:CB':'Apple','64:20:DA':'Apple','D0:81:7D':'Apple','90:8D:78':'Apple','B0:19:D6':'Apple','A0:99:9B':'Apple','1C:91:80':'Apple','F4:5C:89':'Apple','30:90:8F':'Apple','7C:C5:37':'Apple','8C:85:90':'Apple','C0:63:13':'Apple','68:96:7B':'Apple','D8:30:62':'Apple','9C:20:31':'Apple','40:33:1A':'Apple','88:66:5B':'Apple','50:7A:F5':'Apple','AC:CF:85':'Apple','58:1F:AA':'Apple','B4:4B:D6':'Apple',
+        // Huawei
+        '00:9A:CD':'Huawei','AC:4E:91':'Huawei','CC:B1:1A':'Huawei','A4:CF:5A':'Huawei','B0:C5:54':'Huawei','80:9A:58':'Huawei','00:E0:4C':'Huawei','7C:1C:4E':'Huawei','4C:CC:8A':'Huawei','C8:E3:19':'Huawei','34:29:12':'Huawei','28:31:52':'Huawei','FC:64:74':'Huawei','A0:AF:CB':'Huawei','50:01:4A':'Huawei','84:DB:21':'Huawei','E0:43:DB':'Huawei','F0:7B:8C':'Huawei','48:00:BF':'Huawei','E4:61:3E':'Huawei','2C:AB:00':'Huawei','74:E5:43':'Huawei','D0:2E:AB':'Huawei','1C:F2:A4':'Huawei','EC:74:BA':'Huawei','04:65:9D':'Huawei',
+        // Xiaomi / Redmi
+        '64:09:80':'Xiaomi','F8:A4:5F':'Xiaomi','4C:49:62':'Xiaomi','C4:0B:CB':'Xiaomi','34:80:40':'Xiaomi','C8:1C:54':'Xiaomi','5C:02:72':'Xiaomi','A4:50:46':'Xiaomi','B0:E2:35':'Xiaomi','DC:08:0D':'Xiaomi','94:65:9C':'Xiaomi','C0:EE:FB':'Xiaomi','58:44:98':'Redmi','7C:5C:71':'Redmi','8C:5C:8B':'iQOO','38:F9:D3':'Xiaomi','CC:B1:5A':'Xiaomi','B0:0E:65':'Xiaomi','AC:C1:EE':'Xiaomi','A0:8D:22':'Xiaomi','B0:48:1A':'Xiaomi',
+        // OPPO / OnePlus / realme
+        '3C:BD:3A':'OPPO','C0:F8:10':'OPPO','94:EB:CD':'OPPO','A0:37:42':'OPPO','90:1B:71':'OPPO','7C:11:6A':'OPPO','20:A6:08':'OPPO','C0:EE:18':'OnePlus','64:16:66':'OnePlus','A0:8D:22':'OnePlus','A4:9A:58':'Honor','C8:9C:12':'Honor','A0:8A:2E':'Honor','B4:CD:27':'Honor','2C:AB:00':'realme','B0:82:7C':'realme','C0:38:78':'OPPO','94:2E:B0':'OPPO','44:63:49':'OPPO',
+        // vivo
+        '5C:31:2E':'vivo','A0:59:35':'vivo','9C:2E:A1':'vivo','B0:CC:DF':'vivo','14:9F:E3':'vivo','8C:25:30':'vivo','D4:AD:51':'vivo','20:82:A9':'vivo','B0:15:BD':'vivo','F0:79:59':'vivo','54:0E:85':'vivo','24:8A:07':'vivo',
+        // Samsung
+        '00:12:FB':'Samsung','C0:97:3E':'Samsung','50:CC:F7':'Samsung','8C:8E:8E':'Samsung','5C:0A:5B':'Samsung','FC:8A:E5':'Samsung','AC:5F:3F':'Samsung','B0:5C:99':'Samsung','38:AA:3C':'Samsung','A8:F8:39':'Samsung','E0:2A:ED':'Samsung','B0:09:DA':'Samsung','D4:97:0B':'Samsung','88:32:1F':'Samsung','34:14:49':'Samsung','14:1F:BA':'Samsung',
+        // ZTE / nubia
+        '00:1F:E2':'ZTE','C8:64:68':'ZTE','24:05:0F':'ZTE','5C:EA:1D':'ZTE','08:D2:7B':'ZTE','F0:5C:77':'ZTE','58:7A:6B':'ZTE','00:11:92':'nubia','C4:0B:4D':'nubia','C0:EE:FB':'ZTE','D8:E0:E1':'ZTE','F4:EE:3A':'ZTE',
+        // Meizu
+        '04:92:5A':'Meizu','8C:BE:BE':'Meizu','B0:13:2D':'Meizu','E0:1C:88':'Meizu','E4:54:C3':'Meizu',
+        // Lenovo
+        '00:24:54':'Lenovo','14:5A:05':'Lenovo','C8:FF:28':'Lenovo','00:24:E4':'Lenovo PC','F0:76:1C':'Lenovo PC','C0:38:0E':'Lenovo','50:46:78':'Lenovo',
+        // Microsoft / Dell / HP
+        '00:0D:3A':'Microsoft','5C:7F:17':'Microsoft','00:14:A4':'Dell','00:14:22':'Dell','F8:DB:88':'Dell','D4:AE:52':'Dell','00:1A:A0':'HP','00:24:A8':'HP','3C:5A:B4':'HP','A0:48:1C':'HP','F4:5C:89':'HP',
+        // ASUS
+        '00:0C:29':'ASUS','00:11:2F':'ASUS','F8:DB:7F':'ASUS','AC:9B:0A':'ASUS','38:D5:47':'ASUS','E0:3F:49':'ASUS',
+        // Networking
+        '00:25:9C':'Cisco','00:1A:6C':'Cisco','FC:FB:FB':'Cisco','00:1D:0F':'TPLink','50:BD:5F':'TPLink','F4:EC:38':'TPLink','EC:08:6B':'TPLink','00:0C:43':'TP-Link','14:CC:82':'TP-Link','B0:48:1A':'TP-Link','00:E0:4C':'Realtek','00:13:46':'Realtek','00:1B:DE':'Netgear','00:1F:33':'Netgear','28:3B:71':'Netgear','00:11:95':'Netgear','C0:3F:0E':'Netgear','44:94:FC':'Netgear','9C:3D:CF':'Netgear','E0:46:9A':'Netgear','A0:21:B7':'Netgear',
+        // Raspberry Pi
+        'B8:27:EB':'RaspberryPi','DC:A6:32':'RaspberryPi','E4:5F:01':'RaspberryPi','28:CD:C1':'RaspberryPi',
+        // Google
+        'B0:F1:1C':'Google','F4:F5:E8':'Google','3C:28:6D':'Google','F4:6A:6D':'Google','94:18:65':'Google','30:95:65':'Google',
+        // Sony
+        'A4:34:D9':'Sony','B8:8D:12':'Sony','5C:9D:5E':'Sony','10:68:45':'Sony','7C:11:BE':'Sony',
+        // Nokia / Motorola / TCL / Letv
+        '00:19:86':'Nokia','48:43:B7':'Nokia','00:1C:D7':'Motorola','00:23:76':'Motorola','E0:73:E7':'Motorola','90:03:B7':'TCL','5C:52:2E':'TCL','B4:0B:44':'Letv','7C:B2:32':'Letv','90:B1:0D':'Letv',
+        // Smart TV / Streaming
+        '04:E6:57':'SmartTV','C0:8A:DE':'SmartTV','70:7E:2D':'SmartTV','A0:C9:E4':'SmartTV','5C:49:8C':'SmartTV','80:3F:54':'SmartTV','74:03:BD':'SmartTV','CC:6E:73':'SmartTV','D4:05:DB':'SmartTV','E8:40:41':'SmartTV','F0:79:38':'SmartTV','48:BF:6B':'SmartTV',
+        // Various IoT / Smart Home
+        '18:05:32':'IoT','68:9E:19':'IoT','A0:02:42':'IoT','74:DA:38':'IoT','D0:03:04':'IoT','7C:DD:A1':'IoT','EC:11:21':'IoT',
+        // PC manufacturers
+        '00:1D:72':'Acer','00:1D:7B':'Acer','30:5A:3A':'Acer','D4:9E:FC':'Acer','00:1B:38':'MSI','00:11:0A':'MSI','C0:4A:00':'MSI',
+        // Tablets
+        '00:1A:9B':'Teclast','20:82:E0':'Teclast','C0:3E:0A':'Teclast','10:02:B4':'Cube','C0:97:3E':'Cube',
+        // VR / AR
+        'C0:EE:FB':'Meta','D4:1E:28':'Meta','54:35:4D':'Meta',
+        // Nintendo / Gaming
+        '00:0C:6E':'Nintendo','00:17:AB':'Nintendo','00:1D:83':'Nintendo','00:1F:C5':'Nintendo','00:23:31':'Nintendo','00:23:CC':'Nintendo','00:26:32':'Nintendo','00:2B:32':'Nintendo',
+    }
+    Object.freeze(MAC_OUI_DB) // 【内存优化】冻结只读常量，防止意外修改
+    const BRAND_INFO = {
+        'Apple':{bg:'linear-gradient(135deg,#555,#999)',text:'',label:'Apple'},
+        'Huawei':{bg:'linear-gradient(135deg,#C8102E,#E63946)',text:'HW',label:'华为'},
+        'Xiaomi':{bg:'linear-gradient(135deg,#FF6900,#FF8C42)',text:'MI',label:'小米'},
+        'Redmi':{bg:'linear-gradient(135deg,#FF4D4D,#FF6B35)',text:'红',label:'红米'},
+        'OPPO':{bg:'linear-gradient(135deg,#00A651,#0EAE57)',text:'OP',label:'OPPO'},
+        'vivo':{bg:'linear-gradient(135deg,#415FFF,#6B8CFF)',text:'vivo',label:'vivo'},
+        'iQOO':{bg:'linear-gradient(135deg,#000,#333)',text:'iQ',label:'iQOO'},
+        'Samsung':{bg:'linear-gradient(135deg,#1428A0,#243BD8)',text:'SS',label:'三星'},
+        'OnePlus':{bg:'linear-gradient(135deg,#EB0028,#FF4D5A)',text:'1+',label:'一加'},
+        'Honor':{bg:'linear-gradient(135deg,#1A237E,#3949AB)',text:'荣耀',label:'荣耀'},
+        'ZTE':{bg:'linear-gradient(135deg,#005BAC,#0080D0)',text:'ZTE',label:'中兴'},
+        'realme':{bg:'linear-gradient(135deg,#FFC601,#FFD73C)',text:'R',label:'真我'},
+        'Meizu':{bg:'linear-gradient(135deg,#00A6E0,#00C2FF)',text:'MZ',label:'魅族'},
+        'Lenovo':{bg:'linear-gradient(135deg,#E2231A,#E8484B)',text:'LE',label:'联想'},
+        'nubia':{bg:'linear-gradient(135deg,#C8102E,#E63946)',text:'NZ',label:'努比亚'},
+        'Microsoft':{bg:'linear-gradient(135deg,#0078D4,#00A4EF)',text:'MS',label:'微软'},
+        'Dell':{bg:'linear-gradient(135deg,#007DB8,#00A4D8)',text:'DE',label:'戴尔'},
+        'HP':{bg:'linear-gradient(135deg,#0096D6,#00B4E0)',text:'HP',label:'惠普'},
+        'ASUS':{bg:'linear-gradient(135deg,#003087,#0055B3)',text:'AS',label:'华硕'},
+        'Lenovo PC':{bg:'linear-gradient(135deg,#E2231A,#E8484B)',text:'LE',label:'联想'},
+        'Cisco':{bg:'linear-gradient(135deg,#1BA0E2,#0A7CAB)',text:'CI',label:'思科'},
+        'TPLink':{bg:'linear-gradient(135deg,#0A7CBA,#1B9FE0)',text:'TP',label:'TP-Link'},
+        'TP-Link':{bg:'linear-gradient(135deg,#0A7CBA,#1B9FE0)',text:'TP',label:'TP-Link'},
+        'Realtek':{bg:'linear-gradient(135deg,#00B388,#00C994)',text:'RT',label:'瑞昱'},
+        'Netgear':{bg:'linear-gradient(135deg,#4B3A8A,#6B52B5)',text:'NG',label:'网件'},
+        'RaspberryPi':{bg:'linear-gradient(135deg,#C51A4A,#E83E68)',text:'RPi',label:'树莓派'},
+        'Google':{bg:'linear-gradient(135deg,#4285F4,#5A9BF5)',text:'GG',label:'Google'},
+        'Sony':{bg:'linear-gradient(135deg,#333,#555)',text:'SO',label:'索尼'},
+        'Nokia':{bg:'linear-gradient(135deg,#124191,#1B5FCC)',text:'NK',label:'诺基亚'},
+        'Motorola':{bg:'linear-gradient(135deg,#0A5CB8,#1273E0)',text:'MT',label:'摩托罗拉'},
+        'TCL':{bg:'linear-gradient(135deg,#0082C8,#009FE3)',text:'TCL',label:'TCL'},
+        'Letv':{bg:'linear-gradient(135deg,#D33A2C,#E8584C)',text:'LE',label:'乐视'},
+        'SmartTV':{bg:'linear-gradient(135deg,#1a237e,#283593)',text:'TV',label:'智能电视'},
+        'IoT':{bg:'linear-gradient(135deg,#455a64,#607d8b)',text:'IoT',label:'智能设备'},
+        'Acer':{bg:'linear-gradient(135deg,#83b81a,#a4d637)',text:'AC',label:'宏碁'},
+        'MSI':{bg:'linear-gradient(135deg,#c8102e,#e63946)',text:'MSI',label:'微星'},
+        'Teclast':{bg:'linear-gradient(135deg,#ff6d00,#ff9100)',text:'TE',label:'台电'},
+        'Cube':{bg:'linear-gradient(135deg,#5c6bc0,#7986cb)',text:'CB',label:'酷比魔方'},
+        'Meta':{bg:'linear-gradient(135deg,#1d44b4,#3b5fd9)',text:'MT',label:'Meta'},
+        'Nintendo':{bg:'linear-gradient(135deg,#d62828,#e63946)',text:'ND',label:'任天堂'},
+    }
+    Object.freeze(BRAND_INFO) // 【内存优化】冻结只读常量
+    const HOSTNAME_MODEL_DB = {
+        // Apple
+        'iphone':'iPhone','ipad':'iPad','ipod':'iPod','macbook':'MacBook','imac':'iMac','macmini':'Mac mini','apple':'Apple设备',
+        // Samsung
+        'sm-g998':'三星 S21 Ultra','sm-g991':'三星 S21','sm-g996':'三星 S21+','sm-g990':'三星 S21 FE',
+        'sm-g970':'三星 S10','sm-g975':'三星 S10+','sm-g960':'三星 S9','sm-g965':'三星 S9+',
+        'sm-g930':'三星 S8','sm-g935':'三星 S8+','sm-g950':'三星 S8','sm-g955':'三星 S8+',
+        'sm-g9':'三星 S系列','sm-a':'三星 A系列','sm-m':'三星 M系列','sm-n':'三星 Note系列','sm-s':'三星 S系列',
+        'sm-t':'三星 Tab系列','sm-p':'三星 Tab系列',
+        // Xiaomi / Redmi
+        'redmi':'红米','redmi-note':'红米 Note','redmi-k':'红米 K系列','redmi-pad':'红米 Pad',
+        'mi-':'小米','miui':'小米','hmnote':'红米 Note','miphone':'小米手机','xiaomi':'小米',
+        'm2007':'红米 K30','m2012':'红米 K40','m2104':'红米 K40 Gaming','2201':'红米 Note 11','2202':'红米 Note 11 Pro',
+        '2301':'红米 Note 12','2302':'红米 Note 12 Pro','2312':'红米 K70','2311':'红米 K70 Pro',
+        '2401':'小米14','23127':'小米14 Pro',
+        // Huawei / Honor
+        'huawei':'华为','honor':'荣耀','nova':'华为 Nova','p30':'华为 P30','p40':'华为 P40','p50':'华为 P50','mate':'华为 Mate',
+        'p60':'华为 P60','p70':'华为 Pura 70','aln':'华为 Mate 60','bgo':'华为 Mate 50','cma':'华为 Nova 11',
+        'honor-v':'荣耀 V系列','honor-play':'荣耀 Play','honor-x':'荣耀 X系列','honor-magic':'荣耀 Magic',
+        // OPPO / OnePlus / realme
+        'oppo':'OPPO','oneplus':'一加','realme':'真我','oneplus8':'一加 8','oneplus9':'一加 9','oneplus10':'一加 10',
+        'oneplus11':'一加 11','oneplus12':'一加 12','op5953':'OPPO Find X6','op5951':'OPPO Find X5',
+        'cph':'OPPO 手机','phb':'OPPO 手机','pjp':'OPPO 手机',
+        // vivo / iQOO
+        'vivo':'vivo','iqoo':'iQOO','vivo-x':'vivo X系列','vivo-s':'vivo S系列','vivo-y':'vivo Y系列',
+        'v2204':'vivo X80','v2241':'vivo X90','v2304':'vivo X100','v2316':'iQOO 12','v2309':'iQOO 11',
+        'pd2':'vivo 手机','pd4':'vivo 手机',
+        // Google / Sony / Nokia / Motorola
+        'pixel':'Google Pixel','pixel-5':'Pixel 5','pixel-6':'Pixel 6','pixel-7':'Pixel 7','pixel-8':'Pixel 8',
+        'nokia':'诺基亚','motorola':'摩托罗拉','moto':'摩托罗拉','moto-edge':'摩托罗拉 Edge',
+        // PC / Laptop
+        'lenovo':'联想','thinkpad':'ThinkPad','ideapad':'IdeaPad','thinkbook':'ThinkBook','yoga':'Yoga',
+        'dell':'戴尔','latitude':'Latitude','inspiron':'Inspiron','xps':'XPS','hp':'惠普','pavilion':'Pavilion','omen':'OMEN','elitebook':'EliteBook',
+        'asus':'华硕','rog':'ROG','zenbook':'ZenBook','tuf':'TUF','acernitro':'Acer Nitro','aspire':'Aspire',
+        'msi':'MSI','raider':'Raider','stealth':'Stealth','vector':'Vector',
+        // IoT / Smart Home
+        'raspberrypi':'树莓派','raspberry':'树莓派','esp8266':'ESP8266','esp32':'ESP32','arduino':'Arduino',
+        'alexa':'Echo','echo':'Echo','google-home':'Google Home','home-assistant':'Home Assistant',
+        // TV / Streaming
+        'androidtv':'Android TV','smarttv':'智能电视','firetv':'Fire TV','appletv':'Apple TV','chromecast':'Chromecast',
+        'xiaomi-tv':'小米电视','redmi-tv':'红米电视','hisense':'海信','tcl-tv':'TCL电视','skyworth':'创维',
+        // Gaming
+        'nintendo':'任天堂','switch':'Nintendo Switch','steamdeck':'Steam Deck',
+        'metaquest':'Meta Quest','oculus':'Oculus Quest',
+    }
+    Object.freeze(HOSTNAME_MODEL_DB) // 【内存优化】冻结只读常量
+    const GAME_PKG_DB = {
+        // 腾讯系
+        'com.tencent.tmgp.pubgmhd':'和平精英','com.tencent.tmgp.sgame':'王者荣耀',
+        'com.tencent.tmgp.cf':'穿越火线','com.tencent.tmgp.speedmobile':'QQ飞车',
+        'com.tencent.tmgp.dnf':'DNF手游','com.tencent.tmgp.lolm':'英雄联盟手游',
+        'com.tencent.tmgp.mbsj':'使命召唤手游','com.tencent.tmgp.nns':'火影忍者',
+        'com.tencent.tmgp.hyr':'火影忍者','com.tencent.tmgp.viv':'天天酷跑',
+        'com.tencent.tmgp.honor':'QQ华夏','com.tencent.tmgp.mg':'全民枪王',
+        'com.tencent.tmgp.dj':'天天炫斗','com.tencent.mobileqq':'QQ(游戏大厅)',
+        'com.tencent.qggames':'QQ游戏大厅','com.tencent.androidqqgame':'QQ游戏',
+        'com.tencent.tmgp.bns':'剑灵','com.tencent.tmgp.mc':'我的世界(腾讯版)',
+        'com.tencent.tmgp.chess':'天天象棋','com.tencent.tmgp.mj':'欢乐麻将',
+        'com.tencent.tmgp.poker':'欢乐斗地主','com.tencent.tmgp.landlord':'欢乐斗地主',
+        'com.tencent.cloudgame':'腾讯START云游戏',
+        // 王牌战争（文明重启）
+        'com.yingxiong.hero.aligames':'王牌战争','com.yingxiong.hero':'王牌战争','com.yingxiong.hero4399':'王牌战争',
+        // 米哈游
+        'com.miHoYo.GenshinImpact':'原神','com.miHoYo.YuanShen':'原神B服',
+        'com.miHoYo.enterprise.NGHSoD':'崩坏：星穹铁道','com.miHoYo.Hokai3':'崩坏3',
+        'com.miHoYo.ZenlessZoneZero':'绝区零','com.miHoYo.HoYoPlay':'米哈游启动器',
+        'com.miHoYo.enterprise.QYHF':'未定事件簿','com.miHoYo.incave':'天空之傲',
+        'com.miHoYo.enterprise.NHOTHP':'崩坏3(测试)',
+        // 网易
+        'com.netease.onmyoji':'阴阳师','com.netease.mrzh':'率土之滨','com.netease.zjz':'决战平安京',
+        'com.netease.sky':'Sky光遇','com.netease.dwrg':'第五人格','com.netease.g27':'荒野行动',
+        'com.netease.hyhd':' hypergryph','com.netease.mrzh.hd':'率土之滨HD',
+        'com.netease.ez':'大话西游','com.netease.x60':'梦幻西游','com.netease.df':'大航海之路',
+        'com.netease.cloudgame':'网易云游戏','com.netease.chinasword':'逆水寒',
+        'com.netease.mrzh.hd':'率土之滨HD','com.netease.lxhy':'流星蝴蝶剑',
+        'com.netease.win':'战意','com.netease.dao':'永劫无间手游',
+        // Supercell
+        'com.supercell.clashroyale':'皇室战争','com.supercell.clashofclans':'部落冲突',
+        'com.supercell.clashofclans.cn':'部落冲突(中国版)','com.supercell.brawlstars':'荒野乱斗',
+        'com.supercell.squadbusters':' squadronbusters','com.supercell.hayday':'卡通农场',
+        'com.supercell.boombeach':'海岛奇兵',
+        // 其他热门游戏
+        'com.mojang.minecraftpe':'我的世界','com.lilithgame.roc.gp':'万国觉醒',
+        'com.lilithgame.xgame.ios':'剑与远征','com.lilithgame.roc.gp.cn':'万国觉醒(国服)',
+        'com.lilithgame.afk.gp':'剑与远征','com.lilithgame.hw.gp':'剑与家园',
+        'com.ea.game.pvz2_free':'植物大战僵尸2','com.ea.game.fifa15_row':'FIFA足球',
+        'com.ea.game.nfsmw_row':'极品飞车','com.ea.game.simsmobile_row':'模拟人生',
+        'com.gameloft.android.ANMP.GloftA8HM':'狂野飙车8','com.gameloft.android.ANMP.GloftA9HM':'狂野飙车9',
+        'com.gameloft.android.ANMP.GloftM5HM':'现代战争5','com.gameloft.android.ANMP.GloftHM5HM':'现代战争',
+        'com.kiloo.subwaysurf':'地铁跑酷','com.king.candycrushsaga':'糖果传奇',
+        'com.king.candycrushsodasaga':'糖果苏打传奇','com.king.farmheroessaga':'农场英雄传奇',
+        // 二次元/卡牌类
+        'com.hypergryph.zjsn':'明日方舟','com.hypergryph.arknights':'明日方舟',
+        'com.bilibili.fatego':'FGO','com.bilibili.priconne':'公主连结',
+        'com.bilibili.dl.fgo':'FGO(渠道)','com.bilibili.mrzh':'率土之滨(B服)',
+        'com.hermes.bili':'哔哩哔哩',
+        'com.kuro.marvelous':'战双帕弥什','com.kuro.wuthering':'鸣潮',
+        'com.pwrd.hotta':'幻塔','com.pwrd.ro':'幻塔',
+        'com.tencent.tmgp.gcx':'光遇(腾讯)','com.igg.android.lordsmobile':' lordsmobile',
+        'com.igg.android.im':'IGG游戏',
+        'com.camelgames.lordsmobile':'王国纪事',
+        'com.cil.thgame':'时空猎人','com.cib.animals':'动物餐厅',
+        'com.funplus.familyfarm.familyfarmseaside':'家庭农场',
+        'com.dts.freefireth':' FreeFire','com.dts.freefire':' FreeFire',
+        'com.garena.game.freefire':'Free Fire','com.garena.game.freefireth':'Free Fire(泰)',
+        'com.riotgames.league.wildrift':'英雄联盟手游(拳头)',
+        'com.riotgames.teamfighttactics':'云顶之弈手游',
+        'com.blizzard.diabloimmortal':'暗黑破坏神：不朽',
+        'com.blizzard.hearthstone':'炉石传说',
+        'com.blizzard.wtcg.hearthstone':'炉石传说',
+        'com.activision.callofduty.shooter':'使命召唤',
+        'com.dena.ten':'十罗',
+        'com.square_enix.android_googleplay':'Square Enix',
+        'com.levelinfinite.honkaiimpact3rd':'崩坏3(国际)',
+        'com.kwai.game':'快手游戏',
+        'com.ssandsaga.heroes':'英雄杀',
+        'com.hero.entertainment.gp':'英雄娱乐',
+        // 休闲/益智
+        'com.kiloo.subwaysurf':'地铁跑酷','com.outfit7.talkingtom':'汤姆猫',
+        'com.outfit7.mytalkingtomfree':'我的汤姆猫','com.outfit7.mytalkingtom2':'我的汤姆猫2',
+        'com.rovio.baba':'愤怒的小鸟','com.rovio.angrybirds':'愤怒的小鸟',
+        'com.disney.trolopus':'迪士尼游戏',
+        'com.king.farmheros':'农场英雄',
+        // 体育/竞速
+        'com.ea.game.fifa14_row':'FIFA14','com.ea.game.nfsshift':'极品飞车',
+        'com.ea.game.needforspeed':'极品飞车','com.ea.game.fifa':'FIFA',
+        'com.gameloft.android.ANMP.GloftA6HP':'狂野飙车6',
+        'com.gameloft.android.ANMP.GloftA7HM':'狂野飙车7',
+        // MOBA/策略
+        'com.riotgames.league.wildrift':'英雄联盟手游',
+        'com.lilithgame.xgame.ios':'剑与远征','com.lilithgame.hw':'剑与家园',
+        'com.funplus.familyfarm':'家庭农场',
+        'com.camelgames.lordsmobile':'王国纪事',
+        'com.igg.android.lordsmobile':' lordsmobile',
+        // 模拟器
+        'com.tencent.tmgp.emulator':'腾讯模拟器',
+        'com.netease.mumu.mumumulator':'MuMu模拟器',
+        'com.bignox.mumu':'MuMu模拟器',
+        'com.bilibili.bilibilimini':'哔哩哔哩小游戏',
+        // 社交平台内置游戏
+        'com.tencent.mm':'微信','com.tencent.mobileqq':'手机QQ',
+        'com.eg.android.AlipayGphone':'支付宝',
+        // 其他热门
+        'com.dts.supercell':'Supercell游戏',
+        'com.joycity.odin':'奥丁','com.netease.tom':'汤姆猫跑酷',
+        'com.hero3.utk':'英雄无敌','com.hero3.legends':'英雄无敌传奇',
+        'com.camelgames.dota':'刀塔传奇',
+        'com.funplus.discord.gp':'Discord',
+        'com.discord':'Discord',
+        'com.tencent.qqlive':'腾讯视频(游戏中心)',
+        'com.ss.android.ugc.aweme':'抖音',
+        'com.smile.gifmaker':'快手',
+        'com.kuaishou.nebula':'快手极速版',
+        'com.screw.scruner':'螺丝拧',
+    }
+    Object.freeze(GAME_PKG_DB) // 【内存优化】冻结只读常量
+    const GAME_DNS_DB = {
+        '部落冲突':['supercell','clashofclans','clash-of-clans'],
+        '皇室战争':['clashroyale','clash-royale','royale'],
+        '荒野乱斗':['brawlstars','brawl-stars','brawl'],
+        '和平精英':['pubgm','pubgmobile','igame','cdntencent','pubgmhd','tencentmobile'],
+        '王者荣耀':['sgame','tmgp-sgame','tencentmob','honoraryking','pvp.qq.com','kfc.qq.com'],
+        '原神':['mihoyo','genshin','yuanshen','hoyolab','hoyoverse','hoyowiki'],
+        '崩坏':['bh3','honkai','starrail','ngsod','honkai3rd','star-rail'],
+        '绝区零':['zenless','zzz','zenlesszonezero'],
+        '英雄联盟':['lolm','leagueoflegends','lol.qq','wildrift','riot'],
+        '穿越火线':['cf.qq','crossfire','cfmobile'],
+        '使命召唤':['callofduty','codmobile','codm','activision'],
+        'QQ飞车':['speedmobile','qqspeed','speed.qq'],
+        'DNF':['dnf.qq','dnfmobile','dungeon','neople'],
+        '火影忍者':['naruto','hyr.qq','nns.qq','bandai'],
+        '阴阳师':['onmyoji','yys.netease'],
+        '第五人格':['dwrg','identityv','idv.netease'],
+        '荒野行动':['knivesout','g27.netease','cyberhunter'],
+        '光遇':['sky.netease','thatgamecompany','skychildrenoflight'],
+        '我的世界':['minecraft','mojang','mcpe'],
+        '万国觉醒':['rok.lilith','riseofkingdoms','lilithgame'],
+        '狂野飙车':['gameloft','asphalt','gloft'],
+        '糖果传奇':['candycrushsaga','candycrush','king.com'],
+        '地铁跑酷':['subwaysurf','subway-surfers','kiloo'],
+        '哈利波特':['hpmagic','hp.netease','harrypotter'],
+        '云游戏':['cloudgame','start.qq','cloudgame.netease'],
+        '明日方舟':['arknights','hypergryph','skland'],
+        'FGO':['fate-go','fategrandorder','fgo','aniplex'],
+        '公主连结':['priconne','princessconnect','cr.pcr'],
+        '战双帕弥什':['pgr','kurogame','punishing'],
+        '鸣潮':['wuthering','kurogame','wutheringwaves'],
+        '幻塔':['hotta','pwrd','toweroffantasy'],
+        'Free Fire':['freefire','garena','ff.garena'],
+        '暗黑破坏神':['diablo','blizzard','diabloimmortal'],
+        '炉石传说':['hearthstone','blizzard','battle.net'],
+        '永劫无间':['narakabladepoint','netease.naraka','narakagame'],
+        '逆水寒':['chinasword','netease.nssb','justice.netease'],
+        '金铲铲之战':['tft','teamfight','riotgames'],
+        '金铲铲':['tftmobile','cloudtft','riotgames'],
+        'Apex':['apex','ea.com','apexmobile'],
+        '球球大作战':['supercell.boom','ballbattle','ballfight'],
+        '球球英雄':['ballhero','heroball'],
+    }
+    Object.freeze(GAME_DNS_DB) // 【内存优化】冻结只读常量
+    const GAME_PORT_DB = {
+        // Supercell
+        '8430':'部落冲突','9339':'部落冲突','5222':'皇室战争','5223':'荒野乱斗',
+        '9331':'部落冲突','9332':'荒野乱斗','9330':'皇室战争',
+        // 腾讯
+        '23456':'和平精英','8053':'王者荣耀','17000':'王者荣耀',
+        '18080':'穿越火线','10012':'QQ飞车','10013':'DNF手游',
+        '10030':'QQ飞车','10031':'穿越火线','10032':'王者荣耀',
+        // 米哈游
+        '22102':'原神','22103':'原神','22101':'崩坏：星穹铁道',
+        '22104':'绝区零','21004':'崩坏3',
+        // 网易
+        '5050':'阴阳师','5051':'第五人格','5052':'荒野行动',
+        '5053':'率土之滨','5054':'决战平安京','5055':'大话西游',
+        // 拳头
+        '5229':'英雄联盟手游','5230':'云顶之弈',
+        // 暴雪
+        '1119':'炉石传说','3724':'暗黑破坏神',
+        // EA
+        '43300':'Apex','43301':'FIFA','43310':'极品飞车',
+        // Minecraft
+        '10001':'我的世界','25565':'我的世界(MP)','19132':'我的世界(PE)',
+        // Lilith
+        '9001':'万国觉醒','9002':'剑与远征',
+        // 通用游戏端口
+        '27015':'Steam游戏','27016':'Steam游戏','3478':'语音/游戏',
+        '6112':'暴雪游戏','6113':'暴雪游戏','6881':'暴雪游戏',
+        '3498':'游戏服务','3535':'游戏服务','3658':'游戏服务',
+    }
+    Object.freeze(GAME_PORT_DB) // 【内存优化】冻结只读常量
+
+    const getBrandByMac = (mac) => {
+        if (!mac) return '网络设备'
+        const prefix = mac.toUpperCase().substring(0, 8)
+        if (MAC_OUI_DB[prefix]) return MAC_OUI_DB[prefix]
+        const prefix6 = mac.toUpperCase().replace(/:/g, '').substring(0, 6)
+        for (const [oui, brand] of Object.entries(MAC_OUI_DB)) {
+            if (oui.replace(/:/g, '') === prefix6) return brand
+        }
+        return '网络设备'
+    }
+    const getModelByHostname = (hostname) => {
+        if (!hostname) return ''
+        const lower = hostname.toLowerCase()
+        for (const [key, model] of Object.entries(HOSTNAME_MODEL_DB)) {
+            if (lower.includes(key)) return model
+        }
+        return ''
+    }
+    const isRandomMac = (mac) => {
+        if (!mac || typeof mac !== 'string') return false
+        const parts = mac.split(':')
+        if (parts.length !== 6) return false
+        return (parseInt(parts[0], 16) & 0x02) !== 0
+    }
+    const maskMac = (mac) => {
+        if (!mac) return ''
+        const parts = mac.split(':')
+        if (parts.length !== 6) return mac
+        return parts[0]+':'+parts[1]+':'+parts[2]+':**:**:**'
+    }
+    const formatBytes = (bytes) => {
+        const num = parseInt(bytes) || 0
+        const abs = Math.abs(num)
+        if (abs >= 1073741824) return (num/1073741824).toFixed(2)+'GB'
+        if (abs >= 1048576) return (num/1048576).toFixed(2)+'MB'
+        if (abs >= 1024) return (num/1024).toFixed(1)+'KB'
+        return num+'B'
+    }
+    const guessGameByDns = (dnsText) => {
+        if (!dnsText) return ''
+        var lower = dnsText.toLowerCase()
+        var bestMatch = '', bestScore = 0
+        for (var gameName in GAME_DNS_DB) {
+            var domains = GAME_DNS_DB[gameName]
+            for (var i = 0; i < domains.length; i++) {
+                if (lower.includes(domains[i].toLowerCase())) {
+                    if (domains[i].length > bestScore) { bestScore = domains[i].length; bestMatch = gameName }
+                }
+            }
+        }
+        return bestMatch
+    }
+    const guessGameByPort = (ports) => {
+        if (!ports || ports.length === 0) return ''
+        for (var i = 0; i < ports.length; i++) {
+            var p = ports[i].replace(/.*:/, '')
+            if (GAME_PORT_DB[p]) return GAME_PORT_DB[p]
+        }
+        return ''
+    }
+    const guessGameByPkg = (pkg) => {
+        if (!pkg) return ''
+        // 1) 精确匹配（最快最准）
+        if (GAME_PKG_DB[pkg]) return GAME_PKG_DB[pkg]
+        var lower = pkg.toLowerCase()
+        // 2) 前缀匹配（渠道包/多架构包名，如 com.tencent.tmgp.sgame.huawei）
+        for (var key in GAME_PKG_DB) {
+            var lk = key.toLowerCase()
+            if (lower.startsWith(lk + '.') || lk.startsWith(lower + '.')) return GAME_PKG_DB[key]
+        }
+        // 3) 腾讯通道聚合：com.tencent.tmgp.* 都是腾讯发行的游戏
+        if (lower.startsWith('com.tencent.tmgp.')) return '腾讯游戏'
+        if (lower.startsWith('com.supercell.')) return 'Supercell游戏'
+        if (lower.indexOf('clash') >= 0) return '部落冲突/皇室战争'
+        if (lower.indexOf('moba') >= 0 || lower.indexOf('lol') >= 0) return 'MOBA类'
+        if (lower.indexOf('fps') >= 0 || lower.indexOf('shoot') >= 0) return '射击类'
+        if (lower.indexOf('rpg') >= 0 || lower.indexOf('mmo') >= 0) return '角色扮演'
+        // 认不出来的返回空 → 绝不瞎猜，杜绝误判
+        return ''
+    }
+
+    // ===== 游戏识别防误判体系 =====
+    // 设备类型缓存（手机/平板）：平板的活动栈常驻后台Activity容易误判，只认窗口焦点
+    let _deviceTypeCache = null
+    const isTabletDevice = async () => {
+        if (_deviceTypeCache !== null) return _deviceTypeCache
+        try {
+            var res = await runShellWithRoot('getprop ro.build.characteristics 2>/dev/null; echo ---; wm size 2>/dev/null | tail -1')
+            var text = (res && res.content) || ''
+            if (text.indexOf('tablet') >= 0 || text.indexOf('Tablet') >= 0) { _deviceTypeCache = true; return true }
+            var m = text.match(/(\d+)x(\d+)/)
+            if (m && (parseInt(m[1]) >= 1280 || parseInt(m[2]) >= 1280)) { _deviceTypeCache = true; return true }
+        } catch(e) {}
+        _deviceTypeCache = false
+        return false
+    }
+    // 桌面/系统UI包名关键词（识别到这些绝不当作游戏）
+    const _skipPkgKeys = ['launcher', 'systemui', 'com.android.', 'android.', 'com.google.android']
+    // 常见非游戏应用（社交/视频/购物/工具），前台是它们时不算游戏
+    const _notGamePkgs = {
+        'com.tencent.mm':'微信', 'com.tencent.mobileqq':'手机QQ', 'com.tencent.qzone':'QQ空间',
+        'com.eg.android.AlipayGphone':'支付宝', 'com.ss.android.ugc.aweme':'抖音',
+        'com.smile.gifmaker':'快手', 'com.kuaishou.nebula':'快手极速版',
+        'com.tencent.qqlive':'腾讯视频', 'com.hermes.bili':'哔哩哔哩', 'tv.danmaku.bili':'哔哩哔哩',
+        'com.ss.android.article.news':'今日头条', 'com.xunmeng.pinduoduo':'拼多多',
+        'com.tencent.android.qqdownloader':'应用宝', 'com.android.browser':'浏览器',
+        'com.android.chrome':'Chrome', 'com.mi.globalbrowser':'浏览器'
+    }
+    const isRealGame = (pkg) => {
+        if (!pkg) return false
+        if (_notGamePkgs[pkg]) return false
+        var lower = pkg.toLowerCase()
+        for (var i = 0; i < _skipPkgKeys.length; i++) {
+            if (lower.indexOf(_skipPkgKeys[i]) >= 0) return false
+        }
+        return true
+    }
+
+    let GAME_BOOST_ACTIVE = false
+    let GAME_BOOST_START_TIME = 0
+    let GAME_BOOST_CURRENT = ''
+    let GAME_BOOST_PKG = ''
+    let GAME_BOOST_DETECTED_BY = ''
+    const DETECT_SOURCE_MAP = {
+        'focus':'窗口焦点', 'topActivity':'栈顶应用', 'fgActivity':'前台应用'
+    }
+    const getDetectSourceLabel = (src) => DETECT_SOURCE_MAP[src] || src || ''
+    let GAME_LAST_SEEN_TIME = 0
+    let PREV_RETRANS = 0
+    let PREV_TOTAL = 0
+    let PACKET_LOSS_BEFORE = 0
+    let PACKET_REPAIR_RATE = 0
+    let LATENCY_BEFORE = 0
+    let LATENCY_AFTER = 0
+    let LATENCY_IMPROVE = 0
+    let LATENCY_LAST_UPDATE = 0
+    let _latencyHistory = []  // 延迟历史，取最近几次均值更稳定
+    let GAME_BOOST_ENABLED = false
+
+    const detectGameTraffic = async () => {
+        try {
+            var isTablet = await isTabletDevice()
+
+            // ===== 手段1（最准）：窗口焦点 mCurrentFocus / mFocusedWindow =====
+            var focusRes = await runShellWithRoot('dumpsys window windows 2>/dev/null | grep -iE "mCurrentFocus|mFocusedWindow" | head -2')
+            var focusText = (focusRes && focusRes.content || '').trim()
+            if (focusText) {
+                var fLines = focusText.split('\n')
+                for (var fi = 0; fi < fLines.length; fi++) {
+                    var fm = fLines[fi].match(/([a-zA-Z][\w]*(?:\.[\w]+)+)\//)
+                    if (fm) {
+                        var fpkg = fm[1]
+                        // 焦点是桌面/社交应用/系统UI → 明确不在游戏，直接返回
+                        if (!isRealGame(fpkg)) return null
+                        var fgName = guessGameByPkg(fpkg)
+                        if (fgName) return { pkg: fpkg, name: fgName, source: 'focus', isGame: true }
+                        // 焦点在但认不出是哪个游戏 → 不猜，落到手段2兜底
+                    }
+                }
+            }
+
+            // ===== 手段2（仅手机）：栈顶 topResumedActivity =====
+            // 平板的活动栈常驻后台Activity容易误判 → 平板跳过此手段，只认窗口焦点
+            if (!isTablet) {
+                var topRes = await runShellWithRoot('dumpsys activity activities 2>/dev/null | grep -iE "topResumedActivity|mResumedActivity|topActivity" | head -3')
+                var topText = (topRes && topRes.content || '').trim()
+                if (topText) {
+                    var tLines = topText.split('\n')
+                    for (var ti = 0; ti < tLines.length; ti++) {
+                        var tm = tLines[ti].match(/([a-zA-Z][\w]*(?:\.[\w]+)+)\/(\w+)/)
+                        if (tm) {
+                            var tpkg = tm[1]
+                            if (!isRealGame(tpkg)) continue
+                            var tName = guessGameByPkg(tpkg)
+                            if (tName) return { pkg: tpkg, name: tName, source: 'topActivity', isGame: true }
+                        }
+                    }
+                }
+            }
+        } catch(e) {
+            addDiagLog('检测异常:'+String(e), 'error')
+        }
+        return null
+    }
+
+    // 游戏结束后还原内核网络参数到系统默认（与手动关闭加速器的还原参数一致）
+    const restoreBoostKernelParams = async () => {
+        try {
+            await runShellWithRoot(
+                'echo 0 > /proc/sys/net/ipv4/tcp_low_latency 2>/dev/null;' +
+                'echo 0 > /proc/sys/net/ipv4/tcp_no_metrics_save 2>/dev/null;' +
+                'echo 0 > /proc/sys/net/ipv4/tcp_tw_reuse 2>/dev/null;' +
+                'echo "4096 87380 6291456" > /proc/sys/net/ipv4/tcp_rmem 2>/dev/null;' +
+                'echo "4096 16384 4194304" > /proc/sys/net/ipv4/tcp_wmem 2>/dev/null;' +
+                'echo 212992 > /proc/sys/net/core/rmem_default 2>/dev/null;' +
+                'echo 212992 > /proc/sys/net/core/wmem_default 2>/dev/null;' +
+                'echo 212992 > /proc/sys/net/core/rmem_max 2>/dev/null;' +
+                'echo 212992 > /proc/sys/net/core/wmem_max 2>/dev/null;' +
+                'echo 1 > /proc/sys/net/ipv4/tcp_window_scaling 2>/dev/null;' +
+                'echo 1 > /proc/sys/net/ipv4/tcp_moderate_rcvbuf 2>/dev/null;' +
+                'echo 1 > /proc/sys/net/ipv4/tcp_adv_win_scale 2>/dev/null;' +
+                'echo 0 > /proc/sys/net/ipv4/tcp_fastopen 2>/dev/null;' +
+                'echo 0 > /proc/sys/net/ipv4/tcp_mtu_probing 2>/dev/null;' +
+                'echo 15 > /proc/sys/net/ipv4/tcp_retries2 2>/dev/null;' +
+                'echo 1 > /proc/sys/net/ipv4/tcp_slow_start_after_idle 2>/dev/null;' +
+                'echo 0 > /proc/sys/net/ipv4/tcp_no_ssthresh_metrics_save 2>/dev/null;' +
+                'echo "cubic" > /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null;' +
+                'echo "fq_codel" > /proc/sys/net/core/default_qdisc 2>/dev/null;' +
+                'echo 1000 > /proc/sys/net/core/netdev_max_backlog 2>/dev/null;' +
+                'echo 300 > /proc/sys/net/core/netdev_budget 2>/dev/null;' +
+                'echo 8000 > /proc/sys/net/core/netdev_budget_usecs 2>/dev/null;' +
+                'echo 4096 > /proc/sys/net/core/somaxconn 2>/dev/null;' +
+                'echo 1024 > /proc/sys/net/ipv4/tcp_max_syn_backlog 2>/dev/null;' +
+                'echo "32768 60999" > /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null;' +
+                'echo 32768 > /proc/sys/net/ipv4/tcp_max_orphans 2>/dev/null;' +
+                'echo 0 > /proc/sys/net/ipv4/tcp_rfc1337 2>/dev/null;' +
+                'echo 0 > /proc/sys/net/ipv4/tcp_ecn 2>/dev/null;' +
+                'echo GAME_AUTO_OFF'
+            )
+            return true
+        } catch(e) { return false }
+    }
+
+    const readTcpStats = async () => {
+        try {
+            var res = await runShellWithRoot('cat /proc/net/snmp 2>/dev/null')
+            var lines = (res.content || '').split('\n')
+            var retrans = 0, totalSegs = 0
+            var tcpLines = lines.filter(function(l) { return l.startsWith('Tcp:') })
+            if (tcpLines.length >= 2) {
+                var dataParts = tcpLines[1].trim().split(/\s+/)
+                if (dataParts.length >= 12) { totalSegs = parseInt(dataParts[3]) || 0; retrans = parseInt(dataParts[6]) || 0 }
+            }
+            return { retrans: retrans, total: totalSegs }
+        } catch(e) { return { retrans: 0, total: 0 } }
+    }
+
+    const calcPacketLossDelta = (currentStats) => {
+        if (!currentStats) return 0
+        var deltaRetrans = currentStats.retrans - PREV_RETRANS
+        var deltaTotal = currentStats.total - PREV_TOTAL
+        PREV_RETRANS = currentStats.retrans
+        PREV_TOTAL = currentStats.total
+        if (deltaTotal <= 0) return 0
+        return (deltaRetrans / deltaTotal * 100)
+    }
+
+    const readLatency = async () => {
+        try {
+            // 去掉-W 1的1秒超时限制，给ping更充足的时间
+            var res = await runShellWithRoot('timeout 3s ping -c 2 -i 0.3 -W 2 223.5.5.5 2>/dev/null | tail -1')
+            var text = res.content || ''
+            var m = text.match(/([\d.]+)\/([\d.]+)\/([\d.]+)/)
+            if (m) {
+                var lat = parseFloat(m[2])
+                // 记录历史，取最近5次均值，让延迟更稳定
+                _latencyHistory.push(lat)
+                if (_latencyHistory.length > 5) _latencyHistory.shift()
+                var sum = 0
+                for (var i = 0; i < _latencyHistory.length; i++) sum += _latencyHistory[i]
+                return sum / _latencyHistory.length
+            }
+            return 0
+        } catch(e) { return 0 }
+    }
+
+    // 【内存优化】DOM元素缓存，避免高频函数重复查询DOM
+    const _domCache = new Map()
+    const getCachedEl = (selector) => {
+        var cached = _domCache.get(selector)
+        if (cached && cached.isConnected) return cached
+        var el = document.querySelector(selector)
+        if (el) _domCache.set(selector, el)
+        return el
+    }
+
+    const updateGameBoostPanel = () => {
+        var panelEl = getCachedEl('#smart_game_boost_panel')
+        if (!panelEl) return
+        var statusEl = getCachedEl('#smart_boost_status')
+        var gameEl = getCachedEl('#smart_current_game')
+        var durationEl = getCachedEl('#smart_boost_duration')
+        var repairEl = getCachedEl('#smart_repair_rate')
+        var latencyEl = getCachedEl('#smart_latency_improve')
+        var pkgEl = getCachedEl('#smart_boost_pkg')
+        if (!GAME_BOOST_ACTIVE) {
+            if (statusEl) { statusEl.textContent = '待机中'; statusEl.style.color = '#888' }
+            if (gameEl) gameEl.textContent = '无'
+            if (durationEl) durationEl.textContent = '0s'
+            if (repairEl) repairEl.textContent = '0%'
+            if (latencyEl) latencyEl.textContent = '0ms'
+            if (pkgEl) pkgEl.textContent = '-'
+            return
+        }
+        if (statusEl) { statusEl.textContent = '加速中'; statusEl.style.color = '#4ade80' }
+        if (gameEl) gameEl.textContent = GAME_BOOST_CURRENT || '检测中...'
+        if (pkgEl) pkgEl.textContent = GAME_BOOST_PKG || '-'
+        if (GAME_BOOST_START_TIME > 0 && durationEl) {
+            var elapsed = Math.floor((Date.now() - GAME_BOOST_START_TIME) / 1000)
+            var h = Math.floor(elapsed / 3600)
+            var m2 = Math.floor((elapsed % 3600) / 60)
+            var s = elapsed % 60
+            durationEl.textContent = h > 0 ? h+'h '+m2+'m '+s+'s' : (m2 > 0 ? m2+'m '+s+'s' : s+'s')
+        }
+        if (repairEl) {
+            repairEl.textContent = PACKET_REPAIR_RATE.toFixed(1)+'%'
+            repairEl.style.color = PACKET_REPAIR_RATE > 80 ? '#4ade80' : (PACKET_REPAIR_RATE > 50 ? '#fbbf24' : '#ef4444')
+        }
+        if (latencyEl) {
+            latencyEl.textContent = LATENCY_BEFORE > 0 ? LATENCY_BEFORE.toFixed(0)+'→'+LATENCY_AFTER.toFixed(0)+'ms' : LATENCY_AFTER.toFixed(0)+'ms'
+            latencyEl.style.color = LATENCY_IMPROVE > 0 ? '#4ade80' : '#fbbf24'
+        }
+        var lossBeforeEl = getCachedEl('#smart_loss_before')
+        if (lossBeforeEl) {
+            lossBeforeEl.textContent = PACKET_LOSS_BEFORE > 0 ? PACKET_LOSS_BEFORE.toFixed(2)+'%' : '0%'
+        }
+    }
+
+    const gameMonitorLoop = async () => {
+        try {
+            var detected = await detectGameTraffic()
+            var now = Date.now()
+            if (detected && detected.isGame) {
+                GAME_LAST_SEEN_TIME = now
+                var gameName = detected.name
+                var gameId = detected.pkg
+                if (!GAME_BOOST_ACTIVE) {
+                    GAME_BOOST_ACTIVE = true
+                    GAME_BOOST_START_TIME = Date.now()
+                    GAME_BOOST_CURRENT = gameName
+                    GAME_BOOST_PKG = gameId
+                    GAME_BOOST_DETECTED_BY = detected.source
+                    // 【网络优化】readTcpStats和readLatency并行执行
+                    var _baseResults = await Promise.all([readTcpStats(), readLatency()])
+                    var baseStats = _baseResults[0]
+                    PREV_RETRANS = baseStats.retrans
+                    PREV_TOTAL = baseStats.total
+                    PACKET_LOSS_BEFORE = 0
+                    PACKET_REPAIR_RATE = 0
+                    LATENCY_BEFORE = _baseResults[1]
+                    await runShellWithRoot(
+                        'echo 1 > /proc/sys/net/ipv4/tcp_low_latency 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_fin_timeout 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_no_metrics_save 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_tw_reuse 2>/dev/null;' +
+                        // 去限速：放大接收缓冲区上限→16M，默认也提升到4M
+                        'echo "4096 425984 16777216" > /proc/sys/net/ipv4/tcp_rmem 2>/dev/null;' +
+                        // 去限速：放大发送缓冲区上限→16M，默认也提升到4M
+                        'echo "4096 425984 16777216" > /proc/sys/net/ipv4/tcp_wmem 2>/dev/null;' +
+                        // 去限速：提升默认收发缓冲区
+                        'echo 425984 > /proc/sys/net/core/rmem_default 2>/dev/null;' +
+                        'echo 425984 > /proc/sys/net/core/wmem_default 2>/dev/null;' +
+                        'echo 16777216 > /proc/sys/net/core/rmem_max 2>/dev/null;' +
+                        'echo 16777216 > /proc/sys/net/core/wmem_max 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_window_scaling 2>/dev/null;' +
+                        // 去限速：自动调优接收缓冲区
+                        'echo 1 > /proc/sys/net/ipv4/tcp_moderate_rcvbuf 2>/dev/null;' +
+                        // 去限速：窗口缩放因子优化
+                        'echo 1 > /proc/sys/net/ipv4/tcp_adv_win_scale 2>/dev/null;' +
+                        'echo 3 > /proc/sys/net/ipv4/tcp_fastopen 2>/dev/null;' +
+                        'echo 1 > /proc/sys/net/ipv4/tcp_mtu_probing 2>/dev/null;' +
+                        // 去限速：重试次数拉满15，绝不提前断连
+                        'echo 15 > /proc/sys/net/ipv4/tcp_retries2 2>/dev/null;' +
+                        // 去限速：关闭空闲后慢启动，避免速度回落
+                        'echo 0 > /proc/sys/net/ipv4/tcp_slow_start_after_idle 2>/dev/null;' +
+                        // 去限速：不保存慢启动阈值，每次都全速
+                        'echo 1 > /proc/sys/net/ipv4/tcp_no_ssthresh_metrics_save 2>/dev/null;' +
+                        'echo "bbr" > /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null;' +
+                        'echo "fq_codel" > /proc/sys/net/core/default_qdisc 2>/dev/null;' +
+                        // 去限速：增大网络设备发送队列，减少丢包
+                        'echo 10000 > /proc/sys/net/core/netdev_max_backlog 2>/dev/null;' +
+                        // 去限速：增大接收socket队列
+                        'echo 8192 > /proc/sys/net/core/netdev_budget 2>/dev/null;' +
+                        // 去限速：增大处理时间，避免丢包
+                        'echo 20000 > /proc/sys/net/core/netdev_budget_usecs 2>/dev/null;' +
+                        // 去限速：增大somaxconn连接队列
+                        'echo 8192 > /proc/sys/net/core/somaxconn 2>/dev/null;' +
+                        // 去限速：增大SYN队列
+                        'echo 8192 > /proc/sys/net/ipv4/tcp_max_syn_backlog 2>/dev/null;' +
+                        // 去限速：扩大本地端口范围
+                        'echo "1024 65535" > /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null;' +
+                        // 去限速：增大孤儿socket数量
+                        'echo 32768 > /proc/sys/net/ipv4/tcp_max_orphans 2>/dev/null;' +
+                        // 去限速：防止time-wait状态被攻击
+                        'echo 1 > /proc/sys/net/ipv4/tcp_rfc1337 2>/dev/null;' +
+                        // 开启ECN，减少拥塞丢包
+                        'echo 1 > /proc/sys/net/ipv4/tcp_ecn 2>/dev/null;' +
+                        'echo GAME_AUTO_ON'
+                    )
+                    addLog('检测到游戏: '+gameName+' ['+getDetectSourceLabel(detected.source)+']，自动开启加速')
+                    addDiagLog('游戏: '+gameName+' (来源:'+getDetectSourceLabel(detected.source)+', 标识:'+gameId+')，自动开启加速', 'game')
+                    addDiagLog('丢包基线: r='+baseStats.retrans+' total='+baseStats.total, 'info')
+                    addDiagLog('延迟基线: '+LATENCY_BEFORE+'ms', 'info')
+                    addDiagLog('内核: bbr+fq_codel', 'success')
+                    createToast('检测到 '+gameName+'，已自动加速！', 'green', 4000)
+                } else if (GAME_BOOST_CURRENT !== gameName) {
+                    GAME_BOOST_CURRENT = gameName
+                    GAME_BOOST_PKG = gameId
+                    GAME_BOOST_DETECTED_BY = detected.source
+                    addLog('游戏切换: '+gameName+' ['+getDetectSourceLabel(detected.source)+']')
+                    addDiagLog('切换: '+gameName+' ['+getDetectSourceLabel(detected.source)+']', 'game')
+                    createToast('切换加速: '+gameName, 'pink', 3000)
+                }
+            } else {
+                if (GAME_BOOST_ACTIVE && (now - GAME_LAST_SEEN_TIME) > 5000) {
+                    var duration = Math.floor((Date.now() - GAME_BOOST_START_TIME) / 1000)
+                    LATENCY_AFTER = await readLatency()
+                    if (LATENCY_BEFORE > 0 && LATENCY_AFTER > 0) {
+                        LATENCY_IMPROVE = LATENCY_BEFORE - LATENCY_AFTER
+                    }
+                    addLog('游戏结束: '+GAME_BOOST_CURRENT+' 时长:'+duration+'s 丢包修复:'+PACKET_REPAIR_RATE.toFixed(1)+'% 延迟改善:'+LATENCY_IMPROVE.toFixed(0)+'ms')
+                    addDiagLog('结束: '+GAME_BOOST_CURRENT+' 加速'+duration+'s 丢包修复率:'+PACKET_REPAIR_RATE.toFixed(1)+'% 延迟:'+LATENCY_BEFORE.toFixed(0)+'→'+LATENCY_AFTER.toFixed(0)+'ms', 'game')
+                    createToast(GAME_BOOST_CURRENT+' 加速结束', '', 3000)
+                    GAME_BOOST_ACTIVE = false
+                    GAME_BOOST_START_TIME = 0
+                    GAME_BOOST_CURRENT = ''
+                    GAME_BOOST_PKG = ''
+                    GAME_BOOST_DETECTED_BY = ''
+                    GAME_LAST_SEEN_TIME = 0
+                    PACKET_REPAIR_RATE = 0
+                    LATENCY_IMPROVE = 0
+                    // 游戏结束：还原内核网络参数到系统默认（自动加速会话专用）
+                    var _restoreOk = await restoreBoostKernelParams()
+                    addDiagLog(_restoreOk ? '游戏结束: 内核网络参数已还原(cubic+默认缓冲区)' : '游戏结束: 内核参数还原失败', _restoreOk ? 'success' : 'warn')
+                }
+            }
+            if (GAME_BOOST_ACTIVE) {
+                // 去掉15秒限速：每次循环都测延迟，控制更精准
+                var _results = await Promise.all([readTcpStats(), readLatency()])
+                var currentStats = _results[0]
+                var currentLoss = calcPacketLossDelta(currentStats)
+                if (PACKET_LOSS_BEFORE === 0 && currentLoss > 0) {
+                    PACKET_LOSS_BEFORE = currentLoss
+                    addDiagLog('丢包基线='+currentLoss.toFixed(3)+'%', 'warn')
+                }
+                if (PACKET_LOSS_BEFORE > 0) {
+                    PACKET_REPAIR_RATE = Math.max(0, Math.min(100, ((PACKET_LOSS_BEFORE - currentLoss) / PACKET_LOSS_BEFORE * 100)))
+                    if (currentLoss > 0 && PACKET_REPAIR_RATE < 50) {
+                        addDiagLog('丢包高: '+currentLoss.toFixed(3)+'% 修复率='+PACKET_REPAIR_RATE.toFixed(1)+'%', 'warn')
+                    }
+                } else if (currentLoss === 0) {
+                    PACKET_REPAIR_RATE = 100
+                } else {
+                    PACKET_REPAIR_RATE = Math.max(0, 100 - currentLoss * 5)
+                }
+                // 每次都更新延迟，实时反馈
+                LATENCY_LAST_UPDATE = Date.now()
+                LATENCY_AFTER = _results[1]
+                if (LATENCY_BEFORE > 0 && LATENCY_AFTER > 0) {
+                    LATENCY_IMPROVE = LATENCY_BEFORE - LATENCY_AFTER
+                    addDiagLog('延迟: '+LATENCY_BEFORE.toFixed(0)+'→'+LATENCY_AFTER.toFixed(0)+'ms ('+(LATENCY_IMPROVE>0?'+':'')+LATENCY_IMPROVE.toFixed(0)+'ms)', 'net')
+                }
+            }
+            updateGameBoostPanel()
+        } catch(e) {
+            addDiagLog('监控异常:'+String(e), 'error')
+        }
+    }
+
+    const scanDevices = async () => {
+        if (_isScanning) return
+        _isScanning = true
+        try {
+            await _doScanDevices()
+        } catch(e) {
+            addDiagLog('扫描异常: ' + String(e), 'error')
+        }
+        _isScanning = false
+    }
+
+    const _doScanDevices = async () => {
+        const listEl = document.querySelector("#smart_scan_list")
+        if (!listEl) return
+        // 显示扫描中状态
+        listEl.innerHTML = '<div style="text-align:center;padding:15px;opacity:.5;font-size:.6rem">⏳ 正在扫描设备...</div>'
+
+        // ===== 先检查热点监控守护进程是否在运行 =====
+        var daemonRunning = await checkHotspotDaemon()
+
+        // ===== 一次性批量获取所有网络数据，减少 shell 调用次数 =====
+        var batchRes = await runShellWithRoot(
+            'echo __ARP__\n' +
+            'timeout 2s cat /proc/net/arp 2>/dev/null | grep -v "00:00:00:00:00:00" | grep -v "IP " || echo ""\n' +
+            'echo __NEIGH__\n' +
+            'timeout 2s ip neigh 2>/dev/null | grep -v "FAILED" | grep -v "^$" || echo ""\n' +
+            'echo __DHCP__\n' +
+            'timeout 2s cat /data/misc/dhcp/dnsmasq.leases 2>/dev/null || echo ""\n' +
+            'echo __DNS__\n' +
+            'timeout 2s cat /data/misc/dhcp/dnsmasq.log 2>/dev/null | tail -300 | grep -i "query" | awk \'{print $NF}\' | sort -u || echo ""\n' +
+            'echo __CONNTRACK__\n' +
+            'timeout 3s cat /proc/net/nf_conntrack 2>/dev/null || echo ""\n' +
+            'echo __END__'
+        )
+        var batchText = (batchRes && batchRes.content) ? batchRes.content : ''
+
+        // 解析各部分
+        var arpText = '', neighText = '', dhcpText = '', dnsText = '', conntrackText = ''
+        if (batchText.indexOf('__ARP__') >= 0) {
+            arpText = batchText.split('__ARP__')[1] || ''
+            arpText = arpText.split('__NEIGH__')[0] || ''
+        }
+        if (batchText.indexOf('__NEIGH__') >= 0) {
+            neighText = batchText.split('__NEIGH__')[1] || ''
+            neighText = neighText.split('__DHCP__')[0] || ''
+        }
+        if (batchText.indexOf('__DHCP__') >= 0) {
+            dhcpText = batchText.split('__DHCP__')[1] || ''
+            dhcpText = dhcpText.split('__DNS__')[0] || ''
+        }
+        if (batchText.indexOf('__DNS__') >= 0) {
+            dnsText = batchText.split('__DNS__')[1] || ''
+            dnsText = dnsText.split('__CONNTRACK__')[0] || ''
+        }
+        if (batchText.indexOf('__CONNTRACK__') >= 0) {
+            conntrackText = batchText.split('__CONNTRACK__')[1] || ''
+            conntrackText = conntrackText.split('__END__')[0] || ''
+        }
+        dnsText = dnsText.toLowerCase()
+        var dnsTextLower = dnsText
+        var conntrackLower = conntrackText.toLowerCase()
+
+        const devices = []
+
+        // ===== 优先从热点流量监控读取设备数据 =====
+        var hotspotData = await readHotspotTrafficData()
+        var hotspotPolicy = await readHotspotPolicy()
+        if (hotspotData && hotspotData.devices) {
+            var htCount = 0
+            for (var macKey in hotspotData.devices) {
+                var dev = hotspotData.devices[macKey]
+                if (!dev || !dev.mac) continue
+                htCount++
+                var displayName = resolveDisplayName(dev)
+                devices.push({
+                    ip: dev.ip || '',
+                    mac: dev.mac,
+                    hostname: displayName,
+                    brand: '',
+                    model: '',
+                    randomMac: false,
+                    online: dev.online !== undefined ? dev.online : true,
+                    connections: 0,
+                    txBytes: dev.txBytes || 0,
+                    rxBytes: dev.rxBytes || 0,
+                    apps: [],
+                    game: '',
+                    connType: dev.connType || '',
+                    customName: displayName,
+                    htDevice: true,
+                    blocked: hotspotPolicy && hotspotPolicy[dev.mac] && hotspotPolicy[dev.mac].type === 'blacklist'
+                })
+            }
+            addDiagLog('从热点流量监控获取 '+htCount+' 台设备 (守护进程:'+(daemonRunning?'运行':'未运行')+')', 'net')
+        }
+
+        // ===== 从 ARP 补充设备 =====
+        if (arpText.trim()) {
+            var arpLines = arpText.trim().split('\n').filter(function(l) { return l.trim() })
+            for (var ai = 0; ai < arpLines.length; ai++) {
+                var parts = arpLines[ai].trim().split(/\s+/)
+                if (parts.length >= 4) {
+                    var ip = parts[0]
+                    var mac = parts[3]
+                    if (mac && mac !== '00:00:00:00:00:00' && mac !== '*') {
+                        var exists = devices.some(function(d) { return d.mac.toUpperCase() === mac.toUpperCase() })
+                        if (!exists) {
+                            var arpName = _hotspotNameMap[mac.toUpperCase()] || ''
+                            devices.push({ ip: ip, mac: mac, hostname: arpName, brand: '', model: '', randomMac: false, online: true, connections: 0, txBytes: 0, rxBytes: 0, apps: [], game: '', htDevice: false, customName: arpName })
+                        } else {
+                            var existing = devices.find(function(d) { return d.mac.toUpperCase() === mac.toUpperCase() })
+                            if (existing && !existing.ip) existing.ip = ip
+                        }
+                    }
+                }
+            }
+        }
+
+        // ===== 从 ip neigh 补充设备（ARP 可能不全） =====
+        if (neighText.trim()) {
+            var neighLines = neighText.trim().split('\n').filter(function(l) { return l.trim() })
+            for (var ni = 0; ni < neighLines.length; ni++) {
+                var nparts = neighLines[ni].trim().split(/\s+/)
+                if (nparts.length >= 4) {
+                    var nip = nparts[0]
+                    var nmac = nparts[4] || nparts[3] || ''
+                    // ip neigh 格式: "192.168.1.100 dev wlan0 lladdr aa:bb:cc:dd:ee:ff REACHABLE"
+                    // 找 lladdr 后面的 MAC
+                    var lineStr = neighLines[ni]
+                    var macMatch = lineStr.match(/([0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2})/)
+                    if (macMatch) nmac = macMatch[1]
+                    if (nmac && nmac !== '00:00:00:00:00:00' && nmac.indexOf(':') > 0) {
+                        var nexists = devices.some(function(d) { return d.mac.toUpperCase() === nmac.toUpperCase() })
+                        if (!nexists) {
+                            var nName = _hotspotNameMap[nmac.toUpperCase()] || ''
+                            var nState = lineStr.match(/(REACHABLE|STALE|DELAY|PROBE|INCOMPLETE)/)
+                            devices.push({ ip: nip, mac: nmac, hostname: nName, brand: '', model: '', randomMac: false, online: nState && nState[1] !== 'INCOMPLETE', connections: 0, txBytes: 0, rxBytes: 0, apps: [], game: '', htDevice: false, customName: nName })
+                        } else {
+                            var nexisting = devices.find(function(d) { return d.mac.toUpperCase() === nmac.toUpperCase() })
+                            if (nexisting && !nexisting.ip) nexisting.ip = nip
+                        }
+                    }
+                }
+            }
+        }
+
+        // ===== 从 DHCP leases 补充设备名 =====
+        if (dhcpText.trim()) {
+            var dhcpLines = dhcpText.trim().split('\n').filter(function(l) { return l.trim() })
+            for (var di = 0; di < devices.length; di++) {
+                var dd = devices[di]
+                if (!dd.hostname) {
+                    for (var dj = 0; dj < dhcpLines.length; dj++) {
+                        var dparts = dhcpLines[dj].trim().split(/\s+/)
+                        if (dparts.length >= 2 && dparts[1] === dd.mac) {
+                            var dhcpHostname = dparts[3] || dparts[2] || ''
+                            if (dhcpHostname) {
+                                dd.hostname = dhcpHostname
+                                if (!dd.customName) dd.customName = dhcpHostname
+                            }
+                        }
+                    }
+                    if (!dd.hostname) {
+                        var htName = _hotspotNameMap[dd.mac.toUpperCase()]
+                        if (htName) {
+                            dd.hostname = htName
+                            dd.customName = htName
+                        }
+                    }
+                }
+            }
+        }
+
+        // ===== 批量从 conntrack 获取连接数和流量（一次解析所有设备） =====
+        for (var bi = 0; bi < devices.length; bi++) {
+            var bd = devices[bi]
+            bd.brand = getBrandByMac(bd.mac)
+            bd.model = getModelByHostname(bd.hostname)
+            bd.randomMac = isRandomMac(bd.mac)
+
+            if (bd.ip && conntrackText) {
+                // 从已获取的 conntrack 文本中解析，不需要再调 shell
+                var ipLines = conntrackText.split('\n').filter(function(l) { return l.indexOf(bd.ip) >= 0 })
+                bd.connections = ipLines.length
+                // 如果热点监控没有提供流量，从 conntrack 估算
+                if (!bd.htDevice || !bd.txBytes) {
+                    var totalBytes = 0
+                    for (var cli = 0; cli < ipLines.length; cli++) {
+                        var matches = ipLines[cli].match(/bytes=(\d+)/g) || []
+                        for (var mi = 0; mi < matches.length; mi++) {
+                            var bval = matches[mi].match(/bytes=(\d+)/)
+                            if (bval) totalBytes += parseInt(bval[1]) || 0
+                        }
+                    }
+                    bd.txBytes = totalBytes
+                }
+                // 从 conntrack 端口识别应用
+                var ports = new Set()
+                for (var pli = 0; pli < ipLines.length && pli < 30; pli++) {
+                    var dportMatches = ipLines[pli].match(/dport=(\d+)/g) || []
+                    for (var dpi = 0; dpi < dportMatches.length; dpi++) {
+                        var dval = dportMatches[dpi].match(/dport=(\d+)/)
+                        if (dval) ports.add(dval[1])
+                    }
+                }
+                var detectedApps = new Set()
+                ports.forEach(function(p) {
+                    if (p === '443' || p === '80') detectedApps.add('网页浏览')
+                    else if (p === '1935') detectedApps.add('直播流')
+                })
+                var connDetail = ipLines.join('\n').toLowerCase()
+                var gameByDns = guessGameByDns(dnsTextLower + '\n' + connDetail)
+                if (gameByDns) {
+                    detectedApps.add('游戏: ' + gameByDns)
+                    bd.game = gameByDns
+                }
+                var gameByPort = guessGameByPort(Array.from(ports))
+                if (gameByPort) {
+                    detectedApps.add('游戏: ' + gameByPort)
+                    bd.game = gameByPort
+                }
+                if (bd.connections > 50 && !bd.game) detectedApps.add('高流量')
+                if (detectedApps.size === 0 && bd.connections > 0) detectedApps.add('在线活动')
+                if (detectedApps.size === 0) detectedApps.add('空闲')
+                bd.apps = Array.from(new Set(detectedApps))
+            } else {
+                bd.apps = ['空闲']
+            }
+        }
+
+        const countEl = document.querySelector("#smart_device_count")
+        if (countEl) countEl.textContent = devices.length
+        if (devices.length === 0) {
+            listEl.innerHTML = '<div style="text-align:center;padding:20px;opacity:.5;font-size:.6rem">暂无设备连接<br><span style="font-size:.45rem;opacity:.5;">' + (daemonRunning ? '热点监控守护进程运行中，但未检测到设备' : '热点监控守护进程未运行，无法识别设备！请先安装运行热点流量监控插件') + '</span></div>'
+            addDiagLog('扫描完成: 0台设备 (守护进程:'+(daemonRunning?'运行':'未运行')+')', 'net')
+            return
+        }
+        // 排序：在线设备优先，然后按流量降序
+        devices.sort(function(a, b) {
+            if (a.online && !b.online) return -1
+            if (!a.online && b.online) return 1
+            return ((b.txBytes || 0) + (b.rxBytes || 0)) - ((a.txBytes || 0) + (a.rxBytes || 0))
+        })
+        listEl.innerHTML = devices.map((d, i) => {
+            const brandInfo = BRAND_INFO[d.brand] || { bg: 'linear-gradient(135deg,#ff9ecd,#ffd1e3)', text: (d.brand || '?').substring(0,2), label: d.brand }
+            const modelText = d.model ? d.model : (d.brand && d.brand !== '网络设备' ? brandInfo.label : '')
+            const onlineDot = '<span style="display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px;vertical-align:middle;background:'+(d.online ? '#4CAF50' : '#666')+'"></span>'
+            const brandLogo = '<div style="width:36px;height:36px;border-radius:50%;background:'+brandInfo.bg+';display:flex;align-items:center;justify-content:center;font-size:.6rem;font-weight:bold;color:white;flex-shrink:0;">'+(brandInfo.text || (d.brand || '?').substring(0,2))+'</div>'
+            const randomTag = d.randomMac ? '<span style="background:rgba(255,193,7,.2);color:#ffc107;padding:1px 5px;border-radius:8px;font-size:.4rem;margin-left:4px;">随机MAC</span>' : ''
+            const gameTag = d.game ? '<span style="background:linear-gradient(135deg,#4ade80,#22c55e);color:white;padding:2px 6px;border-radius:10px;font-size:.45rem;margin-left:4px;">🎮 '+d.game+'</span>' : ''
+            const htTag = d.htDevice ? '<span style="background:rgba(96,165,250,.15);color:#60a5fa;padding:1px 5px;border-radius:8px;font-size:.4rem;margin-left:4px;">热点监控</span>' : ''
+            const blockedTag = d.blocked ? '<span style="background:rgba(239,68,68,.2);color:#ef4444;padding:1px 5px;border-radius:8px;font-size:.4rem;margin-left:4px;">已拉黑</span>' : ''
+            const appBadges = d.apps.map(function(a) {
+                var color = a.includes('游戏') ? '#4ade80' : a.includes('视频') || a.includes('直播') ? '#fbbf24' : '#a78bfa'
+                return '<span style="background:'+color+'22;color:'+color+';padding:1px 6px;border-radius:8px;font-size:.45rem;margin-right:4px;">'+a+'</span>'
+            }).join('')
+            const totalBytes = (d.txBytes || 0) + (d.rxBytes || 0)
+            const trafficInfo = totalBytes > 0 ? '<span style="font-size:.45rem;opacity:.5;color:#60a5fa;">流量:'+formatBytes(totalBytes) + (d.txBytes > 0 && d.rxBytes > 0 ? ' (↑'+formatBytes(d.txBytes)+' ↓'+formatBytes(d.rxBytes)+')' : '') + '</span>' : '<span style="font-size:.45rem;opacity:.5;">流量:'+formatBytes(d.txBytes)+'</span>'
+            const wifiTag = d.connType === 'wifi' ? '<span style="font-size:.4rem;opacity:.5;">📶 WiFi</span>' : ''
+            const macDisplay = maskMac(d.mac)
+            return '<div style="display:flex;align-items:center;gap:8px;padding:8px;margin-bottom:6px;border-radius:12px;background:rgba(255,158,205,.04);border:1px solid rgba(255,158,205,.06);' + (d.blocked ? 'opacity:.7;' : '') + '">' +
+                brandLogo +
+                '<div style="flex:1;min-width:0;">' +
+                    '<div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;">' +
+                        onlineDot +
+                        '<span style="font-size:.6rem;font-weight:bold;">'+(d.hostname || d.customName || modelText || ('设备'+(i+1)))+'</span>' +
+                        randomTag + gameTag + htTag + blockedTag +
+                    '</div>' +
+                    '<div style="font-size:.5rem;opacity:.5;margin-top:2px;">'+(modelText || d.brand || '未知型号')+' | '+macDisplay+' | '+(d.ip || '无IP')+'</div>' +
+                    '<div style="margin-top:3px;display:flex;flex-wrap:wrap;gap:3px;align-items:center;">'+appBadges+trafficInfo+wifiTag+'</div>' +
+                '</div>' +
+                '<div style="font-size:.45rem;opacity:.4;text-align:right;flex-shrink:0;">'+d.connections+'连接</div>' +
+            '</div>'
+        }).join('')
+        addDiagLog('扫描完成: '+devices.length+'台设备 (热点监控'+(hotspotData && hotspotData.devices ? Object.keys(hotspotData.devices).length : 0)+'台, 守护进程:'+(daemonRunning?'运行':'未运行')+')', 'net')
+    }
+
+    const mmContainer = document.querySelector('.functions-container') || document.body
+    const _bs = 'border:none;border-radius:12px;font-weight:bold;color:white;cursor:pointer;'
+    /* 【字体修复】_tg 渐变文字改为 CSS 类 + @supports 回退，
+       不支持 background-clip:text 的 WebView 会显示纯色而非透明消失 */
+    const _tg = '' // 不再使用内联样式，改用 class="smart-grad-text"
+    mmContainer.insertAdjacentHTML("afterend", `<style>
+@keyframes smart_btn_glow{0%,100%{box-shadow:0 2px 8px rgba(255,255,255,.15),0 0 0 1px rgba(255,255,255,.08)}50%{box-shadow:0 4px 16px rgba(255,255,255,.25),0 0 0 1px rgba(255,255,255,.15)}}
+@keyframes smart_btn_shine{0%{background-position:-200% center}100%{background-position:200% center}}
+/* 【字体修复】渐变文字：支持 background-clip:text 时显示渐变动画，不支持时回退纯色 */
+.smart-grad-text {
+    color: #ff9ecd;
+    font-weight: bold;
+    background: linear-gradient(90deg,#ff9ecd,#a78bfa,#4ade80,#ff9ecd);
+    background-size: 200% auto;
+    animation: smart_btn_shine 4s linear infinite;
+}
+@supports (-webkit-background-clip: text) or (background-clip: text) {
+    .smart-grad-text {
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+    }
+}
+@keyframes smart_action_ripple{0%{transform:scale(0);opacity:.6}100%{transform:scale(2.5);opacity:0}}
+@keyframes sdm_btn_breath{0%,100%{box-shadow:0 2px 8px rgba(255,255,255,.1),inset 0 1px 0 rgba(255,255,255,.2)}50%{box-shadow:0 3px 14px rgba(255,255,255,.15),inset 0 1px 0 rgba(255,255,255,.3)}}
+@keyframes sdm_spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+/* ✨💫 更新按钮旁的小星星：常驻闪烁（opacity 最低 .25，只明暗闪动，不会整个消失） */
+@keyframes sdm_star_sparkle{0%,100%{opacity:.25;transform:scale(.82) rotate(0deg)}50%{opacity:1;transform:scale(1.18) rotate(180deg)}}
+@keyframes sdm_ring_pulse{0%{box-shadow:0 0 0 0 rgba(251,191,36,.6)}70%{box-shadow:0 0 0 8px rgba(251,191,36,0)}100%{box-shadow:0 0 0 0 rgba(251,191,36,0)}}
+@keyframes sdm_bounce_in{0%{transform:scale(0)}50%{transform:scale(1.2)}100%{transform:scale(1)}}
+@keyframes sdm_shake{0%,100%{transform:translateX(0) rotate(0)}25%{transform:translateX(-1px) rotate(-2deg)}75%{transform:translateX(1px) rotate(2deg)}}
+.sdm-check-btn{font-size:.45rem;font-weight:600;margin-left:6px;cursor:pointer;background:rgba(255,255,255,.06);color:#e2e8f0;padding:3px;border-radius:50%;box-shadow:0 2px 8px rgba(0,0,0,.15),inset 0 1px 0 rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.12);transition:all .25s cubic-bezier(.34,1.56,.64,1);display:inline-flex;align-items:center;justify-content:center;user-select:none;position:relative;overflow:visible;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);width:28px;height:28px;flex-shrink:0;vertical-align:middle;animation:sdm_btn_breath 3s ease-in-out infinite}
+.sdm-check-btn .sdm-btn-icon-wrap{width:22px;height:22px;border-radius:50%;background:rgba(99,102,241,.15);display:flex;align-items:center;justify-content:center;flex-shrink:0;position:relative;border:1px solid rgba(99,102,241,.25)}
+.sdm-check-btn .sdm-btn-icon{font-size:.55rem;display:inline-flex;align-items:center;justify-content:center;animation:sdm2_wiggle 2.6s ease-in-out infinite}
+.sdm-check-btn::before{content:'';position:absolute;inset:0;border-radius:50%;padding:1px;background:linear-gradient(135deg,rgba(99,102,241,.4),rgba(147,197,253,.2),rgba(99,102,241,.4));-webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);-webkit-mask-composite:xor;mask-composite:exclude;opacity:.6;pointer-events:none}
+.sdm-check-btn:hover{transform:translateY(-1px) scale(1.1);background:rgba(255,255,255,.1);box-shadow:0 4px 16px rgba(99,102,241,.3),inset 0 1px 0 rgba(255,255,255,.15)}
+.sdm-check-btn:hover .sdm-btn-icon-wrap{background:rgba(99,102,241,.25);transform:rotate(15deg) scale(1.1)}
+.sdm-check-btn:active{transform:translateY(0) scale(.92)}
+/* ✨💫 星星常驻显示并闪烁（不能设 opacity:0，否则大半时间看不见） */
+.sdm-check-btn .sdm-deco-1,.sdm-check-btn .sdm-deco-2{position:absolute;font-size:.28rem;pointer-events:none;animation:sdm_star_sparkle 2s ease-in-out infinite}
+.sdm-check-btn .sdm-deco-1{top:-3px;right:-1px;animation-delay:.4s}
+.sdm-check-btn .sdm-deco-2{bottom:-2px;left:0px;animation-delay:1.4s}
+.sdm-update-tip{position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%) translateY(4px);background:rgba(251,191,36,.95);color:#1a1a2e;font-size:.32rem;font-weight:700;padding:3px 8px;border-radius:8px;white-space:nowrap;opacity:0;pointer-events:none;transition:all .3s cubic-bezier(.34,1.56,.64,1);box-shadow:0 3px 10px rgba(251,191,36,.4);z-index:10}
+.sdm-update-tip::after{content:'';position:absolute;top:100%;left:50%;transform:translateX(-50%);border:4px solid transparent;border-top-color:rgba(251,191,36,.95)}
+.sdm-check-btn.has-update{background:rgba(251,191,36,.1);border-color:rgba(251,191,36,.3);animation:sdm_ring_pulse 2s ease-out infinite}
+.sdm-check-btn.has-update::before{background:linear-gradient(135deg,rgba(251,191,36,.5),rgba(249,115,22,.4),rgba(251,191,36,.5));opacity:.8}
+.sdm-check-btn.has-update .sdm-btn-icon-wrap{background:rgba(251,191,36,.2);border-color:rgba(251,191,36,.4);animation:sdm_shake 1.5s ease-in-out infinite}
+.sdm-check-btn.has-update .sdm-btn-icon{animation:none}
+.sdm-check-btn.has-update .sdm-btn-icon-wrap .sdm-btn-icon{font-size:.6rem}
+/* 有更新时闪得更急促，配合脉冲一起吸引注意 */
+.sdm-check-btn.has-update .sdm-deco-1{animation-duration:1.2s;animation-delay:0s}
+.sdm-check-btn.has-update .sdm-deco-2{animation-duration:1.2s;animation-delay:.6s}
+.sdm-check-btn.has-update .sdm-update-tip{opacity:1;transform:translateX(-50%) translateY(0);animation:sdm_tip_float 2s ease-in-out infinite}
+@keyframes sdm_tip_float{0%,100%{transform:translateX(-50%) translateY(0)}50%{transform:translateX(-50%) translateY(-3px)}}
+.sdm-check-btn.has-update:hover{background:rgba(251,191,36,.15);box-shadow:0 4px 18px rgba(251,191,36,.35),inset 0 1px 0 rgba(255,255,255,.1)}
+.sdm-check-btn.loading .sdm-btn-icon{animation:sdm_spin 1s linear infinite}
+.sdm-update-badge{position:absolute;top:-4px;right:-4px;font-size:.28rem;color:#fff;font-weight:800;background:rgba(239,68,68,.9);padding:0 5px;border-radius:10px;border:1px solid rgba(255,255,255,.5);line-height:1.5;z-index:5;animation:sdm_bounce_in .5s cubic-bezier(.34,1.56,.64,1);box-shadow:0 2px 6px rgba(239,68,68,.4)}
+.sdm-update-badge::before{content:'';position:absolute;inset:0;border-radius:10px;box-shadow:0 0 8px rgba(251,191,36,.6);animation:sdm_ring_pulse 1.5s ease-out infinite}
+@keyframes sdm_changelog_pop{0%{transform:scale(.8);opacity:0}100%{transform:scale(1);opacity:1}}
+@keyframes sdm_changelog_shine{0%{background-position:-100% 0}100%{background-position:200% 0}}
+.sdm-changelog-mask{position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(6px);z-index:10000;display:flex;align-items:center;justify-content:center;animation:sdm_fade_in .3s ease}
+@keyframes sdm_fade_in{from{opacity:0}to{opacity:1}}
+.sdm-changelog-box{width:86vw;max-width:380px;background:linear-gradient(160deg,rgba(30,41,59,.98),rgba(15,23,42,.98));border:1px solid rgba(99,102,241,.3);border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,.5),0 0 40px rgba(99,102,241,.2);overflow:hidden;animation:sdm_changelog_pop .4s cubic-bezier(.34,1.56,.64,1)}
+.sdm-changelog-header{padding:18px 18px 14px;background:linear-gradient(135deg,rgba(99,102,241,.15),rgba(236,72,153,.1));border-bottom:1px solid rgba(255,255,255,.06);position:relative;overflow:hidden}
+.sdm-changelog-header::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,#6366f1,#ec4899,#f59e0b,#10b981,#6366f1);background-size:300% 100%;animation:sdm_changelog_shine 3s linear infinite}
+.sdm-changelog-title{font-size:.8rem;font-weight:bold;color:white;display:flex;align-items:center;gap:8px}
+.sdm-changelog-ver{font-size:.5rem;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:white;padding:2px 10px;border-radius:10px;font-weight:600}
+.sdm-changelog-sub{font-size:.5rem;color:#94a3b8;margin-top:6px}
+.sdm-changelog-body{padding:16px 18px;max-height:50vh;overflow-y:auto}
+.sdm-changelog-body::-webkit-scrollbar{width:4px}
+.sdm-changelog-body::-webkit-scrollbar-thumb{background:rgba(99,102,241,.4);border-radius:2px}
+.sdm-changelog-item{margin-bottom:12px}
+.sdm-changelog-item:last-child{margin-bottom:0}
+.sdm-changelog-item-title{font-size:.58rem;font-weight:bold;color:#a5b4fc;margin-bottom:6px;display:flex;align-items:center;gap:6px}
+.sdm-changelog-item-title .dot{width:6px;height:6px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#ec4899)}
+.sdm-changelog-item ul{margin:0;padding-left:18px;font-size:.56rem;color:#cbd5e1;line-height:1.7}
+.sdm-changelog-item li{margin-bottom:3px}
+.sdm-changelog-item li::marker{color:#818cf8}
+.sdm-changelog-footer{padding:12px 18px 16px;display:flex;gap:10px;justify-content:flex-end;border-top:1px solid rgba(255,255,255,.06)}
+.sdm-changelog-btn{padding:8px 20px;border-radius:12px;font-size:.6rem;font-weight:600;cursor:pointer;transition:all .2s ease;border:none}
+.sdm-changelog-btn.primary{background:linear-gradient(135deg,#6366f1,#8b5cf6);color:white;box-shadow:0 4px 12px rgba(99,102,241,.4)}
+.sdm-changelog-btn.primary:hover{transform:translateY(-2px);box-shadow:0 6px 18px rgba(99,102,241,.55)}
+.sdm-changelog-btn.primary:active{transform:translateY(0)}
+/* 注：樱花雨（#smart_sakura_container / #smart_sakura_canvas / .smart_sakura）已整体移除 */
+.smart_action_btn{position:relative;overflow:hidden;border:none;border-radius:14px;font-weight:bold;cursor:pointer;transition:all .25s ease;animation:smart_btn_glow 3s ease-in-out infinite}
+.smart_action_btn:active{transform:scale(.93)}
+.smart_action_btn::after{content:'';position:absolute;top:50%;left:50%;width:0;height:0;border-radius:50%;background:rgba(255,255,255,.3);transform:translate(-50%,-50%);pointer-events:none}
+.smart_action_btn:active::after{width:120px;height:120px;transition:width .4s ease,height .4s ease,opacity .4s ease;animation:smart_action_ripple .5s ease-out}
+.smart_shine_text{background:linear-gradient(90deg,rgba(255,255,255,.5) 0%,rgba(255,255,255,1) 50%,rgba(255,255,255,.5) 100%);background-size:200% auto;background-clip:text;-webkit-background-clip:text;-webkit-text-fill-color:transparent;animation:smart_btn_shine 3s linear infinite}
+/* 作者开关样式 */
+.smart-author-switch{position:relative;width:32px;height:18px;border-radius:9px;background:rgba(255,255,255,.15);cursor:pointer;transition:background .25s;flex-shrink:0;display:inline-block;vertical-align:middle;}
+.smart-author-switch._on{background:linear-gradient(135deg,#a78bfa,#ec4899);}
+.smart-author-switch::after{content:'';position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:#fff;transition:transform .25s;}
+.smart-author-switch._on::after{transform:translateX(14px);}
+/* 小宇点击特效 */
+@keyframes smart_xiaoyu_pop{0%{opacity:0;transform:translate(-50%,-50%) scale(.3)}30%{opacity:1;transform:translate(-50%,-50%) scale(1.3)}70%{opacity:1;transform:translate(-50%,-50%) scale(1)}100%{opacity:0;transform:translate(-50%,-80%) scale(1.6)}}
+.smart-xiaoyu-text{position:fixed;font-size:1.3rem;font-weight:bold;background:linear-gradient(135deg,#ff9ecd,#a78bfa,#60a5fa);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;pointer-events:none;z-index:99999;text-shadow:0 0 12px rgba(167,139,250,.4);animation:smart_xiaoyu_pop .5s ease-out forwards;filter:drop-shadow(0 2px 4px rgba(0,0,0,.3));}
+/* 后台播放开关样式 */
+.sm-bg-switch{position:relative;width:36px;height:20px;border-radius:10px;background:rgba(255,255,255,.15);cursor:pointer;transition:background .25s;flex-shrink:0;display:inline-block;vertical-align:middle;}
+.sm-bg-switch._on{background:linear-gradient(135deg,#10b981,#059669);}
+.sm-bg-switch::after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;transition:transform .25s;box-shadow:0 1px 3px rgba(0,0,0,.3);}
+.sm-bg-switch._on::after{transform:translateX(16px);}
+/* ADB设备播放区域样式 */
+.sm-adb-section{padding:10px 12px;border-radius:12px;margin:8px 0;background:linear-gradient(135deg,rgba(59,130,246,.08),rgba(99,102,241,.04));border:1px solid rgba(59,130,246,.15);}
+.sm-adb-btn{font-size:.55rem;padding:7px 14px;border-radius:10px;border:none;cursor:pointer;color:#fff;background:linear-gradient(135deg,#3b82f6,#6366f1);transition:all .2s;}
+.sm-adb-btn:active{transform:scale(.95);}
+.sm-adb-btn._playing{background:linear-gradient(135deg,#10b981,#059669);}
+.sm-adb-status{font-size:.5rem;opacity:.6;margin-top:6px;text-align:center;}
+/* 小窗模式样式 */
+#smart_music_panel._mini{
+  width:300px !important;
+  height:auto !important;
+  max-height:200px !important;
+  padding:10px 12px !important;
+  border-radius:16px !important;
+  position:fixed !important;
+  top:80px !important;
+  right:20px !important;
+  left:auto !important;
+  bottom:auto !important;
+  transform:none !important;
+  z-index:9999 !important;
+  cursor:move !important;
+  box-shadow:0 8px 32px rgba(0,0,0,.4) !important;
+}
+#smart_music_panel._mini .sm-header{padding:0 0 6px 0;margin-bottom:6px;}
+#smart_music_panel._mini .sm-header .sm-title{font-size:.7rem;}
+#smart_music_panel._mini .sm-section{padding:0 !important;border:none !important;}
+#smart_music_panel._mini .sm-now-playing{font-size:.6rem;padding:4px 0;}
+#smart_music_panel._mini .sm-controls{gap:4px;}
+#smart_music_panel._mini .sm-controls .sm-btn{font-size:12px;padding:4px 8px;min-width:36px;}
+#smart_music_panel._mini .sm-controls .sm-btn-play{min-width:60px !important;}
+#smart_music_panel._mini .sm-seek-wrap{margin-top:4px;}
+#smart_music_panel._mini .sm-tab-bar,
+#smart_music_panel._mini #sm_playlist_tab,
+#smart_music_panel._mini #sm_favorites_tab,
+#smart_music_panel._mini #sm_lyrics_tab,
+#smart_music_panel._mini .sm-vol-wrap,
+#smart_music_panel._mini .sm-adb-section,
+#smart_music_panel._mini #sm_bg_switch{display:none !important;}
+/* 迷你模式下保留自动续播开关 */
+#smart_music_panel._mini #sm_autoplay_switch{
+  display:inline-block !important;
+  width:28px !important;
+  height:16px !important;
+}
+#smart_music_panel._mini #sm_autoplay_switch::after{
+  width:12px !important;
+  height:12px !important;
+}
+#smart_music_panel._mini #sm_autoplay_switch._on::after{
+  transform:translateX(12px) !important;
+}
+#smart_music_panel._mini .sm-autoplay-label{
+  display:inline !important;
+  font-size:.5rem !important;
+  opacity:.6 !important;
+}
+#smart_music_panel._mini .sm-minimize-btn{
+  display:inline-block;
+  margin-right:6px;
+  cursor:pointer;
+  font-size:.7rem;
+  opacity:.7;
+}
+#smart_music_panel._mini .sm-minimize-btn:hover{opacity:1;}
+.sm-minimize-btn{
+  display:inline-block;
+  margin-right:6px;
+  cursor:pointer;
+  font-size:.65rem;
+  opacity:.5;
+  transition:opacity .2s;
+}
+.sm-minimize-btn:hover{opacity:1;}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║  🌸✨ 二次元美化主题 · Sakura Dream Ver. ✨🌸                        ║
+   ║  粉紫梦幻配色 · 彩虹流光边框 · 星光闪烁 · 糖果按钮 · 樱花猫爪      ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+/* ── 🌟 二次元专用动画库 ── */
+@keyframes sdm2_rainbow_flow{0%{background-position:0% 50%}100%{background-position:300% 50%}}
+@keyframes sdm2_heart_float{0%{opacity:0;transform:translateY(0) scale(.6)}15%{opacity:1}85%{opacity:.8}100%{opacity:0;transform:translateY(-48px) scale(1.2)}}
+@keyframes sdm2_glow_breath{0%,100%{box-shadow:0 0 12px rgba(255,158,205,.28),0 0 26px rgba(167,139,250,.16)}50%{box-shadow:0 0 22px rgba(255,158,205,.5),0 0 44px rgba(167,139,250,.34)}}
+@keyframes sdm2_wiggle{0%,100%{transform:rotate(-2.5deg)}50%{transform:rotate(2.5deg)}}
+@keyframes sdm2_float_soft{0%,100%{transform:translateY(0)}50%{transform:translateY(-5px)}}
+@keyframes sdm2_pet_dance{0%,100%{transform:scale(1) rotate(0deg)}25%{transform:scale(1.12) rotate(-7deg)}75%{transform:scale(1.12) rotate(7deg)}}
+@keyframes sdm2_ribbon_wave{0%,100%{background-position:0% 50%}50%{background-position:100% 50%}}
+@keyframes sdm2_bg_aurora{0%,100%{background-position:0% 0%,100% 100%}50%{background-position:100% 0%,0% 100%}}
+
+/* ── 🎀 二次元梦幻容器背景（主面板整体） ── */
+#IFRAME_SMART{position:relative;border-radius:16px;background:linear-gradient(160deg,rgba(255,158,205,.05),rgba(167,139,250,.04) 45%,rgba(125,211,252,.05));background-size:200% 200%;animation:sdm2_bg_aurora 14s ease-in-out infinite;padding-bottom:6px}
+#IFRAME_SMART .title strong.smart-grad-text{font-size:1rem;letter-spacing:1px}
+
+/* ── 🌈 二次元流光边框卡片 ── */
+.sdm2-card{position:relative;overflow:hidden}
+.sdm2-card::before{content:'';position:absolute;inset:0;border-radius:inherit;padding:1.5px;background:linear-gradient(90deg,#ff9ecd,#c084fc,#7dd3fc,#86efac,#fde68a,#ff9ecd);background-size:300% 100%;animation:sdm2_rainbow_flow 5s linear infinite;-webkit-mask:linear-gradient(#fff 0 0) content-box,linear-gradient(#fff 0 0);-webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none;z-index:2;opacity:.85}
+/* 注：卡片扫光 ::after 已移除（用户要求删「扫光」） */
+/* 注：卡片悬停上下弹跳已移除，保留卡片本身 */
+
+/* ── ✨ 二次元发光标题（仅保留静态光晕，摇摆与 ✨🎀 装饰动画已移除） ── */
+.sdm2-title-glow{position:relative;display:inline-block;text-shadow:0 0 14px rgba(255,158,205,.6),0 0 28px rgba(167,139,250,.4) !important}
+
+/* ── 🌟 装饰角标（星星·猫爪：emoji 保留，动画已移除以省性能） ── */
+.sdm2-deco{position:absolute;pointer-events:none;z-index:3;opacity:1;filter:drop-shadow(0 0 5px rgba(255,158,205,.7))}
+.sdm2-deco.d1{top:-4px;right:10px}
+.sdm2-deco.d2{top:-5px;right:36px;font-size:.6rem}
+.sdm2-deco.d3{bottom:-2px;right:16px;font-size:.55rem}
+.sdm2-paw{position:absolute;bottom:4px;left:8px;font-size:.55rem;opacity:.5;pointer-events:none;z-index:3;filter:drop-shadow(0 0 4px rgba(125,211,252,.6))}
+
+/* ── 🎊 二次元横幅（欢迎横幅·彩虹丝带） ── */
+.sdm2-banner{position:relative;overflow:hidden;margin:2px 0 10px;padding:10px 14px;border-radius:16px;border:1px solid rgba(255,158,205,.35);background:linear-gradient(105deg,rgba(255,158,205,.15),rgba(196,164,252,.12),rgba(125,211,252,.13),rgba(134,239,172,.1),rgba(253,230,138,.12),rgba(255,158,205,.15));background-size:200% 100%;animation:sdm2_ribbon_wave 8s linear infinite;box-shadow:0 4px 18px rgba(255,158,205,.18)}
+.sdm2-banner::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,#ff9ecd,#a78bfa,#7dd3fc,#86efac,#fde68a,#ff9ecd);background-size:300% 100%;animation:sdm2_rainbow_flow 4s linear infinite}
+/* 注：横幅扫光 ::after 已移除 */
+.sdm2-banner-text{position:relative;z-index:2;text-align:center;font-size:.62rem;font-weight:bold;letter-spacing:2px;color:#ffd6e8;background:linear-gradient(90deg,#ff9ecd,#c084fc,#7dd3fc,#86efac,#fde68a,#ff9ecd);background-size:300% 100%;animation:sdm2_rainbow_flow 6s linear infinite;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;filter:drop-shadow(0 0 8px rgba(255,158,205,.45))}
+@supports not (background-clip:text){.sdm2-banner-text{color:#ff9ecd;-webkit-text-fill-color:#ff9ecd}}
+.sdm2-banner-sub{position:relative;z-index:2;text-align:center;font-size:.42rem;opacity:.65;margin-top:3px;color:#e9d5ff;letter-spacing:1px}
+
+/* ── 🍬 糖果按钮增强（弹跳+光晕+光泽） ── */
+.smart_action_btn{position:relative;overflow:hidden;box-shadow:0 3px 14px rgba(255,158,205,.25),inset 0 1px 0 rgba(255,255,255,.25) !important;text-shadow:0 1px 3px rgba(255,255,255,.25)}
+/* 注：按钮扫光 ::after 已移除；悬停弹跳已移除，只保留放大反馈 */
+.smart_action_btn:hover{transform:scale(1.05)}
+
+/* ── 💎 二次元徽章芯片（呼吸光晕） ── */
+.sdm2-chip{animation:sdm2_glow_breath 2.8s ease-in-out infinite;position:relative}
+.sdm2-chip-star{display:inline-block}
+
+/* 注：樱花开关按钮 #smart_sakura_toggle 已随樱花雨一并移除 */
+
+/* ── 💕 漂浮爱心装饰 ── */
+.sdm2-hearts{position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:3}
+.sdm2-hearts span{position:absolute;bottom:0;font-size:.55rem;animation:sdm2_heart_float 4.5s ease-in-out infinite;opacity:0;filter:drop-shadow(0 0 4px rgba(255,110,180,.7))}
+
+/* 注：星光闪粉层 .sdm2-sparkles 已彻底移除 —— 每张卡片动态生成 5~8 个带 drop-shadow
+   的 <i> 粒子且跑两轮，是列表滚动卡顿的主因 */
+
+/* ── 📜 二次元滚动条美化 ── */
+#IFRAME_SMART ::-webkit-scrollbar{width:6px;height:6px}
+#IFRAME_SMART ::-webkit-scrollbar-track{background:rgba(255,158,205,.06);border-radius:3px}
+#IFRAME_SMART ::-webkit-scrollbar-thumb{background:linear-gradient(180deg,#ff9ecd,#a78bfa);border-radius:3px;box-shadow:0 0 6px rgba(255,158,205,.5)}
+#IFRAME_SMART ::-webkit-scrollbar-thumb:hover{background:linear-gradient(180deg,#c084fc,#ff6fae)}
+
+/* ── 🖋 二次元选中文本 ── */
+#IFRAME_SMART ::selection{background:rgba(255,158,205,.45);color:#fff;text-shadow:0 0 8px rgba(255,255,255,.6)}
+
+/* ── 🧸 输入框/文本域二次元化 ── */
+#smart_log_area,#smart_diag_log{background:linear-gradient(135deg,rgba(20,12,28,.5),rgba(30,18,44,.4)) !important;border:1px solid rgba(192,132,252,.25) !important;color:rgba(255,214,232,.75) !important;caret-color:#ff9ecd}
+#smart_log_area:focus,#smart_diag_log:focus{border-color:rgba(255,158,205,.45) !important;box-shadow:0 0 14px rgba(255,158,205,.2)}
+
+/* ── 🎀 下拉框二次元化 ── */
+#smart_scan_interval{background:rgba(255,158,205,.1) !important;border:1px solid rgba(192,132,252,.3) !important;color:#ffd6e8 !important}
+#smart_scan_interval option{background:#1e1230;color:#ffd6e8}
+
+/* ── 🌟 设备列表卡片二次元化（扫描列表条目悬浮效果） ── */
+#smart_scan_list>div{transition:all .25s cubic-bezier(.34,1.56,.64,1) !important;border:1px solid rgba(255,158,205,.1) !important}
+#smart_scan_list>div:hover{transform:translateX(4px) scale(1.01);border-color:rgba(255,158,205,.35) !important;background:rgba(255,158,205,.08) !important;box-shadow:0 3px 14px rgba(255,158,205,.2)}
+
+/* ── ✨ 品牌徽章呼吸光 ── */
+#smart_scan_list div[style*="width:36px"]{animation:sdm2_glow_breath 3.4s ease-in-out infinite}
+
+/* ── 💫 collapse_box 内部容器统一柔化 ── */
+#IFRAME_SMART .collapse_box{border-radius:16px}
+#IFRAME_SMART .collapse{transition:height .35s cubic-bezier(.34,1.56,.64,1)}
+
+/* ── 🌈 版本号徽章彩虹化 ── */
+#IFRAME_SMART .title>span[style*="linear-gradient(135deg,#3b82f6"]{background:linear-gradient(135deg,#a78bfa,#ff6fae) !important;box-shadow:0 2px 12px rgba(255,111,174,.4) !important;border:1px solid rgba(255,214,232,.4) !important;animation:sdm2_glow_breath 3s ease-in-out infinite}
+
+/* ── 🌠 音乐面板二次元加强（仅视觉层覆盖） ── */
+#smart_music_panel{box-shadow:0 12px 50px rgba(0,0,0,.65),0 0 0 1px rgba(255,158,205,.25),0 0 36px rgba(255,158,205,.22) !important;border:1px solid rgba(255,182,193,.4) !important}
+#smart_music_panel .sm-btn{transition:all .22s cubic-bezier(.34,1.56,.64,1)}
+#smart_music_panel .sm-btn:hover{transform:translateY(-2px) scale(1.06);filter:brightness(1.15)}
+#smart_music_panel .sm-btn:active{transform:scale(.94)}
+#smart_music_panel .sm-tab._active{box-shadow:0 0 12px rgba(255,158,205,.35)}
+
+/* ── 🌠 AI 面板二次元加强 ── */
+#smart_ai_panel{box-shadow:0 12px 55px rgba(0,0,0,.7),0 0 0 1px rgba(192,132,252,.3),0 0 40px rgba(167,139,250,.25) !important;border:1px solid rgba(216,180,254,.4) !important}
+#smart_ai_fab{box-shadow:0 4px 22px rgba(167,139,250,.55),0 0 0 2px rgba(216,180,254,.3),0 0 18px rgba(255,158,205,.35) !important;animation:sdm2_glow_breath 3.6s ease-in-out infinite}
+#smart_ai_fab:hover{transform:scale(1.12) rotate(8deg)}
+
+/* ── 🎀 信号监控二次元化（视觉覆盖） ── */
+#SIGNAL_MONITOR .btn{border-radius:10px !important;transition:all .22s cubic-bezier(.34,1.56,.64,1)}
+#SIGNAL_MONITOR .btn:hover{transform:translateY(-2px);filter:brightness(1.2)}
+#SIGNAL_MONITOR .kfk_cards>div{border:1px solid rgba(255,158,205,.15) !important;border-radius:14px !important;transition:all .25s ease}
+#SIGNAL_MONITOR .kfk_cards>div:hover{border-color:rgba(255,158,205,.4) !important;box-shadow:0 4px 16px rgba(255,158,205,.22);transform:translateY(-2px)}
+#update_interval_select{background:rgba(30,18,44,.9) !important;color:#ffd6e8 !important;border:1px solid rgba(192,132,252,.35) !important;border-radius:8px !important}
+
+/* ── 🌟 电池监控容器二次元化 ── */
+#BATTERY_PRO_CONTAINER{filter:saturate(1.18)}
+
+/* ── 💫 空状态提示二次元化 ── */
+#smart_scan_list div[style*="text-align:center"]{color:rgba(255,158,205,.75) !important}
+
+/* ── 🌸 顶部标题装饰行 ── */
+/* 注：彩虹下划线 .sdm2-title-underline 已移除 */
+
+/* ── ⭐ 二次元小提示标签（kawaii 风格） ── */
+.sdm2-kawaii-note{display:inline-block;padding:2px 10px;border-radius:12px;font-size:.42rem;background:linear-gradient(135deg,rgba(255,158,205,.16),rgba(192,132,252,.14));border:1px dashed rgba(255,158,205,.45);color:#ffd6e8;letter-spacing:1px;animation:sdm2_float_soft 3s ease-in-out infinite}
+/* ── 🚦 动效总开关：关闭时所有动画/过渡瞬间跳到终态（1ms），不再持续重绘 ── */
+/* 关键点：作用域限定在 #IFRAME_SMART 内，绝不写 html.sdm-no-fx * 这种全局通配，否则会误伤其他插件 */
+/* 更新按钮整棵子树用 :not() 排除，压根不参与压缩，所以关特效时也照常动 */
+html.sdm-no-fx #IFRAME_SMART,
+html.sdm-no-fx #IFRAME_SMART *:not(.sdm-check-btn):not(.sdm-btn-icon-wrap):not(.sdm-btn-icon):not(.sdm-deco-1):not(.sdm-deco-2):not(.sdm-update-tip):not(.sdm-update-badge),
+html.sdm-no-fx #IFRAME_SMART *:not(.sdm-check-btn):not(.sdm-btn-icon-wrap):not(.sdm-btn-icon):not(.sdm-deco-1):not(.sdm-deco-2):not(.sdm-update-tip):not(.sdm-update-badge)::before,
+html.sdm-no-fx #IFRAME_SMART *:not(.sdm-check-btn):not(.sdm-btn-icon-wrap):not(.sdm-btn-icon):not(.sdm-deco-1):not(.sdm-deco-2):not(.sdm-update-tip):not(.sdm-update-badge)::after{animation-duration:1ms !important;animation-delay:0s !important;animation-iteration-count:1 !important;transition-duration:1ms !important;transition-delay:0s !important}
+html.sdm-no-fx #smart_fx_toggle{background:linear-gradient(135deg,#64748b,#475569,#334155) !important;box-shadow:none !important}
+/* 功能性反馈不受开关影响：loading 时仍要转，否则看不出在加载 */
+html.sdm-no-fx .sdm-check-btn.loading .sdm-btn-icon{animation:sdm_spin 1s linear infinite !important}
+</style>
+<div id="IFRAME_SMART" style="width:100%;margin-top:10px;">
+    <div class="sdm2-banner"><div class="sdm2-banner-text">✧･ﾟ: *✧･ﾟ♡ 智能设备管理器 · Sakura Dream Ver ♡ﾟ･* :･ﾟ✧</div><div class="sdm2-banner-sub">🌸 星空下的梦幻设备魔法阵 · 萌力全开中 🌸</div></div>
+    <div class="title" style="margin:6px 0;">
+        <span id="sdm_check_update_btn" class="sdm-check-btn" title="检查更新"><span class="sdm-btn-icon-wrap"><span class="sdm-btn-icon">📦</span></span><span class="sdm-deco-1">✨</span><span class="sdm-deco-2">💫</span><span class="sdm-update-tip">有新版！</span></span>
+        <span id="sdm_version_badge" title="当前插件版本" style="display:inline-block;vertical-align:middle;font-size:.45rem;font-weight:bold;color:#fff;margin-left:6px;background:linear-gradient(135deg,#a78bfa,#f472b6);padding:2px 9px;border-radius:10px;box-shadow:0 1px 6px rgba(244,114,182,.35);border:1px solid rgba(255,214,232,.35);letter-spacing:.5px;opacity:.92;">v${PLUGIN_VERSION}</span>
+        <span style="font-size:.4rem;opacity:.35;margin-left:4px">QQ 1085465022</span>
+        <span style="display:inline-flex;align-items:center;gap:3px;margin-left:6px;vertical-align:middle;">
+            <span style="font-size:.4rem;opacity:.5;">作者</span>
+            <span class="smart-author-switch" id="smart_author_switch"></span>
+        </span>
+        <span id="smart_author_display" style="display:none;font-size:.4rem;margin-left:4px;background:linear-gradient(135deg,#a78bfa,#ec4899);color:white;padding:2px 8px;border-radius:8px;font-weight:bold;">✨ 小宇同学</span>
+        <span id="smart_fx_toggle" title="一键关闭本插件所有动画特效（卡顿时用）" style="display:inline-block;font-size:.5rem;font-weight:bold;color:white;cursor:pointer;margin-left:6px;background:linear-gradient(135deg,#a78bfa,#818cf8,#60a5fa);padding:4px 14px;border-radius:14px;border:1px solid rgba(196,181,253,.55);box-shadow:0 2px 12px rgba(129,140,248,.4),0 0 16px rgba(167,139,250,.3);transition:all .25s;">✨ 特效开</span>
+        <div style="display:inline-block;" id="collapse_SMART_btn"></div>
+    </div>
+    <div class="collapse" id="collapse_SMART" data-name="close" style="height:0px;overflow:hidden;">
+    <div class="collapse_box">
+        <div id="smart_game_boost_panel" class="sdm2-card" style="padding:14px;margin-bottom:10px;border-radius:18px;background:linear-gradient(135deg,rgba(255,158,205,.09),rgba(134,239,172,.06),rgba(192,132,252,.08));border:1px solid rgba(255,158,205,.22);">
+            <span class="sdm2-deco d1">✨</span><span class="sdm2-deco d2">⭐</span><span class="sdm2-deco d3">💫</span><span class="sdm2-paw">🐾</span>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                <div style="display:flex;align-items:center;gap:8px;">
+                    <div style="width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,#86efac,#4ade80,#a7f3d0);display:flex;align-items:center;justify-content:center;font-size:1.1rem;box-shadow:0 2px 14px rgba(134,239,172,.5),0 0 18px rgba(74,222,128,.35);animation:sdm2_pet_dance 3s ease-in-out infinite;">🎮</div>
+                    <div>
+                        <div style="font-size:.7rem;" class="smart-grad-text sdm2-title-glow">游戏自动加速</div>
+                        <div style="font-size:.5rem;opacity:.5;">状态: <span id="smart_boost_status">待机中</span> <span class="sdm2-chip-star">🌟</span></div>
+                    </div>
+                </div>
+                <span class="sdm2-kawaii-note">🎀 检测到游戏自动开启</span>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
+                <div style="padding:10px;border-radius:12px;background:rgba(134,239,172,.09);text-align:center;border:1px solid rgba(134,239,172,.15);">
+                    <div style="font-size:.45rem;opacity:.5;">当前游戏</div>
+                    <div style="font-size:.6rem;font-weight:bold;color:#86efac;" id="smart_current_game">无</div>
+                    <div style="font-size:.4rem;opacity:.4;" id="smart_boost_pkg">-</div>
+                </div>
+                <div style="padding:10px;border-radius:12px;background:rgba(192,132,252,.1);text-align:center;border:1px solid rgba(192,132,252,.16);">
+                    <div style="font-size:.45rem;opacity:.5;">加速时长</div>
+                    <div style="font-size:.6rem;font-weight:bold;color:#c084fc;" id="smart_boost_duration">0s</div>
+                </div>
+                <div style="padding:10px;border-radius:12px;background:rgba(253,230,138,.09);text-align:center;border:1px solid rgba(253,230,138,.16);">
+                    <div style="font-size:.45rem;opacity:.5;">丢包修复率</div>
+                    <div style="font-size:.6rem;font-weight:bold;color:#fde68a;" id="smart_repair_rate">0%</div>
+                </div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px;">
+                <div style="padding:8px;border-radius:12px;background:rgba(125,211,252,.09);text-align:center;border:1px solid rgba(125,211,252,.16);">
+                    <div style="font-size:.45rem;opacity:.5;">延迟改善</div>
+                    <div style="font-size:.55rem;font-weight:bold;color:#7dd3fc;" id="smart_latency_improve">0ms</div>
+                </div>
+                <div style="padding:8px;border-radius:12px;background:rgba(255,158,205,.1);text-align:center;border:1px solid rgba(255,158,205,.16);">
+                    <div style="font-size:.45rem;opacity:.5;">丢包基线</div>
+                    <div style="font-size:.55rem;font-weight:bold;color:#ff9ecd;" id="smart_loss_before">0%</div>
+                </div>
+            </div>
+            <div style="font-size:.4rem;opacity:.45;margin-top:6px;text-align:center;">✨ 打开游戏自动检测并加速，优先游戏流量，实时监控丢包修复率和延迟改善 ✨</div>
+        </div>
+        <div class="sdm2-card" style="padding:14px;margin-bottom:10px;border-radius:18px;background:linear-gradient(135deg,rgba(255,158,205,.05),rgba(125,211,252,.04));border:1px solid rgba(255,158,205,.14);">
+            <span class="sdm2-deco d1">📡</span><span class="sdm2-deco d2">✨</span><span class="sdm2-paw">🐾</span>
+            <div class="title" style="font-size:.7rem;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
+                <span class="smart-grad-text sdm2-title-glow">📡 已连接设备</span>
+                <div style="display:flex;align-items:center;gap:6px;">
+                    <span style="font-size:.55rem;opacity:.6;">共 <span id="smart_device_count">0</span> 台 <span class="sdm2-chip-star">💕</span></span>
+                    <select id="smart_scan_interval" style="font-size:.45rem;padding:2px 6px;border-radius:8px;border:1px solid rgba(255,158,205,.25);background:rgba(255,158,205,.1);color:rgba(255,255,255,.85);outline:none;">
+                        <option value="3000">3秒</option>
+                        <option value="5000">5秒</option>
+                        <option value="10000" selected>10秒</option>
+                        <option value="15000">15秒</option>
+                        <option value="30000">30秒</option>
+                    </select>
+                    <button style="${_bs}background:linear-gradient(135deg,#7dd3fc,#38bdf8,#60a5fa);font-size:.45rem;padding:3px 10px;box-shadow:0 2px 10px rgba(56,189,248,.35);" id="smart_refresh_now">🔄 刷新</button>
+                </div>
+            </div>
+            <div id="smart_scan_list" style="max-height:300px;overflow-y:auto;">
+                <div style="text-align:center;padding:20px;opacity:.55;font-size:.6rem">🌸 点击刷新按钮扫描设备 🌸</div>
+            </div>
+        </div>
+        <div class="sdm2-card" style="padding:14px;margin-bottom:10px;border-radius:18px;background:linear-gradient(135deg,rgba(192,132,252,.05),rgba(255,158,205,.04));border:1px solid rgba(192,132,252,.14);">
+            <span class="sdm2-deco d1">⭐</span><span class="sdm2-deco d3">✨</span>
+            <div class="title" style="font-size:.7rem;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
+                <span class="smart-grad-text sdm2-title-glow">📜 活动日志</span>
+                <button style="${_bs}background:linear-gradient(135deg,#fb7185,#f43f5e);font-size:.45rem;padding:3px 10px;box-shadow:0 2px 10px rgba(244,63,94,.35);" id="smart_clear_log">清空</button>
+            </div>
+            <textarea id="smart_log_area" disabled style="font-size:.5rem !important;border:none;padding:8px;margin:0;width:100%;height:120px;border-radius:12px;overflow-x:hidden;background:linear-gradient(135deg,rgba(20,12,28,.55),rgba(30,18,44,.45));color:rgba(255,214,232,.7);border:1px solid rgba(192,132,252,.2);" placeholder="暂无日志 ✨"></textarea>
+        </div>
+        <div class="sdm2-card" style="padding:14px;border-radius:18px;margin-bottom:10px;border:1px solid rgba(255,158,205,.2);background:linear-gradient(135deg,rgba(255,158,205,.07),rgba(196,79,196,.05),rgba(192,132,252,.05));">
+            <span class="sdm2-deco d1">💫</span><span class="sdm2-deco d2">📊</span><span class="sdm2-paw">🐱</span>
+            <div class="title" style="font-size:.7rem;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
+                <span class="smart-grad-text sdm2-title-glow">📊 网络诊断日志</span>
+                <button id="smart_clear_diaglog" style="font-size:.45rem;padding:3px 10px;${_bs}background:linear-gradient(135deg,#fb7185,#f43f5e);box-shadow:0 2px 10px rgba(244,63,94,.35);">清空</button>
+            </div>
+            <textarea id="smart_diag_log" disabled style="font-size:.5rem !important;border:none;padding:8px;margin:0;width:100%;height:100px;border-radius:12px;overflow-x:hidden;background:linear-gradient(135deg,rgba(20,12,28,.55),rgba(30,18,44,.45));color:rgba(255,214,232,.7);border:1px solid rgba(255,158,205,.18);" placeholder="暂无诊断日志 ✨"></textarea>
+        </div>
+        <div class="sdm2-card" style="padding:14px;border-radius:18px;margin-bottom:10px;border:1px solid rgba(125,211,252,.2);background:linear-gradient(135deg,rgba(125,211,252,.07),rgba(192,132,252,.05),rgba(255,158,205,.04));">
+            <span class="sdm2-deco d1">📝</span><span class="sdm2-deco d2">🌟</span><span class="sdm2-deco d3">🎀</span>
+            <div class="title" style="font-size:.7rem;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
+                <span class="smart-grad-text sdm2-title-glow">📝 插件讲解</span>
+            </div>
+            <div style="padding:16px 12px;font-size:.6rem;line-height:1.8;color:rgba(255,255,255,.78);text-align:center;">
+                <div style="font-size:.65rem;font-weight:bold;margin-bottom:10px;background:linear-gradient(135deg,#7dd3fc,#c084fc,#ff9ecd);background-size:200% 100%;animation:sdm2_rainbow_flow 5s linear infinite;-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;">📖 插件简介</div>
+                <div style="margin-bottom:12px;">本插件制作于小宇同学 <span class="sdm2-chip-star">✨</span></div>
+                <div style="padding:10px 14px;border-radius:12px;background:rgba(192,132,252,.09);border:1px solid rgba(192,132,252,.18);margin-bottom:10px;">
+                    <div style="font-size:.55rem;opacity:.6;margin-bottom:4px;">联系方式</div>
+                    <div style="font-size:.6rem;font-weight:bold;color:#c084fc;">QQ：1085465022</div>
+                    <div style="font-size:.5rem;opacity:.5;margin-top:4px;">有问题QQ联系</div>
+                </div>
+                <div style="font-size:.5rem;opacity:.5;">(っ｡´ω｡)っ 感谢使用本插件 ✨</div>
+            </div>
+        </div>
+        <div id="SMART_action_box" style="margin-bottom:10px;display:flex;gap:8px;flex-wrap:wrap"></div>
+        <div style="margin-top:8px;text-align:right;font-size:.45rem;opacity:.75;">Smart Device Manager <span style="opacity:.6;">QQ 1085465022</span> <span class="sdm2-chip-star">🌸</span></div>
+    </div>
+    </div>
+    </div>`)
+
+
+
+    // ╔════════════════════════════════════════════════════════════╗
+    // ║  🌸✨ 二次元氛围装饰层 · 漂浮爱心 + 星光闪粉（纯视觉） ✨🌸    ║
+    // ║  挂在独立装饰容器上，pointer-events:none，不影响任何交互    ║
+    // ╚════════════════════════════════════════════════════════════╝
+    ;(function sdm2Ambience() {
+        const HEART_SET = ['💗', '💕', '🩷', '✿', '🌸', '💖']
+        const rand = (arr) => arr[Math.floor(Math.random() * arr.length)]
+        const randRange = (min, max) => min + Math.random() * (max - min)
+
+        // 1. 给横幅注入漂浮爱心层
+        const banner = document.querySelector('.sdm2-banner')
+        if (banner && !banner.querySelector('.sdm2-hearts')) {
+            const hearts = document.createElement('div')
+            hearts.className = 'sdm2-hearts'
+            for (let i = 0; i < 7; i++) {
+                const s = document.createElement('span')
+                s.textContent = rand(HEART_SET)
+                s.style.left = randRange(4, 92) + '%'
+                s.style.fontSize = randRange(.4, .7) + 'rem'
+                s.style.animationDelay = randRange(0, 4.5) + 's'
+                s.style.animationDuration = randRange(3.8, 6.5) + 's'
+                hearts.appendChild(s)
+            }
+            banner.appendChild(hearts)
+        }
+
+        // 2. （已移除）星光闪粉层 sparkCards —— 每张卡片要动态生成 5~8 个带 drop-shadow
+        //    的粒子，且执行两轮，是列表滚动卡顿的主因。对应 CSS 与粒子动画的关键帧
+        //    定义也已一并删除。
+
+        // 3. 猫爪提示彩蛋：点击标题触发爱心喷泉（低频，纯装饰）
+        const titleEl = document.querySelector('#IFRAME_SMART .title strong.smart-grad-text')
+        if (titleEl) {
+            titleEl.style.cursor = 'pointer'
+            let _sdm2LastPop = 0
+            titleEl.addEventListener('click', function(e) {
+                const now = Date.now()
+                if (now - _sdm2LastPop < 800) return
+                _sdm2LastPop = now
+                for (let i = 0; i < 8; i++) {
+                    const h = document.createElement('span')
+                    h.textContent = rand(HEART_SET)
+                    h.style.cssText = 'position:fixed;pointer-events:none;z-index:99999;font-size:' + randRange(.6, 1.1) + 'rem;filter:drop-shadow(0 0 6px rgba(255,110,180,.8));animation:sdm2_heart_float ' + randRange(1.6, 2.6) + 's ease-out forwards;left:' + (e.clientX + randRange(-40, 40)) + 'px;top:' + (e.clientY - 10) + 'px;'
+                    document.body.appendChild(h)
+                    setTimeout(function() { h.remove() }, 2800)
+                }
+            })
+        }
+    })();
+
+
+    /* ============ 🚦 全局动效总开关 ============ */
+    // 关闭后：本插件（#IFRAME_SMART）内的 CSS 动画/过渡瞬间结束（1ms）不再持续重绘。
+    // 注意：只作用于本插件容器及其后代，其他插件的动画不受影响。
+    // 更新按钮（.sdm-check-btn）整棵子树被 :not() 排除，始终保持动效。
+    var _fxOn = true
+    try {
+        var _fxSaved = localStorage.getItem('smart_fx_enabled')
+        if (_fxSaved !== null) _fxOn = _fxSaved === '1'
+    } catch(e) {}
+
+    const _fxApply = () => {
+        try { document.documentElement.classList.toggle('sdm-no-fx', !_fxOn) } catch(e) {}
+        var btn = document.querySelector('#smart_fx_toggle')
+        if (btn) {
+            btn.textContent = _fxOn ? '✨ 特效开' : '🚫 特效关'
+            btn.setAttribute('title', _fxOn ? '一键关闭本插件所有动画特效（卡顿时用）' : '一键恢复本插件所有动画特效')
+        }
+    }
+
+    const _fxToggle = () => {
+        _fxOn = !_fxOn
+        try { localStorage.setItem('smart_fx_enabled', _fxOn ? '1' : '0') } catch(e) {}
+        _fxApply()
+        if (typeof createToast === 'function') createToast(_fxOn ? '已开启全部动效 ✨' : '已关闭全部动效 🚫', _fxOn ? 'pink' : 'yellow', 2000)
+    }
+
+    // 应用开关状态
+    _fxApply()
+
+    var fxToggleBtn = document.querySelector('#smart_fx_toggle')
+    if (fxToggleBtn) fxToggleBtn.onclick = function() { _fxToggle() }
+
+
+    const actionBox = document.querySelector('#SMART_action_box')
+    const scanBtn = document.createElement('button')
+    scanBtn.textContent = '📡 扫描设备'
+    scanBtn.className = 'smart_action_btn'
+    scanBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#7dd3fc,#38bdf8,#60a5fa);background-size:200% 100%;animation:sdm2_rainbow_flow 6s linear infinite, sdm2_glow_breath 3.5s ease-in-out infinite;color:white;border:1px solid rgba(186,230,253,.5);'
+    scanBtn.onclick = async () => {
+        if (!(await checkAdvanceFunc())) return createToast('未开启高级功能', 'red')
+        createToast('正在扫描...', 'pink', 3000)
+        await scanDevices()
+    }
+    actionBox.appendChild(scanBtn)
+
+    // 🎵 音乐播放器
+    var musicBtn = document.createElement('button')
+    musicBtn.textContent = '🎵 音乐'
+    musicBtn.className = 'smart_action_btn'
+    musicBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#f9a8d4,#f472b6,#ec4899);background-size:200% 100%;animation:sdm2_rainbow_flow 6s linear infinite, sdm2_glow_breath 3.5s ease-in-out infinite;color:white;border:1px solid rgba(249,168,212,.5);'
+    musicBtn.onclick = function() { toggleMusicPlayer() }
+    actionBox.appendChild(musicBtn)
+
+    // 🤖 AI 智能助手
+    var aiBtn = document.createElement('button')
+    aiBtn.textContent = '🤖 AI助手'
+    aiBtn.className = 'smart_action_btn'
+    aiBtn.style.cssText = 'font-size:.55rem;padding:8px 16px;background:linear-gradient(135deg,#d8b4fe,#c084fc,#a855f7);background-size:200% 100%;animation:sdm2_rainbow_flow 6s linear infinite, sdm2_glow_breath 3.5s ease-in-out infinite;color:white;border:1px solid rgba(216,180,254,.5);'
+    aiBtn.onclick = function() { toggleAIPanel() }
+    actionBox.appendChild(aiBtn)
+
+    // ============ 音乐播放器模块（歌词悬浮在屏幕底部居中） ============
+    // 【性能优化】延迟300ms加载，优先渲染主界面
+    setTimeout(function() {
+    ;(function() {
+        // ---- 状态 ----
+        var _playlist = []        // {url, title, lrc}
+        var _currentIndex = -1
+        var _audio = null
+        var _lrcData = []          // [{time, text}]
+        var _lrcLineIndex = -1
+        var _isPlaying = false
+        var _panelVisible = false
+        var _lyricsOverlayVisible = false
+        var _progressTimer = null
+        var _playMode = 'sequence'   // 'sequence' 顺序播放 | 'single' 单曲循环
+        var _retryCount = 0          // 播放失败重试计数（防止无限重试）
+        var _bgPlayEnabled = false   // 后台持续播放开关
+        var _wakeLock = null         // WakeLock 实例
+        var _bgKeepAliveTimer = null  // 后台保活定时器
+        var _autoPlayEnabled = false  // 打开页面自动续播
+
+        // ---- 从 localStorage 恢复 ----
+        try {
+            var saved = localStorage.getItem('smart_music_playlist')
+            if (saved) _playlist = JSON.parse(saved) || []
+        } catch(e) {}
+        try { _playMode = localStorage.getItem('smart_music_playmode') || 'sequence' } catch(e) {}
+        try { _bgPlayEnabled = localStorage.getItem('smart_music_bgplay') === '1' } catch(e) {}
+        try { _autoPlayEnabled = localStorage.getItem('smart_music_autoplay') === '1' } catch(e) {}
+
+        var savePlaylist = function() {
+            try { localStorage.setItem('smart_music_playlist', JSON.stringify(_playlist)) } catch(e) {}
+        }
+
+        // ---- 收藏列表 ----
+        var _favorites = []
+        try {
+            var savedFav = localStorage.getItem('smart_music_favorites')
+            if (savedFav) _favorites = JSON.parse(savedFav) || []
+        } catch(e) {}
+
+        var saveFavorites = function() {
+            try { localStorage.setItem('smart_music_favorites', JSON.stringify(_favorites)) } catch(e) {}
+        }
+
+        var isFavorited = function(songId) {
+            return _favorites.some(function(f) { return f.id === songId })
+        }
+
+        var toggleFavorite = function(song) {
+            if (!song || !song.id) return
+            var idx = _favorites.findIndex(function(f) { return f.id === song.id })
+            if (idx >= 0) {
+                _favorites.splice(idx, 1)
+                showToast('已取消收藏', 'pink', 1500)
+            } else {
+                _favorites.push({
+                    id: song.id,
+                    name: song.name || '',
+                    artists: song.artists || [],
+                    album: song.album || '',
+                    platform: song.platform || '',
+                    pfName: song.pfName || '',
+                    songId: song.songId || song.id || '',
+                    albumId: song.albumId || '',
+                    duration: song.duration || 0
+                })
+                showToast('已收藏: ' + (song.name || '未知'), 'green', 1500)
+            }
+            saveFavorites()
+            renderFavorites()
+            renderSearchResults()
+            renderPlaylist()
+        }
+
+        var renderFavorites = function() {
+            var container = document.getElementById('sm_favorites_container')
+            if (!container) return
+            if (!_favorites.length) {
+                container.innerHTML = '<div class="sm-empty" style="text-align:center;padding:30px 10px;color:rgba(255,255,255,.35);font-size:.75rem;">💗 暂无收藏<br><span style="font-size:.65rem;color:rgba(255,255,255,.25);">在搜索结果中点击 ♡ 即可收藏</span></div>'
+                return
+            }
+            var html = ''
+            for (var i = 0; i < _favorites.length; i++) {
+                var fav = _favorites[i]
+                var name = escapeHtml(fav.name || '未知歌曲')
+                var artists = escapeHtml((fav.artists || []).join(' / '))
+                var pfTag = fav.platform ? '<span class="sm-search-pf-tag _' + fav.platform + '">' + (fav.pfName || fav.platform) + '</span>' : ''
+                var isCurrent = _currentIndex >= 0 && _playlist[_currentIndex] && _playlist[_currentIndex].pfId === fav.id
+                html += '<div class="sm-fav-item' + (isCurrent ? ' _active' : '') + '" data-fav-idx="' + i + '">'
+                    + pfTag
+                    + '<span class="_fav-title">' + name + (artists ? ' - ' + artists : '') + '</span>'
+                    + '<span class="_fav-del" data-fav-del="' + i + '">✕</span>'
+                    + '</div>'
+            }
+            container.innerHTML = html
+        }
+
+        var playFavorite = async function(fav) {
+            if (!fav || !fav.id) return
+            // 检查是否已在播放列表
+            for (var i = 0; i < _playlist.length; i++) {
+                if (_playlist[i].pfId === fav.id) {
+                    // 验证已有URL是否仍然有效，如果失效则重新获取
+                    var existingUrl = _playlist[i].url || ''
+                    var urlValid = true
+                    if (existingUrl && _playlist[i].songRef) {
+                        urlValid = await validateAudioUrl(existingUrl)
+                    }
+                    if (urlValid) {
+                        loadSong(i)
+                        play()
+                        renderFavorites()
+                        return
+                    }
+                    // URL已过期，重新获取
+                    showToast('播放地址已过期，正在重新获取...', 'pink', 3000)
+                    var newUrl = await getPlayUrl(_playlist[i].songRef)
+                    if (newUrl) {
+                        _playlist[i].url = newUrl
+                        savePlaylist()
+                        renderPlaylist()
+                        loadSong(i)
+                        play()
+                        renderFavorites()
+                        return
+                    }
+                    // 重新获取也失败，从播放列表移除旧条目，走下方重新添加流程
+                    _playlist.splice(i, 1)
+                    savePlaylist()
+                    renderPlaylist()
+                    break
+                }
+            }
+            showToast('正在获取播放地址...', 'pink', 2000)
+            // 构造song对象
+            var song = {
+                id: fav.id,
+                name: fav.name,
+                artists: fav.artists || [],
+                album: fav.album || '',
+                platform: fav.platform || '',
+                pfName: fav.pfName || '',
+                songId: fav.songId || fav.id || '',
+                albumId: fav.albumId || '',
+                duration: fav.duration || 0
+            }
+            var playUrl = await getPlayUrl(song)
+            if (!playUrl) {
+                showToast('获取播放地址失败，该歌曲可能需要VIP', 'red', 4000)
+                return
+            }
+            var title = (fav.artists && fav.artists.length ? fav.artists.join(' / ') + ' - ' : '') + (fav.name || '未知歌曲')
+            _playlist.push({ url: playUrl, title: title, lrc: '', pfId: fav.id, platform: fav.platform, songRef: song })
+            savePlaylist()
+            renderPlaylist()
+            loadSong(_playlist.length - 1)
+            play()
+            renderFavorites()
+            showToast('正在播放: ' + title + ' [' + (_playMode === 'single' ? '单曲循环' : '顺序播放') + ']', 'green', 2500)
+            // 异步获取歌词
+            fetchLyricsForSong(song)
+        }
+
+        // ---- LRC 解析 ----
+        var parseLRC = function(lrcText) {
+            if (!lrcText || !lrcText.trim()) return []
+            var lines = lrcText.split('\n')
+            var result = []
+            var timeReg = /\[(\d{1,2}):(\d{1,2})(?:\.(\d{1,3}))?\]/g
+            for (var i = 0; i < lines.length; i++) {
+                var line = lines[i]
