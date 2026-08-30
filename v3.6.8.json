@@ -1,0 +1,17 @@
+{
+    "rev": "3.6.8",
+    "guard": "",
+    "diag": "",
+    "deploy": "",
+    "js": "https://raw.githubusercontent.com/xiaoyutxy/my-pIugins/main/sdm.js",
+    "md5": "",
+    "notes": "下载增加断点续传(-C -)+指数退避重试(800ms→1600ms→3200ms)；curl错误码映射中文提示(28=网络连接超时等)；speed-limit防卡死",
+    "changelog": [
+        {
+            "title": "📦 本次更新",
+            "items": [
+                "下载增加断点续传(-C -)+指数退避重试(800ms→1600ms→3200ms)；curl错误码映射中文提示(28=网络连接超时等)；speed-limit防卡死"
+            ]
+        }
+    ]
+}
