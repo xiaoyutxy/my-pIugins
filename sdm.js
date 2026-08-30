@@ -8,7 +8,7 @@ try {
     let DIAG_LOG = []
     let SCAN_INTERVAL_MS = 10000
     let _isScanning = false
-    const PLUGIN_VERSION = '3.6.0'
+    const PLUGIN_VERSION = '3.6.1'
 
     // ════════════════════════════════════════════════════════════
     // 自有更新推送机制 ★ 改成你自己的 GitHub 仓库 ★
@@ -32,17 +32,23 @@ try {
         catch (e) { return { success: false, content: '', error: e?.message || String(e) }; }
     };
 
+    let _sdmProbeTs = 0;
     const _sdmProbeCdn = async () => {
-        if (_sdmBestNode) return _sdmBestNode;
+        // 缓存5分钟，过期后重新探测（网络环境变化能自适应，不会永久锁死在一个节点上）
+        if (_sdmBestNode && Date.now() - _sdmProbeTs < 300000) return _sdmBestNode;
         const candidates = [SDM_CDN_ORIGIN, ...SDM_CDN_MIRRORS];
-        const results = [];
-        for (const node of candidates) {
+        // 并发测速：所有节点同时发请求，最快返回200的胜出。
+        // 串行测6个节点最坏30秒，并发只需最慢一个的超时时间（5秒）。
+        const probeOne = async (node) => {
             const testUrl = `https://${node}/gh/xiaoyutxy/my-pIugins@main/_latest.json?_=${Date.now()}`;
             const start = Date.now();
             const r = await _sdmRun(`curl -sL --connect-timeout 3 --max-time 5 -w '%{http_code}' -o /dev/null ${_sdmSq(testUrl)}`, 8000).catch(() => ({ content: '0' }));
-            if (String(r?.content || '').trim() === '200') results.push({ node, rtt: Date.now() - start });
-        }
-        _sdmBestNode = results.length > 0 ? results.sort((a, b) => a.rtt - b.rtt)[0].node : SDM_CDN_MIRRORS[0];
+            return { node, rtt: Date.now() - start, ok: String(r?.content || '').trim() === '200' };
+        };
+        const results = await Promise.all(candidates.map(probeOne));
+        const ok = results.filter(r => r.ok).sort((a, b) => a.rtt - b.rtt);
+        _sdmBestNode = ok.length > 0 ? ok[0].node : SDM_CDN_MIRRORS[0];
+        _sdmProbeTs = Date.now();
         return _sdmBestNode;
     };
 
@@ -75,6 +81,12 @@ try {
     //   各源 rev 一致且都低于本地  → 云端文件本身没更新，purge 缓存没用，得去推文件
     //   各源 rev 不一致（有的高）  → 确实是 CDN 缓存问题，多源取最高已自动兜底
     let _sdmProbeLog = [];
+
+    // curl 退出码 → 中文提示，让用户看到"网络连接超时"而不是一脸懵的"__FAIL__:28"
+    const _sdmCurlErrMap = { 6:'网络域名解析失败', 7:'无法连接到服务器', 22:'服务器返回错误', 28:'网络连接超时', 35:'网络安全连接失败', 56:'网络连接中断（网络不稳定，可稍后重试）', 92:'HTTP/2帧错误（网络异常）' };
+    const _sdmCurlErrText = (c) => _sdmCurlErrMap[parseInt(c)] || ('网络传输异常(码' + c + ')');
+    // 可续传的 curl 退出码：这些码意味着下载已部分完成，用 -C - 可以接着下而不必从头来
+    const _sdmCurlResumeEcs = new Set(['18','28','56','92']);
 
     const _sdmFetchManifest = async (jsonFile) => {
         const t = Date.now();
@@ -361,8 +373,22 @@ try {
             let dlVer = '';
             for (const src of srcList) {
                 const host = String(src).replace(/^https?:\/\//, '').split('/')[0];
-                const r = await _sdmRun(`curl -sL --fail --connect-timeout 8 --max-time 90 ${_sdmSq(src)} -o ${_sdmSq(SDM_PENDING_JS)} && echo __OK__ || echo __FAIL__`, 95000);
-                if (!String(r?.content || '').includes('__OK__')) { lastFail = `下载失败（源 ${host}）`; await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`, 2000); continue; }
+                // 断点续传 + 指数退避重试：同一源最多重试3次，第一次失败后用 -C - 接着下（不从头来），
+                // 退避间隔 800ms→1600ms→3200ms，给网络波动恢复的时间。
+                let dlOk = false;
+                for (let retry = 0; retry < 3; retry++) {
+                    const resumeFlag = retry > 0 ? '-C - ' : '';
+                    const dlR = await _sdmRun(`curl -sL --fail ${resumeFlag}--connect-timeout 8 --max-time 90 --speed-limit 1 --speed-time 45 ${_sdmSq(src)} -o ${_sdmSq(SDM_PENDING_JS)}; ec=$?; [ "$ec" -eq 0 ] && echo __OK__ || echo "__FAIL__:$ec"`, 95000);
+                    const out = String(dlR?.content || '');
+                    if (out.includes('__OK__')) { dlOk = true; break; }
+                    // 提取 curl 退出码，映射成中文
+                    const m = out.match(/__FAIL__:(\d+)/);
+                    const ec = m?.[1] || '?';
+                    if (!_sdmCurlResumeEcs.has(ec)) { await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`, 2000); }  // 不可续传的码删掉残文件
+                    lastFail = `${host}：${_sdmCurlErrText(ec)}` + (retry < 2 ? `（重试${retry+1}/3中…）` : '');
+                    if (retry < 2) await _sdmWait(800 * Math.pow(2, retry));  // 800ms→1600ms→3200ms
+                }
+                if (!dlOk) { lastFail = lastFail || `下载失败（源 ${host}）`; await _sdmRun(`rm -f ${_sdmSq(SDM_PENDING_JS)}`, 2000); continue; }
                 // 下载后即时校验：大小合理 + 签名恰好2行（防CDN缓存旧文件被装成新版本 / 文件损坏 / 内容重复）
                 const vrf = await _sdmRun(`_s=$(wc -c < ${_sdmSq(SDM_PENDING_JS)} 2>/dev/null || echo 0); _c=$(grep -c 'SDM_PLUGIN''_ID:a1b2c3' ${_sdmSq(SDM_PENDING_JS)} 2>/dev/null || echo 0); _v=$(grep -o "const PLUGIN_VERSION = '[^']*'" ${_sdmSq(SDM_PENDING_JS)} 2>/dev/null | head -1 | sed "s/.*'\\(.*\\)'.*/\\1/"); echo "$_s|$_c|$_v"`, 10000);
                 const [dsz, dcnt, dver] = String(vrf?.content || '0|0|').trim().split('|');
