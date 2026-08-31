@@ -1,1 +1,3116 @@
+                var matches = []
+                var m
+                timeReg.lastIndex = 0
+                while ((m = timeReg.exec(line)) !== null) {
+                    var min = parseInt(m[1]) || 0
+                    var sec = parseInt(m[2]) || 0
+                    var ms = m[3] ? parseInt(m[3]) : 0
+                    if (m[3] && m[3].length === 2) ms = parseInt(m[3]) * 10
+                    var time = min * 60 + sec + ms / 1000
+                    matches.push(time)
+                }
+                var text = line.replace(timeReg, '').trim()
+                if (matches.length === 0) continue
+                // 跳过元数据行（没有文本且有特殊标记）
+                if (!text && matches.length > 0) continue
+                for (var j = 0; j < matches.length; j++) {
+                    result.push({ time: matches[j], text: text })
+                }
+            }
+            result.sort(function(a, b) { return a.time - b.time })
+            return result
+        }
+
+        // ---- 查找当前歌词行 ----
+        var findLrcIndex = function(currentTime) {
+            if (!_lrcData.length) return -1
+            for (var i = _lrcData.length - 1; i >= 0; i--) {
+                if (currentTime >= _lrcData[i].time) return i
+            }
+            return -1
+        }
+
+        // ---- CSS 样式 ----
+        var style = document.createElement('style')
+        style.textContent = `
+        #smart_music_panel {
+            position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            width: 380px; max-width: 92vw; max-height: 85vh; overflow-y: auto;
+            z-index: 100000; border-radius: 18px; padding: 0;
+            background: linear-gradient(135deg, rgba(30,20,35,.97), rgba(45,25,50,.97), rgba(35,28,55,.97));
+            border: 1px solid rgba(255,182,193,.45);
+            box-shadow: 0 8px 40px rgba(0,0,0,.6), 0 0 0 1px rgba(255,182,193,.2), 0 0 36px rgba(255,158,205,.25), 0 0 60px rgba(167,139,250,.18);
+            display: none; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+        #smart_music_panel._show { display: block; animation: smart_music_fadein .25s ease; }
+        @keyframes smart_music_fadein { from { opacity:0; transform:translate(-50%,-48%) } to { opacity:1; transform:translate(-50%,-50%) } }
+        #smart_music_overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,.45); z-index: 99999; display: none;
+        }
+        #smart_music_overlay._show { display: block; }
+        #smart_music_lyrics_bar {
+            position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+            z-index: 100001; max-width: 80vw; text-align: center; cursor: grab;
+            display: none; user-select: none; -webkit-user-select: none;
+            touch-action: none;
+        }
+        #smart_music_lyrics_bar._dragging { cursor: grabbing; opacity: .85; }
+        #smart_music_lyrics_bar._show { display: block; animation: smart_lyric_pop .3s ease; }
+        @keyframes smart_lyric_pop { from { opacity:0; transform:translateX(-50%) translateY(8px) } to { opacity:1; transform:translateX(-50%) translateY(0) } }
+        #smart_music_lyrics_bar .lyric-current {
+            font-size: 18px; font-weight: 900; line-height: 1.5;
+            color: #fff;
+            text-shadow: 
+                0 0 2px #000,
+                0 0 4px #000,
+                0 0 8px rgba(0,0,0,.8),
+                0 2px 6px rgba(0,0,0,.9),
+                0 0 20px rgba(255,182,193,.5);
+            background: linear-gradient(135deg, rgba(0,0,0,.65), rgba(20,10,30,.7));
+            backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+            padding: 12px 32px; border-radius: 32px;
+            border: 2px solid rgba(255,182,193,.35);
+            box-shadow: 
+                0 6px 28px rgba(0,0,0,.5),
+                0 0 0 1px rgba(255,255,255,.06),
+                inset 0 1px 0 rgba(255,255,255,.1);
+            display: inline-block; max-width: 80vw; word-break: break-word;
+            letter-spacing: .3px;
+        }
+        #smart_music_lyrics_bar .lyric-next {
+            font-size: 13px; color: rgba(255,255,255,.7); margin-top: 6px;
+            text-shadow: 0 1px 4px rgba(0,0,0,.9), 0 0 6px rgba(0,0,0,.6);
+            font-weight: 500;
+        }
+        .sm-section { padding: 12px 16px; }
+        .sm-header {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 14px 16px; border-bottom: 1px solid rgba(255,182,193,.15);
+            background: linear-gradient(135deg, rgba(255,182,193,.08), rgba(167,139,250,.06));
+            border-radius: 18px 18px 0 0;
+        }
+        .sm-title { font-size: 15px; font-weight: bold; background: linear-gradient(90deg,#ff9ecd,#a78bfa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+        .sm-close { background: rgba(255,255,255,.1); border: none; color: #fff; width: 28px; height: 28px; border-radius: 50%; cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; transition: all .2s; }
+        .sm-close:hover { background: rgba(255,100,100,.3); }
+        .sm-input {
+            width: 100%; box-sizing: border-box; padding: 8px 12px; border-radius: 10px;
+            border: 1px solid rgba(255,182,193,.2); background: rgba(255,255,255,.06);
+            color: #fff; font-size: 13px; outline: none; transition: border-color .2s;
+        }
+        .sm-input:focus { border-color: rgba(255,182,193,.5); }
+        .sm-input::placeholder { color: rgba(255,255,255,.35); }
+        .sm-btn {
+            border: none; border-radius: 10px; padding: 8px 16px; font-size: 13px;
+            font-weight: bold; color: #fff; cursor: pointer; transition: all .2s;
+        }
+        .sm-btn:active { transform: scale(.95); }
+        .sm-btn-add { background: linear-gradient(135deg,#f472b6,#ec4899); }
+        .sm-btn-play { background: linear-gradient(135deg,#22c55e,#16a34a); }
+        .sm-btn-pause { background: linear-gradient(135deg,#f59e0b,#d97706); }
+        .sm-btn-prev { background: linear-gradient(135deg,#60a5fa,#3b82f6); }
+        .sm-btn-next { background: linear-gradient(135deg,#60a5fa,#3b82f6); }
+        .sm-btn-lrc { background: linear-gradient(135deg,#a78bfa,#8b5cf6); }
+        .sm-btn-scan { background: linear-gradient(135deg,#06b6d4,#0891b2); }
+        .sm-btn-del { background: rgba(239,68,68,.2); color: rgba(252,165,165,1); border: 1px solid rgba(239,68,68,.3); padding: 4px 10px; font-size: 11px; }
+        .sm-btn-del:hover { background: rgba(239,68,68,.35); }
+        .sm-playlist-item {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 8px 12px; border-radius: 10px; margin-bottom: 4px;
+            background: rgba(255,255,255,.04); border: 1px solid transparent;
+            cursor: pointer; transition: all .15s; font-size: 13px;
+        }
+        .sm-playlist-item:hover { background: rgba(255,182,193,.08); }
+        .sm-playlist-item._active { background: linear-gradient(135deg, rgba(255,182,193,.15), rgba(167,139,250,.1)); border-color: rgba(255,182,193,.3); }
+        .sm-playlist-item ._title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .sm-playlist-item ._del { flex-shrink: 0; margin-left: 8px; }
+        .sm-fav-item { display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:8px;cursor:pointer;transition:background .2s;border:1px solid transparent; }
+        .sm-fav-item:hover { background:rgba(244,114,182,.08);border-color:rgba(244,114,182,.12); }
+        .sm-fav-item._active { background:linear-gradient(135deg,rgba(244,114,182,.12),rgba(236,72,153,.08));border-color:rgba(244,114,182,.2); }
+        .sm-fav-item ._fav-title { flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.72rem;color:#e2e8f0; }
+        .sm-fav-item ._fav-pf { font-size:.6rem;padding:1px 5px;border-radius:4px;flex-shrink:0; }
+        .sm-fav-item ._fav-del { flex-shrink:0;font-size:.6rem;color:#f87171;cursor:pointer;padding:2px 6px;border-radius:4px; }
+        .sm-fav-item ._fav-del:hover { background:rgba(248,113,113,.15); }
+        .sm-fav-btn { cursor:pointer;font-size:.85rem;flex-shrink:0;padding:2px 4px;transition:transform .15s; }
+        .sm-fav-btn:hover { transform:scale(1.2); }
+        .sm-fav-btn._active { color:#f472b6; }
+        .sm-controls { display: flex; align-items: center; gap: 8px; justify-content: center; flex-wrap: wrap; }
+        .sm-seek-wrap { width: 100%; margin-top: 8px; display: flex; align-items: center; gap: 8px; }
+        .sm-seek-bar { flex: 1; height: 5px; border-radius: 3px; background: rgba(255,255,255,.15); cursor: pointer; position: relative; overflow: hidden; }
+        .sm-seek-fill { height: 100%; border-radius: 3px; background: linear-gradient(90deg,#ff9ecd,#a78bfa); width: 0%; transition: width .1s linear; }
+        .sm-time { font-size: 11px; color: rgba(255,255,255,.5); font-variant-numeric: tabular-nums; min-width: 36px; text-align: center; }
+        .sm-vol-wrap { display: flex; align-items: center; gap: 6px; width: 100%; margin-top: 6px; }
+        .sm-vol-bar { flex: 1; height: 4px; border-radius: 2px; background: rgba(255,255,255,.15); cursor: pointer; position: relative; overflow: hidden; }
+        .sm-vol-fill { height: 100%; border-radius: 2px; background: linear-gradient(90deg,#4ade80,#22c55e); width: 80%; }
+        .sm-tab-bar { display: flex; gap: 4px; margin-bottom: 10px; }
+        .sm-tab { flex: 1; text-align: center; padding: 8px; border-radius: 10px; font-size: 13px; font-weight: bold; cursor: pointer; background: rgba(255,255,255,.05); color: rgba(255,255,255,.5); border: 1px solid transparent; transition: all .2s; }
+        .sm-tab._active { background: linear-gradient(135deg, rgba(255,182,193,.15), rgba(167,139,250,.1)); color: #ff9ecd; border-color: rgba(255,182,193,.25); }
+        .sm-lrc-area { width: 100%; box-sizing: border-box; height: 120px; resize: vertical; padding: 10px; border-radius: 10px; border: 1px solid rgba(255,182,193,.2); background: rgba(255,255,255,.06); color: #fff; font-size: 12px; line-height: 1.6; outline: none; font-family: monospace; }
+        .sm-lrc-area:focus { border-color: rgba(255,182,193,.5); }
+        .sm-now-playing { text-align: center; font-size: 13px; font-weight: bold; color: #ff9ecd; margin-bottom: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .sm-empty { text-align: center; padding: 20px; color: rgba(255,255,255,.3); font-size: 13px; }
+        .sm-hint { font-size: 11px; color: rgba(255,255,255,.3); margin-top: 6px; line-height: 1.5; }
+        .sm-toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+        .sm-switch { position: relative; width: 40px; height: 22px; border-radius: 11px; background: rgba(255,255,255,.15); cursor: pointer; transition: background .25s; flex-shrink: 0; }
+        .sm-switch._on { background: linear-gradient(135deg,#ff9ecd,#a78bfa); }
+        .sm-switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: transform .25s; }
+        .sm-switch._on::after { transform: translateX(18px); }
+        .sm-switch-label { font-size: 12px; color: rgba(255,255,255,.7); }
+        .sm-search-item { display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border-radius:10px;margin-bottom:4px;background:rgba(255,255,255,.04);border:1px solid transparent;cursor:pointer;transition:all .15s; }
+        .sm-search-item:hover { background:rgba(255,100,100,.08);border-color:rgba(255,100,100,.15); }
+        .sm-search-item._loading { opacity:.4;pointer-events:none; }
+        .sm-search-info { flex:1;overflow:hidden; }
+        .sm-search-title { font-size:12px;font-weight:bold;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+        .sm-search-artist { font-size:10px;color:rgba(255,255,255,.4);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }
+        .sm-search-dur { font-size:10px;color:rgba(255,255,255,.3);flex-shrink:0;margin-left:6px; }
+        .sm-search-playing { color:#4ade80;font-size:10px;flex-shrink:0;margin-left:6px; }
+        .sm-search-loading { text-align:center;padding:16px;color:rgba(255,255,255,.3);font-size:12px; }
+        .sm-pf-btn { font-size:10px;padding:2px 10px;border-radius:8px;cursor:pointer;background:rgba(255,255,255,.05);color:rgba(255,255,255,.4);border:1px solid transparent;transition:all .2s; }
+        .sm-pf-btn._on { background:rgba(236,72,153,.15);color:#f9a8d4;border-color:rgba(236,72,153,.3); }
+        .sm-pf-btn._searching { background:rgba(99,102,241,.2);color:#a5b4fc;border-color:rgba(99,102,241,.3); }
+        .sm-search-pf-tag { font-size:9px;padding:1px 6px;border-radius:6px;margin-right:4px;font-weight:bold;display:inline-block;flex-shrink:0; }
+        .sm-search-pf-tag._netease { background:rgba(239,68,68,.15);color:#f87171; }
+        .sm-search-pf-tag._qq { background:rgba(59,130,246,.15);color:#60a5fa; }
+        .sm-search-pf-tag._kugou { background:rgba(34,197,94,.15);color:#4ade80; }
+        .sm-search-pf-tag._kuwo { background:rgba(234,179,8,.15);color:#fbbf24; }
+        .sm-search-pf-tag._migu { background:rgba(168,85,247,.15);color:#c084fc; }
+        `
+        document.head.appendChild(style)
+
+        // ---- 创建面板 HTML ----
+        var overlay = document.createElement('div')
+        overlay.id = 'smart_music_overlay'
+        document.body.appendChild(overlay)
+
+        var panel = document.createElement('div')
+        panel.id = 'smart_music_panel'
+        panel.innerHTML = `
+            <div class="sm-header">
+                <span class="sm-title">🎵 音乐播放器</span>
+                <div style="display:flex;align-items:center;">
+                    <span class="sm-minimize-btn" id="sm_minimize_btn" title="最小化为小窗">📌</span>
+                    <button class="sm-close" id="sm_close_btn">×</button>
+                </div>
+            </div>
+
+            <div class="sm-section">
+                <div class="sm-now-playing" id="sm_now_playing">未播放</div>
+                <div class="sm-controls">
+                    <button class="sm-btn sm-btn-prev" id="sm_prev_btn">⏮</button>
+                    <button class="sm-btn sm-btn-play" id="sm_play_btn" style="min-width:64px">▶ 播放</button>
+                    <button class="sm-btn sm-btn-next" id="sm_next_btn">⏭</button>
+                    <button class="sm-btn" id="sm_mode_btn" style="min-width:48px;font-size:14px;background:linear-gradient(135deg,#f59e0b,#d97706);" title="点击切换播放模式">🔁</button>
+                </div>
+                <div class="sm-seek-wrap">
+                    <span class="sm-time" id="sm_cur_time">0:00</span>
+                    <div class="sm-seek-bar" id="sm_seek_bar"><div class="sm-seek-fill" id="sm_seek_fill"></div></div>
+                    <span class="sm-time" id="sm_dur_time">0:00</span>
+                </div>
+                <div class="sm-vol-wrap">
+                    <span style="font-size:12px">🔊</span>
+                    <div class="sm-vol-bar" id="sm_vol_bar"><div class="sm-vol-fill" id="sm_vol_fill"></div></div>
+                    <span class="sm-time" id="sm_vol_pct">80%</span>
+                </div>
+                <div style="display:flex;align-items:center;justify-content:center;gap:12px;margin-top:6px;">
+                    <div style="display:flex;align-items:center;gap:6px;">
+                        <span style="font-size:.5rem;opacity:.6;">后台播放</span>
+                        <span class="sm-bg-switch" id="sm_bg_switch" title="开启后音乐在后台持续播放"></span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:6px;">
+                        <span class="sm-autoplay-label" style="font-size:.5rem;opacity:.6;">⏯ 自动续播</span>
+                        <span class="sm-bg-switch" id="sm_autoplay_switch" title="开启后打开页面自动播放上次的歌曲"></span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="sm-adb-section">
+                <div style="font-size:.6rem;font-weight:bold;margin-bottom:6px;color:#60a5fa;">📱 设备播放</div>
+                <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+                    <button class="sm-adb-btn" id="sm_adb_play_btn">▶ 推送到设备播放</button>
+                    <button class="sm-adb-btn" id="sm_adb_stop_btn" style="background:linear-gradient(135deg,#ef4444,#dc2626);">⏹ 停止设备播放</button>
+                </div>
+                <div class="sm-adb-status" id="sm_adb_status">未连接设备</div>
+            </div>
+
+            <div class="sm-adb-section" style="background:linear-gradient(135deg,rgba(167,139,250,.08),rgba(236,72,153,.04));border-color:rgba(167,139,250,.2);">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+                    <div style="font-size:.6rem;font-weight:bold;background:linear-gradient(135deg,#a78bfa,#ec4899);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;">🔮 高级后台同步</div>
+                    <span class="sm-bg-switch" id="sm_bgsync_switch" style="width:32px;height:18px;" title="开启后同步系统后台播放的音乐"></span>
+                </div>
+                <div style="display:flex;gap:6px;justify-content:center;flex-wrap:wrap;">
+                    <button class="sm-adb-btn" id="sm_bg_prev_btn" style="background:linear-gradient(135deg,#8b5cf6,#6366f1);min-width:44px;">⏮</button>
+                    <button class="sm-adb-btn" id="sm_bg_play_btn" style="background:linear-gradient(135deg,#10b981,#059669);min-width:60px;">▶ 播放</button>
+                    <button class="sm-adb-btn" id="sm_bg_next_btn" style="background:linear-gradient(135deg,#8b5cf6,#6366f1);min-width:44px;">⏭</button>
+                </div>
+                <div class="sm-adb-status" id="sm_bgsync_status">未开启同步</div>
+            </div>
+
+            <div class="sm-section" style="border-top:1px solid rgba(255,182,193,.1)">
+                <div class="sm-tab-bar">
+                    <div class="sm-tab _active" id="sm_tab_playlist">📋 播放列表</div>
+                    <div class="sm-tab" id="sm_tab_favorites">❤️ 收藏</div>
+                    <div class="sm-tab" id="sm_tab_lyrics">🎤 歌词</div>
+                </div>
+
+                <div id="sm_playlist_tab">
+                    <div style="display:flex;gap:6px;margin-bottom:8px;">
+                        <input type="text" class="sm-input" id="sm_search_input" placeholder="搜索歌曲/歌手（多平台聚合）..." style="flex:1" />
+                        <button class="sm-btn sm-btn-search" id="sm_search_btn" style="background:linear-gradient(135deg,#ec4899,#8b5cf6)">🔍 Listen1搜索</button>
+                    </div>
+                    <div style="display:flex;gap:4px;margin-bottom:6px;flex-wrap:wrap;" id="sm_platform_filter">
+                        <span style="font-size:10px;color:rgba(255,255,255,.4);padding:2px 6px;">平台:</span>
+                        <span class="sm-pf-btn _on" data-pf="netease">网易云</span>
+                        <span class="sm-pf-btn _on" data-pf="qq">QQ音乐</span>
+                        <span class="sm-pf-btn _on" data-pf="kugou">酷狗</span>
+                        <span class="sm-pf-btn _on" data-pf="kuwo">酷我</span>
+                        <span class="sm-pf-btn _on" data-pf="migu">咪咕</span>
+                    </div>
+                    <div id="sm_search_results" style="max-height:260px;overflow-y:auto;margin-bottom:10px;display:none"></div>
+                    <div style="display:flex;gap:6px;margin-bottom:8px;border-top:1px dashed rgba(255,182,193,.12);padding-top:8px;">
+                        <input type="text" class="sm-input" id="sm_url_input" placeholder="或粘贴音频直链 URL" style="flex:1" />
+                        <input type="text" class="sm-input" id="sm_title_input" placeholder="歌名" style="width:90px" />
+                    </div>
+                    <div style="display:flex;gap:6px;margin-bottom:10px;">
+                        <button class="sm-btn sm-btn-add" id="sm_add_btn" style="flex:1">➕ 添加</button>
+                        <button class="sm-btn sm-btn-scan" id="sm_scan_btn">📱 扫描本地</button>
+                    </div>
+                    <div id="sm_playlist_container" style="max-height:200px;overflow-y:auto"></div>
+                </div>
+
+                <div id="sm_favorites_tab" style="display:none">
+                    <div id="sm_favorites_container" style="max-height:350px;overflow-y:auto"></div>
+                </div>
+
+                <div id="sm_lyrics_tab" style="display:none">
+                    <div style="display:flex;gap:6px;margin-bottom:8px;">
+                        <input type="text" class="sm-input" id="sm_lrc_url_input" placeholder="粘贴 LRC 歌词直链 URL（可选）" style="flex:1" />
+                        <button class="sm-btn sm-btn-scan" id="sm_fetch_lrc_btn">获取</button>
+                    </div>
+                    <textarea class="sm-lrc-area" id="sm_lrc_textarea" placeholder="粘贴 LRC 歌词到这里，格式：&#10;[00:12.34]这是第一句歌词&#10;[00:18.56]这是第二句歌词&#10;&#10;或粘贴纯文本歌词，将逐行滚动显示"></textarea>
+                    <div style="display:flex;gap:6px;margin-top:8px;">
+                        <button class="sm-btn sm-btn-lrc" id="sm_apply_lrc_btn" style="flex:1">✅ 应用歌词</button>
+                        <button class="sm-btn sm-btn-lrc" id="sm_save_lrc_btn" style="background:linear-gradient(135deg,#06b6d4,#0891b2)">💾 存到歌曲</button>
+                    </div>
+                    <div class="sm-toggle-row" style="margin-top:10px">
+                        <span class="sm-switch-label">歌词悬浮条（屏幕底部居中）</span>
+                        <div class="sm-switch _on" id="sm_lyrics_toggle"></div>
+                    </div>
+                    <div class="sm-hint">开启后，播放时歌词会以悬浮条形式显示在屏幕底部居中位置，支持时间同步滚动</div>
+                </div>
+            </div>
+        `
+        document.body.appendChild(panel)
+
+        // ---- 歌词悬浮条 ----
+        var lyricsBar = document.createElement('div')
+        lyricsBar.id = 'smart_music_lyrics_bar'
+        lyricsBar.innerHTML = '<div class="lyric-current" id="sm_lyric_cur">🎵</div><div class="lyric-next" id="sm_lyric_next"></div>'
+        document.body.appendChild(lyricsBar)
+
+        // ---- audio 元素 ----
+        _audio = new Audio()
+        _audio.volume = 0.8
+
+        // ---- 后台持续播放支持 ----
+        var _requestWakeLock = async function() {
+            try {
+                if ('wakeLock' in navigator) {
+                    _wakeLock = await navigator.wakeLock.request('screen')
+                }
+            } catch(e) {}
+        }
+        var _releaseWakeLock = async function() {
+            if (_wakeLock) {
+                try { await _wakeLock.release() } catch(e) {}
+                _wakeLock = null
+            }
+        }
+        // 页面可见性变化时重新获取 WakeLock + 保存播放进度
+        document.addEventListener('visibilitychange', async function() {
+            if (document.visibilityState === 'hidden') {
+                _savePlayProgress()
+            }
+            if (_bgPlayEnabled && document.visibilityState === 'visible' && _isPlaying) {
+                await _requestWakeLock()
+            }
+        })
+        // 页面关闭前保存进度
+        window.addEventListener('beforeunload', function() {
+            _savePlayProgress()
+        })
+        // 后台保活：定时器保持主线程活跃，确保音频不中断
+        var _startBgKeepAlive = function() {
+            if (_bgKeepAliveTimer) return
+            _bgKeepAliveTimer = setInterval(function() {
+                // 空操作定时器，保持主线程唤醒
+                if (!_isPlaying) {
+                    _stopBgKeepAlive()
+                }
+            }, 1000)
+        }
+        var _stopBgKeepAlive = function() {
+            if (_bgKeepAliveTimer) { clearInterval(_bgKeepAliveTimer); _bgKeepAliveTimer = null }
+        }
+
+        // ---- MediaSession API 支持（锁屏/通知栏控制） ----
+        var _updateMediaSession = function() {
+            if (!('mediaSession' in navigator) || _currentIndex < 0) return
+            var song = _playlist[_currentIndex]
+            if (!song) return
+            var titleParts = (song.title || '未知歌曲').split(' - ')
+            var artist = titleParts.length > 1 ? titleParts[0] : ''
+            var title = titleParts.length > 1 ? titleParts.slice(1).join(' - ') : song.title
+            try {
+                navigator.mediaSession.metadata = new MediaMetadata({
+                    title: title || '未知歌曲',
+                    artist: artist || '未知歌手',
+                    album: song.album || '',
+                })
+            } catch(e) {}
+        }
+        if ('mediaSession' in navigator) {
+            try {
+                navigator.mediaSession.setActionHandler('play', function() { play() })
+                navigator.mediaSession.setActionHandler('pause', function() { pause() })
+                navigator.mediaSession.setActionHandler('previoustrack', function() { playPrev() })
+                navigator.mediaSession.setActionHandler('nexttrack', function() { playNext() })
+            } catch(e) {}
+        }
+
+        // ---- 后台播放开关 ----
+        var _updateBgSwitch = function() {
+            var sw = document.getElementById('sm_bg_switch')
+            if (!sw) return
+            if (_bgPlayEnabled) sw.classList.add('_on')
+            else sw.classList.remove('_on')
+        }
+        var _toggleBgPlay = function() {
+            _bgPlayEnabled = !_bgPlayEnabled
+            try { localStorage.setItem('smart_music_bgplay', _bgPlayEnabled ? '1' : '0') } catch(e) {}
+            _updateBgSwitch()
+            if (_bgPlayEnabled) {
+                _requestWakeLock()
+                if (_isPlaying) _startBgKeepAlive()
+                showToast('后台播放已开启', 'green', 2000)
+            } else {
+                _releaseWakeLock()
+                _stopBgKeepAlive()
+                showToast('后台播放已关闭', 'pink', 2000)
+            }
+        }
+
+        // ---- ADB 设备播放 ----
+        var _shellCurl2 = (typeof shellCurl !== 'undefined') ? shellCurl : null
+        var _runShell = (typeof runShellWithRoot !== 'undefined') ? runShellWithRoot : null
+        var _adbPlaying = false
+
+        var _checkAdbAvailable = async function() {
+            if (!_runShell) return false
+            try {
+                var res = await _runShell('pidof adbd')
+                if (res && res.content && res.content.trim()) return true
+                // 尝试网络ADB
+                var res2 = await _runShell('getprop service.adb.tcp.port')
+                if (res2 && res2.content && res2.content.trim() !== '0' && res2.content.trim() !== '') return true
+                // 检查 adb 二进制
+                var res3 = await _runShell('ls /data/data/com.minikano.f50_sms/files/adb 2>/dev/null')
+                if (res3 && res3.content && res3.content.includes('adb')) return true
+                return true  // 有root权限默认认为可用
+            } catch(e) {
+                return true
+            }
+        }
+
+        var _updateAdbStatus = function(text, isPlaying) {
+            var el = document.getElementById('sm_adb_status')
+            var btn = document.getElementById('sm_adb_play_btn')
+            if (el) el.textContent = text
+            if (btn) {
+                if (isPlaying) {
+                    btn.classList.add('_playing')
+                    btn.textContent = '▶ 设备播放中'
+                } else {
+                    btn.classList.remove('_playing')
+                    btn.textContent = '▶ 推送到设备播放'
+                }
+            }
+            _adbPlaying = isPlaying
+        }
+
+        var playOnDevice = async function() {
+            if (_adbPlaying) {
+                showToast('设备正在播放中，先停止当前播放', 'pink', 2000)
+                return
+            }
+            if (_currentIndex < 0 || !_playlist[_currentIndex]) {
+                showToast('请先在播放列表中选择一首歌曲', 'pink', 2000)
+                return
+            }
+            var song = _playlist[_currentIndex]
+            if (!song.url) {
+                showToast('当前歌曲没有可用的播放地址', 'red', 3000)
+                return
+            }
+            if (!_runShell) {
+                showToast('没有 Root/Shell 权限，无法推送到设备', 'red', 3000)
+                return
+            }
+            _updateAdbStatus('正在推送到设备...', false)
+            showToast('正在推送: ' + (song.title || '未知歌曲') + ' 到设备...', 'pink', 3000)
+            try {
+                // 方法1: 用 am start 直接在设备上播放音频URL
+                var audioUrl = song.url.replace(/'/g, '')
+                var cmd1 = "am start -a android.intent.action.VIEW -d '" + audioUrl + "' -t audio/*"
+                var res = await _runShell(cmd1, 15000)
+                if (res && res.success) {
+                    _updateAdbStatus('已在设备上播放: ' + (song.title || '未知歌曲'), true)
+                    showToast('已在设备上播放！', 'green', 3000)
+                    return
+                }
+                // 方法2: 用媒体控制器
+                var cmd2 = "am start -n com.android.music/.MediaPlaybackActivity -d '" + audioUrl + "' -t audio/*"
+                var res2 = await _runShell(cmd2, 15000)
+                if (res2 && res2.success) {
+                    _updateAdbStatus('已在设备上播放: ' + (song.title || '未知歌曲'), true)
+                    showToast('已在设备上播放！', 'green', 3000)
+                    return
+                }
+                // 方法3: 用 noice/app
+                var cmd3 = "am start -a android.intent.action.MUSIC_PLAYER"
+                var res3 = await _runShell(cmd3, 10000)
+                _updateAdbStatus('已尝试打开设备音乐播放器', true)
+                showToast('已尝试打开设备音乐播放器，请手动播放', 'pink', 3000)
+            } catch(e) {
+                _updateAdbStatus('推送失败: ' + (e.message || '未知错误'), false)
+                showToast('推送到设备失败: ' + (e.message || ''), 'red', 4000)
+            }
+        }
+
+        var stopDevicePlay = async function() {
+            if (!_runShell) {
+                showToast('没有 Root/Shell 权限', 'red', 2000)
+                return
+            }
+            try {
+                // 停止设备上的媒体播放
+                await _runShell('am broadcast -a com.android.music.musicservicecommand.pause', 10000)
+                // 备用：用 media session 命令
+                await _runShell('cmd media_session dispatch pause', 10000)
+                _updateAdbStatus('已停止设备播放', false)
+                showToast('已停止设备播放', 'pink', 2000)
+            } catch(e) {
+                showToast('停止设备播放失败', 'red', 2000)
+            }
+        }
+
+        // ---- 小窗模式 ----
+        var _isMiniMode = false
+        var _miniPos = { x: 0, y: 0 }
+        var _miniDrag = { dragging: false, startX: 0, startY: 0, origX: 0, origY: 0 }
+
+        var toggleMiniMode = function() {
+            if (!_isMiniMode) {
+                // 进入小窗模式
+                _isMiniMode = true
+                panel.classList.add('_mini')
+                overlay.classList.remove('_show')
+                // 恢复保存的位置
+                try {
+                    var saved = localStorage.getItem('smart_music_mini_pos')
+                    if (saved) {
+                        var pos = JSON.parse(saved)
+                        panel.style.left = pos.x + 'px'
+                        panel.style.top = pos.y + 'px'
+                        panel.style.right = 'auto'
+                    }
+                } catch(e) {}
+                showToast('已切换为小窗模式，可拖动 · 点击恢复', 'pink', 2500)
+            } else {
+                // 退出小窗模式，恢复正常
+                _isMiniMode = false
+                panel.classList.remove('_mini')
+                panel.style.left = ''
+                panel.style.top = ''
+                panel.style.right = ''
+                overlay.classList.add('_show')
+            }
+        }
+
+        // 小窗拖动
+        var _onMiniDragStart = function(e) {
+            if (!_isMiniMode) return
+            var touch = e.touches ? e.touches[0] : e
+            _miniDrag.dragging = true
+            _miniDrag.startX = touch.clientX
+            _miniDrag.startY = touch.clientY
+            var rect = panel.getBoundingClientRect()
+            _miniDrag.origX = rect.left
+            _miniDrag.origY = rect.top
+            e.preventDefault()
+        }
+        var _onMiniDragMove = function(e) {
+            if (!_miniDrag.dragging) return
+            var touch = e.touches ? e.touches[0] : e
+            var dx = touch.clientX - _miniDrag.startX
+            var dy = touch.clientY - _miniDrag.startY
+            var newX = Math.max(0, Math.min(window.innerWidth - panel.offsetWidth, _miniDrag.origX + dx))
+            var newY = Math.max(0, Math.min(window.innerHeight - panel.offsetHeight, _miniDrag.origY + dy))
+            panel.style.left = newX + 'px'
+            panel.style.top = newY + 'px'
+            panel.style.right = 'auto'
+            e.preventDefault()
+        }
+        var _onMiniDragEnd = function(e) {
+            if (!_miniDrag.dragging) return
+            _miniDrag.dragging = false
+            // 计算移动距离
+            var touch = e && e.changedTouches ? e.changedTouches[0] : (e || { clientX: _miniDrag.startX, clientY: _miniDrag.startY })
+            var dx = Math.abs((touch.clientX || 0) - _miniDrag.startX)
+            var dy = Math.abs((touch.clientY || 0) - _miniDrag.startY)
+            
+            // 保存位置
+            try {
+                var rect = panel.getBoundingClientRect()
+                localStorage.setItem('smart_music_mini_pos', JSON.stringify({ x: rect.left, y: rect.top }))
+            } catch(e) {}
+            
+            // 如果移动距离很小（小于5像素），认为是点击，恢复成大窗口
+            // 但要排除点击了按钮/开关的情况
+            if (dx < 5 && dy < 5 && e && e.target) {
+                var target = e.target
+                // 如果点的是按钮、开关、进度条等控件，不恢复
+                var isControl = target.closest('button') || 
+                               target.closest('.sm-bg-switch') ||
+                               target.closest('.sm-seek-bar') ||
+                               target.closest('.sm-vol-bar') ||
+                               target.closest('.sm-minimize-btn') ||
+                               target.closest('input') ||
+                               target.closest('select') ||
+                               target.closest('.sm-tab')
+                if (!isControl && _isMiniMode) {
+                    toggleMiniMode()
+                }
+            }
+        }
+
+        // ---- 高级后台音乐同步 ----
+        var _bgSyncEnabled = false
+        var _bgSyncTimer = null
+        var _lastBgTrack = ''
+        var _isSyncingFromBg = false  // 防止双向同步死循环
+
+        var _getBgMusicInfo = async function() {
+            if (!_runShell) return null
+            try {
+                // 通过 dumpsys 获取当前媒体播放信息
+                var cmd = 'dumpsys media_session 2>/dev/null | grep -A 30 "ACTIVE" | head -40'
+                var res = await _runShell(cmd, 8000)
+                if (!res || !res.content) return null
+                var text = res.content
+
+                // 提取歌曲信息
+                var title = ''
+                var artist = ''
+                var state = ''
+
+                // 匹配 state
+                var stateMatch = text.match(/state=(\w+)/i)
+                if (stateMatch) state = stateMatch[1].toLowerCase()
+
+                // 匹配 metadata
+                var titleMatch = text.match(/title=([^\n]+)/i)
+                if (titleMatch) title = titleMatch[1].trim()
+
+                var artistMatch = text.match(/artist=([^\n]+)/i)
+                if (artistMatch) artist = artistMatch[1].trim()
+
+                // 如果没找到，尝试从 notification 中获取
+                if (!title) {
+                    var cmd2 = 'dumpsys notification --noredact 2>/dev/null | grep -B 2 -A 2 "media.session\|MediaStyle\|android.media.session.MediaSession" | head -30'
+                    var res2 = await _runShell(cmd2, 8000)
+                    if (res2 && res2.content) {
+                        var tMatch = res2.content.match(/android\.title=([^\n]+)/i)
+                        if (tMatch) title = tMatch[1].trim()
+                        var aMatch = res2.content.match(/android\.text=([^\n]+)/i)
+                        if (aMatch) artist = aMatch[1].trim()
+                    }
+                }
+
+                if (!title && !artist) return null
+
+                return {
+                    title: title,
+                    artist: artist,
+                    isPlaying: state === 'playing' || state === 'active'
+                }
+            } catch(e) {
+                return null
+            }
+        }
+
+        var _startBgSync = function() {
+            if (_bgSyncTimer) return
+            _bgSyncEnabled = true
+            try { localStorage.setItem('smart_music_bgsync', '1') } catch(e) {}
+            _bgSyncTimer = setInterval(async function() {
+                if (_isSyncingFromBg) return
+                var info = await _getBgMusicInfo()
+                if (info && info.title) {
+                    var trackKey = info.artist + ' - ' + info.title
+                    if (trackKey !== _lastBgTrack) {
+                        _lastBgTrack = trackKey
+                        _isSyncingFromBg = true
+                        // 更新显示
+                        var nowPlayingEl = document.getElementById('sm_now_playing')
+                        if (nowPlayingEl) {
+                            nowPlayingEl.textContent = (info.artist ? info.artist + ' - ' : '') + info.title + ' 📱'
+                        }
+                        // 更新后台同步状态显示
+                        var syncStatusEl = document.getElementById('sm_bgsync_status')
+                        if (syncStatusEl) {
+                            syncStatusEl.textContent = '🎵 ' + (info.title || '未知歌曲')
+                        }
+                        // 更新 MediaSession
+                        _updateMediaSession()
+                        _isSyncingFromBg = false
+                    }
+                    // 同步播放状态
+                    if (info.isPlaying !== _isPlaying && !_isSyncingFromBg) {
+                        _isPlaying = info.isPlaying
+                        updatePlayBtn()
+                        if (info.isPlaying) {
+                            startProgressTimer()
+                        } else {
+                            stopProgressTimer()
+                        }
+                    }
+                }
+            }, 2000)
+             showToast('高级后台同步已开启', 'green', 2000)
+             var statusEl = document.getElementById('sm_bgsync_status')
+             if (statusEl) statusEl.textContent = '同步中...'
+         }
+
+        var _stopBgSync = function() {
+            _bgSyncEnabled = false
+            try { localStorage.setItem('smart_music_bgsync', '0') } catch(e) {}
+            if (_bgSyncTimer) { clearInterval(_bgSyncTimer); _bgSyncTimer = null }
+            _lastBgTrack = ''
+            showToast('高级后台同步已关闭', 'pink', 2000)
+            var statusEl = document.getElementById('sm_bgsync_status')
+            if (statusEl) statusEl.textContent = '未开启同步'
+        }
+
+        var _toggleBgSync = function() {
+            if (_bgSyncEnabled) {
+                _stopBgSync()
+            } else {
+                if (!_runShell) {
+                    showToast('需要 Root/Shell 权限才能使用后台同步', 'red', 3000)
+                    return
+                }
+                _startBgSync()
+            }
+            _updateBgSyncSwitch()
+        }
+
+        var _updateBgSyncSwitch = function() {
+            var sw = document.getElementById('sm_bgsync_switch')
+            if (!sw) return
+            if (_bgSyncEnabled) sw.classList.add('_on')
+            else sw.classList.remove('_on')
+        }
+
+        // 后台音乐控制（上一曲/播放暂停/下一曲）
+        var bgMusicPrev = async function() {
+            if (!_runShell) { showToast('需要 Root/Shell 权限', 'red', 2000); return }
+            try {
+                await _runShell('cmd media_session dispatch previous', 5000)
+                showToast('上一曲', 'pink', 1500)
+            } catch(e) {
+                showToast('控制失败', 'red', 2000)
+            }
+        }
+
+        var bgMusicPlayPause = async function() {
+            if (!_runShell) { showToast('需要 Root/Shell 权限', 'red', 2000); return }
+            try {
+                var info = await _getBgMusicInfo()
+                if (info && info.isPlaying) {
+                    await _runShell('cmd media_session dispatch pause', 5000)
+                    _isPlaying = false
+                    showToast('暂停', 'pink', 1500)
+                } else {
+                    await _runShell('cmd media_session dispatch play', 5000)
+                    _isPlaying = true
+                    showToast('播放', 'pink', 1500)
+                }
+                updatePlayBtn()
+            } catch(e) {
+                showToast('控制失败', 'red', 2000)
+            }
+        }
+
+        var bgMusicNext = async function() {
+            if (!_runShell) { showToast('需要 Root/Shell 权限', 'red', 2000); return }
+            try {
+                await _runShell('cmd media_session dispatch next', 5000)
+                showToast('下一曲', 'pink', 1500)
+            } catch(e) {
+                showToast('控制失败', 'red', 2000)
+            }
+        }
+
+        // ---- 辅助 ----
+        var fmtTime = function(sec) {
+            if (!sec || isNaN(sec) || sec < 0) return '0:00'
+            var m = Math.floor(sec / 60)
+            var s = Math.floor(sec % 60)
+            return m + ':' + (s < 10 ? '0' : '') + s
+        }
+
+        var showToast = function(msg, color, dur) {
+            try { if (typeof createToast === 'function') createToast(msg, color || 'pink', dur || 2500) } catch(e) {}
+        }
+
+        // ---- 渲染播放列表 ----
+        var renderPlaylist = function() {
+            var container = document.getElementById('sm_playlist_container')
+            if (!container) return
+            if (!_playlist.length) {
+                container.innerHTML = '<div class="sm-empty">播放列表为空，添加音频 URL 或扫描本地音乐</div>'
+                return
+            }
+            var html = ''
+            for (var i = 0; i < _playlist.length; i++) {
+                var item = _playlist[i]
+                var isActive = i === _currentIndex
+                var hasLrc = item.lrc ? ' 🎤' : ''
+                var isFav = item.pfId ? isFavorited(item.pfId) : false
+                var favBtn = item.pfId ? '<span class="sm-fav-btn' + (isFav ? ' _active' : '') + '" data-pl-fav="' + i + '">' + (isFav ? '❤️' : '🤍') + '</span>' : ''
+                html += '<div class="sm-playlist-item' + (isActive ? ' _active' : '') + '" data-idx="' + i + '">'
+                    + '<span class="_title">' + (item.title || ('歌曲' + (i+1))) + hasLrc + '</span>'
+                    + favBtn
+                    + '<button class="sm-btn sm-btn-del _del" data-del="' + i + '">删除</button>'
+                    + '</div>'
+            }
+            container.innerHTML = html
+        }
+
+        // ---- 加载歌曲 ----
+        var loadSong = function(idx) {
+            if (idx < 0 || idx >= _playlist.length) return
+            _currentIndex = idx
+            _retryCount = 0
+            var song = _playlist[idx]
+            _audio.src = song.url
+            _audio.load()
+            _updateMediaSession()
+
+            // 更新标题
+            var np = document.getElementById('sm_now_playing')
+            if (np) np.textContent = song.title || ('歌曲' + (idx + 1))
+
+            // 解析歌词
+            _lrcData = parseLRC(song.lrc || '')
+            _lrcLineIndex = -1
+
+            // 更新歌词输入框
+            var ta = document.getElementById('sm_lrc_textarea')
+            if (ta) ta.value = song.lrc || ''
+
+            renderPlaylist()
+            updateLyricsBar()
+        }
+
+        // ---- 播放/暂停 ----
+        var play = function() {
+            if (_currentIndex < 0 && _playlist.length > 0) loadSong(0)
+            if (_currentIndex < 0) { showToast('请先添加歌曲', 'red'); return }
+            _audio.play().then(function() {
+                _isPlaying = true
+                updatePlayBtn()
+                startProgressTimer()
+                _updateMediaSession()
+                if (_bgPlayEnabled) {
+                    _requestWakeLock()
+                    _startBgKeepAlive()
+                }
+                if ('mediaSession' in navigator) {
+                    navigator.mediaSession.playbackState = 'playing'
+                }
+            }).catch(function(e) {
+                showToast('播放失败: ' + (e.message || '浏览器限制'), 'red', 4000)
+            })
+        }
+
+        var pause = function() {
+            _audio.pause()
+            _isPlaying = false
+            updatePlayBtn()
+            stopProgressTimer()
+            _stopBgKeepAlive()
+            _savePlayProgress()  // 保存播放进度
+            if ('mediaSession' in navigator) {
+                navigator.mediaSession.playbackState = 'paused'
+            }
+        }
+
+        // 保存播放进度到 localStorage
+        var _savePlayProgress = function() {
+            try {
+                if (_currentIndex >= 0 && _audio && _audio.currentTime >= 0) {
+                    localStorage.setItem('smart_music_progress', JSON.stringify({
+                        idx: _currentIndex,
+                        time: _audio.currentTime || 0
+                    }))
+                }
+            } catch(e) {}
+        }
+
+        // 恢复播放进度并自动播放
+        var _tryAutoResume = function() {
+            if (!_autoPlayEnabled || _playlist.length === 0) return
+            try {
+                var saved = localStorage.getItem('smart_music_progress')
+                if (saved) {
+                    var data = JSON.parse(saved)
+                    var idx = data.idx || 0
+                    var time = data.time || 0
+                    if (idx >= 0 && idx < _playlist.length) {
+                        loadSong(idx)
+                        // 等 canplay 再 play + seek
+                        var onCanPlay = function() {
+                            _audio.removeEventListener('canplay', onCanPlay)
+                            if (time > 0) _audio.currentTime = time
+                            _audio.play().then(function() {
+                                _isPlaying = true
+                                updatePlayBtn()
+                                startProgressTimer()
+                                if (_bgPlayEnabled) {
+                                    _requestWakeLock()
+                                    _startBgKeepAlive()
+                                }
+                                if ('mediaSession' in navigator) {
+                                    navigator.mediaSession.playbackState = 'playing'
+                                }
+                                showToast('⏯ 自动续播已恢复', 'green', 1500)
+                            }).catch(function(e) {
+                                // 自动播放被浏览器阻止了，等用户交互再播
+                                console.log('auto play blocked:', e.message)
+                                // 先加载好歌曲，用户点播放按钮就能续播
+                                _isPlaying = false
+                                updatePlayBtn()
+                                if (time > 0) _audio.currentTime = time
+                                // 提示用户
+                                showToast('⏯ 自动续播已就绪，点播放开始', 'yellow', 3000)
+                                // 监听第一次用户交互后自动播放
+                                var autoPlayOnInteract = function() {
+                                    if (_autoPlayEnabled && !_isPlaying && _audio.src) {
+                                        _audio.play().then(function() {
+                                            _isPlaying = true
+                                            updatePlayBtn()
+                                            startProgressTimer()
+                                            if ('mediaSession' in navigator) {
+                                                navigator.mediaSession.playbackState = 'playing'
+                                            }
+                                        }).catch(function(){})
+                                    }
+                                    document.removeEventListener('click', autoPlayOnInteract)
+                                    document.removeEventListener('touchstart', autoPlayOnInteract)
+                                }
+                                setTimeout(function() {
+                                    document.addEventListener('click', autoPlayOnInteract, { once: true })
+                                    document.addEventListener('touchstart', autoPlayOnInteract, { once: true })
+                                }, 500)
+                            })
+                        }
+                        _audio.addEventListener('canplay', onCanPlay)
+                    }
+                }
+            } catch(e) {}
+        }
+
+        var togglePlay = function() {
+            if (_isPlaying) pause(); else play()
+        }
+
+        var updatePlayBtn = function() {
+            var btn = document.getElementById('sm_play_btn')
+            if (!btn) return
+            if (_isPlaying) {
+                btn.textContent = '⏸ 暂停'
+                btn.className = 'sm-btn sm-btn-pause'
+            } else {
+                btn.textContent = '▶ 播放'
+                btn.className = 'sm-btn sm-btn-play'
+            }
+        }
+
+        // ---- 进度条 ----
+        var startProgressTimer = function() {
+            stopProgressTimer()
+            _progressTimer = setInterval(updateProgress, 300)
+        }
+
+        var stopProgressTimer = function() {
+            if (_progressTimer) { clearInterval(_progressTimer); _progressTimer = null }
+        }
+
+        var _lastSaveTime = 0
+        var updateProgress = function() {
+            var cur = _audio.currentTime || 0
+            var dur = _audio.duration || 0
+            var pct = dur > 0 ? (cur / dur * 100) : 0
+            var fill = document.getElementById('sm_seek_fill')
+            if (fill) fill.style.width = pct + '%'
+            var ct = document.getElementById('sm_cur_time')
+            if (ct) ct.textContent = fmtTime(cur)
+            var dt = document.getElementById('sm_dur_time')
+            if (dt) dt.textContent = fmtTime(dur)
+
+            // 更新歌词
+            updateLyricsByTime(cur)
+
+            // 每30秒自动保存一次进度
+            if (_isPlaying && cur - _lastSaveTime > 30) {
+                _lastSaveTime = cur
+                _savePlayProgress()
+            }
+        }
+
+        // ---- 歌词同步 ----
+        var updateLyricsByTime = function(time) {
+            if (!_lrcData.length) return
+            var newIdx = findLrcIndex(time)
+            if (newIdx !== _lrcLineIndex) {
+                _lrcLineIndex = newIdx
+                updateLyricsBar()
+            }
+        }
+
+        var updateLyricsBar = function() {
+            var curEl = document.getElementById('sm_lyric_cur')
+            var nextEl = document.getElementById('sm_lyric_next')
+            if (!curEl) return
+
+            if (!_lrcData.length || _lrcLineIndex < 0) {
+                var np = document.getElementById('sm_now_playing')
+                curEl.textContent = np ? ('🎵 ' + np.textContent) : '🎵'
+                if (nextEl) nextEl.textContent = ''
+                return
+            }
+            curEl.textContent = _lrcData[_lrcLineIndex].text || '🎵'
+            if (nextEl && _lrcLineIndex + 1 < _lrcData.length) {
+                nextEl.textContent = _lrcData[_lrcLineIndex + 1].text || ''
+            } else {
+                if (nextEl) nextEl.textContent = ''
+            }
+        }
+
+        // ---- 切歌 ----
+        var playNext = function() {
+            if (!_playlist.length) return
+            var next = (_currentIndex + 1) % _playlist.length
+            loadSong(next)
+            play()
+        }
+
+        var playPrev = function() {
+            if (!_playlist.length) return
+            var prev = (_currentIndex - 1 + _playlist.length) % _playlist.length
+            loadSong(prev)
+            play()
+        }
+
+        // ---- Listen 1 多源音乐搜索（网易云 / QQ音乐 / 酷狗） ----
+        var _searchResults = []
+        var _searching = false
+        var _activePlatforms = { netease: true, qq: true, kugou: true, kuwo: true, migu: true }
+        var _searchStatus = { netease: 'idle', qq: 'idle', kugou: 'idle', kuwo: 'idle', migu: 'idle' }
+
+        var searchAll = async function() {
+            if (_searching) return
+            var input = document.getElementById('sm_search_input')
+            var keyword = (input && input.value || '').trim()
+            if (!keyword) { showToast('请输入歌曲名或歌手', 'red'); return }
+
+            _searching = true
+            _searchResults = []
+            showSearchLoading('🔍 聚合音源多平台搜索中...')
+            _searchStatus = { netease: 'idle', qq: 'idle', kugou: 'idle', kuwo: 'idle', migu: 'idle' }
+
+            var tasks = []
+            if (_activePlatforms.netease) {
+                _searchStatus.netease = 'searching'
+                tasks.push(searchNetease(keyword))
+            }
+            if (_activePlatforms.qq) {
+                _searchStatus.qq = 'searching'
+                tasks.push(searchQQ(keyword))
+            }
+            if (_activePlatforms.kugou) {
+                _searchStatus.kugou = 'searching'
+                tasks.push(searchKugou(keyword))
+            }
+            if (_activePlatforms.kuwo) {
+                _searchStatus.kuwo = 'searching'
+                tasks.push(searchKuwo(keyword))
+            }
+            if (_activePlatforms.migu) {
+                _searchStatus.migu = 'searching'
+                tasks.push(searchMigu(keyword))
+            }
+
+            // 并行搜索，结果陆续展示
+            Promise.all(tasks.map(function(p) {
+                return p.catch(function(e) { return [] })
+            })).then(function(results) {
+                _searching = false
+                updatePlatformButtons()
+                if (_searchResults.length === 0) {
+                    showSearchEmpty()
+                    showToast('未找到相关歌曲，试试其他平台', 'pink', 2500)
+                } else {
+                    renderSearchResults()
+                    showToast('找到 ' + _searchResults.length + ' 首歌曲', 'green', 2000)
+                }
+            })
+        }
+
+        var updatePlatformButtons = function() {
+            var btns = document.querySelectorAll('#sm_platform_filter .sm-pf-btn')
+            btns.forEach(function(btn) {
+                var pf = btn.getAttribute('data-pf')
+                if (_searchStatus[pf] === 'searching') btn.classList.add('_searching')
+                else btn.classList.remove('_searching')
+            })
+        }
+
+        var shellCurl = async function(url, extraHeaders) {
+            var _rs = typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : null
+            if (!_rs) return null
+            var hdr = extraHeaders || ''
+            var cmd = "curl -s --max-time 10 '" + url + "' " + hdr + " 2>/dev/null"
+            var res = await _rs(cmd)
+            var text = (res && res.content || '').trim()
+            var jsonStart = text.indexOf('{')
+            if (jsonStart > 0) text = text.substring(jsonStart)
+            return text
+        }
+
+        // 网易云搜索
+        var searchNetease = async function(keyword) {
+            try {
+                var text = await shellCurl(
+                    'https://music.163.com/api/search/get?s=' + encodeURIComponent(keyword) + '&type=1&offset=0&limit=15',
+                    "-H 'Referer: https://music.163.com' -H 'User-Agent: Mozilla/5.0 (Linux; Android 10)'"
+                )
+                if (!text) throw new Error('无返回')
+                var data = JSON.parse(text)
+                if (data && data.result && data.result.songs) {
+                    var list = data.result.songs.map(function(s) {
+                        return {
+                            id: 'wy_' + s.id,
+                            platform: 'netease',
+                            pfName: '网易云',
+                            songId: s.id,
+                            name: s.name,
+                            artists: (s.artists || []).map(function(a) { return a.name }),
+                            album: s.album ? s.album.name : '',
+                            duration: s.duration || 0
+                        }
+                    })
+                    _searchResults = _searchResults.concat(list)
+                    renderSearchResults()
+                    _searchStatus.netease = 'done'
+                    updatePlatformButtons()
+                    return list
+                }
+                _searchStatus.netease = 'failed'
+                return []
+            } catch(e) {
+                _searchStatus.netease = 'failed'
+                updatePlatformButtons()
+                return []
+            }
+        }
+
+        // QQ音乐搜索
+        var searchQQ = async function(keyword) {
+            try {
+                var text = await shellCurl(
+                    'https://c.y.qq.com/soso/fcgi-bin/client_search_cp?w=' + encodeURIComponent(keyword) + '&n=15&p=1&format=json',
+                    "-H 'Referer: https://y.qq.com' -H 'User-Agent: Mozilla/5.0 (Linux; Android 10)'"
+                )
+                if (!text) throw new Error('无返回')
+                // QQ可能返回callback包裹，去掉
+                if (text.indexOf('callback') >= 0 || text.charAt(0) !== '{') {
+                    var s = text.indexOf('{')
+                    var e = text.lastIndexOf('}')
+                    if (s >= 0 && e > s) text = text.substring(s, e + 1)
+                }
+                var data = JSON.parse(text)
+                var songs = []
+                if (data && data.data && data.data.song && data.data.song.list) {
+                    songs = data.data.song.list.map(function(s) {
+                        var artists = (s.singer || []).map(function(a) { return a.name })
+                        return {
+                            id: 'qq_' + s.songmid,
+                            platform: 'qq',
+                            pfName: 'QQ音乐',
+                            songId: s.songmid,
+                            songIdNum: s.songid,
+                            name: s.songname,
+                            artists: artists,
+                            album: s.albumname || '',
+                            duration: (s.interval || 0) * 1000
+                        }
+                    })
+                    _searchResults = _searchResults.concat(songs)
+                    renderSearchResults()
+                }
+                _searchStatus.qq = 'done'
+                updatePlatformButtons()
+                return songs
+            } catch(e) {
+                _searchStatus.qq = 'failed'
+                updatePlatformButtons()
+                return []
+            }
+        }
+
+        // 酷狗搜索
+        var searchKugou = async function(keyword) {
+            try {
+                var text = await shellCurl(
+                    'https://songsearch.kugou.com/song_search_v2?keyword=' + encodeURIComponent(keyword) + '&pagesize=15&page=1&platform=WebFilter',
+                    "-H 'Referer: https://www.kugou.com' -H 'User-Agent: Mozilla/5.0 (Linux; Android 10)'"
+                )
+                if (!text) throw new Error('无返回')
+                var data = JSON.parse(text)
+                var songs = []
+                if (data && data.data && data.data.lists) {
+                    songs = data.data.lists.map(function(s) {
+                        // 2026-08-27: HQFileHash(320k)播放可用，FileHash(128k)经常无URL，优先用HQ
+                        var bestHash = s.HQFileHash || s.FileHash
+                        return {
+                            id: 'kg_' + bestHash,
+                            platform: 'kugou',
+                            pfName: '酷狗',
+                            songId: bestHash,
+                            backupHash: s.FileHash || '',  // 128k备用hash
+                            albumId: s.AlbumID,
+                            name: s.SongName,
+                            artists: s.SingerName ? [s.SingerName] : [],
+                            album: s.AlbumName || '',
+                            duration: (s.Duration || 0) * 1000
+                        }
+                    })
+                    _searchResults = _searchResults.concat(songs)
+                    renderSearchResults()
+                }
+                _searchStatus.kugou = 'done'
+                updatePlatformButtons()
+                return songs
+            } catch(e) {
+                _searchStatus.kugou = 'failed'
+                updatePlatformButtons()
+                return []
+            }
+        }
+
+        // 酷我搜索
+        var searchKuwo = async function(keyword) {
+            try {
+                // 2026-08-27 更新：旧API已失效，使用search.kuwo.cn备用接口
+                var text = await shellCurl(
+                    'http://search.kuwo.cn/r.s?all=' + encodeURIComponent(keyword) + '&ft=music&itemset=web_2013&client=kt&pn=0&rn=15&rformat=json&encoding=utf8',
+                    "-H 'User-Agent: Mozilla/5.0 (Linux; Android 10)'"
+                )
+                if (!text) throw new Error('无返回')
+                // search.kuwo.cn返回Python dict风格（单引号），用正则提取歌曲信息
+                var songs = []
+                var songBlocks = text.match(/\{'[^']*?MUSICRID[^']*?\}/g) || []
+                songBlocks.forEach(function(block) {
+                    function getField(field) {
+                        var m = block.match(new RegExp("'" + field + "':'([^']*)'"))
+                        return m ? m[1].replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&') : ''
+                    }
+                    var rid = getField('MUSICRID').replace('MUSIC_', '')
+                    var name = getField('SONGNAME') || getField('NAME')
+                    var artist = getField('ARTIST')
+                    var album = getField('ALBUM')
+                    var duration = parseInt(getField('DURATION')) || 0
+                    if (rid && name) {
+                        songs.push({
+                            id: 'kw_' + rid,
+                            platform: 'kuwo',
+                            pfName: '酷我',
+                            songId: rid,
+                            name: name,
+                            artists: artist ? [artist] : [],
+                            album: album || '',
+                            duration: duration * 1000
+                        })
+                    }
+                })
+                _searchResults = _searchResults.concat(songs)
+                renderSearchResults()
+                _searchStatus.kuwo = 'done'
+                updatePlatformButtons()
+                return songs
+            } catch(e) {
+                // 如果备用接口也失败，尝试旧API
+                try {
+                    var text2 = await shellCurl(
+                        'http://www.kuwo.cn/api/www/search/searchMusicBykeyWord?key=' + encodeURIComponent(keyword) + '&pn=1&rn=15&httpsStatus=1&reqId=' + Date.now(),
+                        "-H 'Referer: http://www.kuwo.cn/' -H 'csrf: 00000000000000000000000000000000' -H 'Cookie: kw_token=00000000000000000000000000000000' -H 'User-Agent: Mozilla/5.0 (Linux; Android 10)'"
+                    )
+                    if (!text2) throw new Error('无返回')
+                    var data2 = JSON.parse(text2)
+                    var songs2 = []
+                    if (data2 && data2.data && data2.data.list) {
+                        songs2 = data2.data.list.map(function(s) {
+                            return {
+                                id: 'kw_' + s.rid,
+                                platform: 'kuwo',
+                                pfName: '酷我',
+                                songId: s.rid,
+                                name: s.name,
+                                artists: s.artist ? s.artist.split('&') : [],
+                                album: s.album || '',
+                                duration: (s.duration || 0) * 1000
+                            }
+                        })
+                        _searchResults = _searchResults.concat(songs2)
+                        renderSearchResults()
+                    }
+                    _searchStatus.kuwo = 'done'
+                    updatePlatformButtons()
+                    return songs2
+                } catch(e2) {
+                    _searchStatus.kuwo = 'failed'
+                    updatePlatformButtons()
+                    return []
+                }
+            }
+        }
+
+        // 咪咕搜索
+        var searchMigu = async function(keyword) {
+            try {
+                // 2026-08-27 更新：旧API已失效（301），使用app.c.nf.migu.cn新接口
+                var text = await shellCurl(
+                    'https://app.c.nf.migu.cn/MIGUM2.0/v1.0/content/search_all.do?text=' + encodeURIComponent(keyword) + '&pageSize=15&pageNo=1&searchSwitch=' + encodeURIComponent('{"song":1}'),
+                    "-H 'Referer: https://m.music.migu.cn/' -H 'User-Agent: Mozilla/5.0 (Linux; Android 10)'"
+                )
+                if (!text) throw new Error('无返回')
+                var data = JSON.parse(text)
+                var songs = []
+                if (data && data.songResultData && data.songResultData.result) {
+                    songs = data.songResultData.result.map(function(s) {
+                        return {
+                            id: 'mg_' + (s.contentId || s.copyrightId || s.id || ''),
+                            platform: 'migu',
+                            pfName: '咪咕',
+                            songId: s.contentId || s.copyrightId || s.id || '',
+                            name: s.name || s.songName || s.title || '',
+                            artists: (s.singers || []).map(function(a) { return a.name }),
+                            album: (s.albums && s.albums.length) ? s.albums[0].name : '',
+                            duration: 0
+                        }
+                    })
+                    _searchResults = _searchResults.concat(songs)
+                    renderSearchResults()
+                }
+                _searchStatus.migu = 'done'
+                updatePlatformButtons()
+                return songs
+            } catch(e) {
+                _searchStatus.migu = 'failed'
+                updatePlatformButtons()
+                return []
+            }
+        }
+
+        // 获取播放地址
+        // ---- 提取URL的辅助函数 ----
+        var extractPlayUrl = function(obj, paths) {
+            for (var p = 0; p < paths.length; p++) {
+                var val = obj
+                for (var k = 0; k < paths[p].length; k++) {
+                    if (val == null) { val = undefined; break }
+                    val = val[paths[p][k]]
+                }
+                if (Array.isArray(val)) val = val[0]
+                if (typeof val === 'string' && (val.indexOf('http://') === 0 || val.indexOf('https://') === 0)) return val
+                if (typeof val === 'string' && val.indexOf('//') === 0) return 'https:' + val
+            }
+            return ''
+        }
+
+        // ---- 验证音频URL是否可访问且为音频内容 ----
+        var validateAudioUrl = async function(url) {
+            if (!url) return false
+            var _rs = typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : null
+            if (!_rs) return true  // 无shell权限无法验证，默认通过
+            try {
+                // 用 curl -sI 做HEAD请求检查 Content-Type，-L 跟随重定向
+                var cmd = "curl -sI --max-time 6 -L '" + url + "' 2>/dev/null | head -30"
+                var res = await _rs(cmd)
+                var text = (res && res.content || '').trim()
+                if (!text) return true  // 无返回，不确定，默认通过
+
+                // 检查 HTTP 状态码（取最后一次重定向的状态）
+                var statusLines = text.match(/HTTP\/[\d.]+\s+(\d{3})/gi) || []
+                var lastStatus = statusLines.length ? parseInt(statusLines[statusLines.length - 1].replace(/HTTP\/[\d.]+\s+/i, '')) : 0
+                if (lastStatus >= 400 && lastStatus < 600) return false  // 4xx/5xx 错误
+
+                // 检查 Content-Type
+                var ctMatch = text.match(/Content-Type:\s*([^\r\n]+)/i)
+                if (ctMatch) {
+                    var ct = ctMatch[1].trim().toLowerCase()
+                    // 明确是音频类型
+                    if (ct.indexOf('audio') >= 0 || ct.indexOf('octet-stream') >= 0 || ct.indexOf('mpeg') >= 0) return true
+                    // 明确是HTML错误页面
+                    if (ct.indexOf('text/html') >= 0 || ct.indexOf('text/plain') >= 0) return false
+                }
+                return true  // 无法确定，默认通过
+            } catch(e) {
+                return true  // 验证失败，默认通过
+            }
+        }
+
+        // ---- 音源后端：逐个尝试，哪个成功用哪个 ----
+        // 2026-08-29 更新：接入 Meting-API 公共实例（GitHub 开源项目 meting-api），
+        // 直接返回音频流，网易云/酷狗/酷我多平台可用；保留原有 GD Studio、酷我 antiserver 作为备用。
+        var METING_SERVERS = {
+            netease: 'netease',
+            qq: 'tencent',
+            kugou: 'kugou',
+            kuwo: 'kuwo'
+        }
+        var METING_BACKENDS = function(platform) {
+            var svr = METING_SERVERS[platform] || 'netease'
+            return [
+                { url: function(id) { return 'https://api.injahow.cn/meting/?server=' + svr + '&type=url&id=' + id }, direct: true, name: 'Meting-Injahow' },
+                { url: function(id) { return 'https://meting.jinghuashang.cn/api?server=' + svr + '&type=url&id=' + id }, direct: true, name: 'Meting-Jinghua' },
+                { url: function(id) { return 'https://meting.mikus.ink/api?server=' + svr + '&type=url&id=' + id }, direct: true, name: 'Meting-Mikus' },
+            ]
+        }
+
+        var NETEASE_BACKENDS = METING_BACKENDS('netease').concat([
+            // GD Studio（JSON 格式，长期可用）
+            { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?types=url&source=netease&id=' + id + '&br=320' }, extract: [['url']], name: 'GD-320' },
+            { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?types=url&source=netease&id=' + id + '&br=999' }, extract: [['url']], name: 'GD-lossless' },
+        ])
+
+        var QQ_BACKENDS = METING_BACKENDS('qq').concat([
+            // GD Studio 腾讯源（偶尔可用）
+            { url: function(id) { return 'https://music-api.gdstudio.xyz/api.php?types=url&source=tx&id=' + id + '&br=320' }, extract: [['url']], name: 'GD-tx' },
+        ])
+
+        var KUGOU_BACKENDS = METING_BACKENDS('kugou').concat([
+            // 官方移动接口已不稳定（经常 errcode 2），保留作为最后尝试
+            { url: function(id) { return 'https://m.kugou.com/app/i/getSongInfo.php?cmd=playInfo&hash=' + id }, extract: [['url'],['playUrl'],['play_url'],['backup_url']], name: 'Kugou-Mobile' },
+            { url: function(id, albumId, song) {
+                if (!song || !song.backupHash || song.backupHash === id) return null
+                return 'https://m.kugou.com/app/i/getSongInfo.php?cmd=playInfo&hash=' + song.backupHash
+              }, extract: [['url'],['playUrl'],['play_url'],['backup_url']], name: 'Kugou-Mobile-backup' },
+        ])
+
+        var KUWO_BACKENDS = METING_BACKENDS('kuwo').concat([
+            // 酷我 antiserver（纯文本直链）
+            { url: function(id) { return 'http://antiserver.kuwo.cn/anti.s?type=convert_url&format=mp3&response=url&rid=MUSIC_' + id }, extract: [], textUrl: true, name: 'KuWo-anti' },
+            { url: function(id) { return 'http://antiserver.kuwo.cn/anti.s?type=convert_url&format=aac&response=url&rid=MUSIC_' + id }, extract: [], textUrl: true, name: 'KuWo-anti-aac' },
+        ])
+
+        // ---- 咪咕后端 ----
+        // 咪咕官方接口已长期失效，Meting 也不支持咪咕；播放失败时会走网易云跨平台回退
+        var MIGU_BACKENDS = []
+
+        // ---- 汽水VIP后端（跨平台搜索+获取） ----
+        var QISHUI_API = 'https://api.vsaa.cn/api/music.qishui.vip'
+        var QISHUI_API_HTTP = 'http://api.vsaa.cn/api/music.qishui.vip'
+        var QISHUI_PROXY_API = 'https://proxy.qishui.vsaa.cn/qishui/proxy'
+
+        var getPlayUrl = async function(song) {
+            if (!song || !song.platform) return ''
+            var _rs = typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : null
+            if (!_rs) {
+                // 无shell权限时，网易云还能用直链
+                if (song.platform === 'netease') {
+                    return 'https://music.163.com/song/media/outer/url?id=' + song.songId + '.mp3'
+                }
+                return ''
+            }
+
+            var backends = []
+            var songId = song.songId || ''
+            var albumId = song.albumId || ''
+
+            if (song.platform === 'netease') {
+                backends = NETEASE_BACKENDS
+            } else if (song.platform === 'qq') {
+                backends = QQ_BACKENDS
+            } else if (song.platform === 'kugou') {
+                backends = KUGOU_BACKENDS
+            } else if (song.platform === 'kuwo') {
+                backends = KUWO_BACKENDS
+            } else if (song.platform === 'migu') {
+                backends = MIGU_BACKENDS
+            }
+
+            if (!backends.length) return ''
+
+            for (var i = 0; i < backends.length; i++) {
+                var backend = backends[i]
+                try {
+                    var apiUrl = backend.url(songId, albumId, song)
+                    if (!apiUrl) continue  // needSong类型的后端可能返回null
+
+                    // 直接音频流后端（如 Meting-API）：接口本身返回音频二进制，无需再解析 JSON
+                    if (backend.direct) {
+                        var isDirectValid = await validateAudioUrl(apiUrl)
+                        if (isDirectValid) {
+                            aiLogSafe('[' + song.pfName + '] ' + (backend.name || '后端' + (i+1)) + ' 获取成功', 'success')
+                            return apiUrl
+                        }
+                        aiLogSafe('[' + song.pfName + '] ' + (backend.name || '后端' + (i+1)) + ' URL无效或已过期，尝试下一个', 'warn')
+                        continue
+                    }
+
+                    var hdr = backend.headers ? '-H \'' + backend.headers + '\'' : "-H 'User-Agent: Mozilla/5.0'"
+                    var text
+
+                    if (backend.method === 'POST' && backend.postBody) {
+                        var body = backend.postBody(songId)
+                        text = await shellCurl(apiUrl, hdr + " -X POST -H 'Content-Type: application/json' -d '" + body.replace(/'/g, "'\\''") + "'")
+                    } else {
+                        text = await shellCurl(apiUrl, hdr)
+                    }
+
+                    if (!text) continue
+
+                    // 纯文本直链类型后端（如酷我antiserver）
+                    if (backend.textUrl) {
+                        var plainUrl = text.trim()
+                        if (plainUrl && plainUrl.indexOf('http') === 0) {
+                            var isPlainValid = await validateAudioUrl(plainUrl)
+                            if (isPlainValid) {
+                                aiLogSafe('[' + song.pfName + '] ' + (backend.name || '后端' + (i+1)) + ' 获取成功', 'success')
+                                return plainUrl
+                            }
+                            aiLogSafe('[' + song.pfName + '] ' + (backend.name || '后端' + (i+1)) + ' URL无效或已过期，尝试下一个', 'warn')
+                        }
+                        continue
+                    }
+
+                    var data
+                    try { data = JSON.parse(text) } catch(e) { continue }
+                    if (!data) continue
+
+                    // 提取URL
+                    var playUrl = extractPlayUrl(data, backend.extract)
+
+                    // 如果返回的URL没有http前缀但有url字段
+                    if (!playUrl && data.url && typeof data.url === 'string' && data.url.indexOf('http') === 0) {
+                        playUrl = data.url
+                    }
+                    if (!playUrl && data.data && data.data.url && typeof data.data.url === 'string' && data.data.url.indexOf('http') === 0) {
+                        playUrl = data.data.url
+                    }
+                    // 汽水VIP的musicInfo字段
+                    if (!playUrl && data.musicInfo && typeof data.musicInfo === 'string' && data.musicInfo.indexOf('http') === 0) {
+                        playUrl = data.musicInfo
+                    }
+
+                    if (playUrl) {
+                        // 验证URL是否可访问且为音频内容
+                        var isValid = await validateAudioUrl(playUrl)
+                        if (isValid) {
+                            aiLogSafe('[' + song.pfName + '] ' + (backend.name || '后端' + (i+1)) + ' 获取成功', 'success')
+                            return playUrl
+                        }
+                        // URL无效，继续尝试下一个后端
+                        aiLogSafe('[' + song.pfName + '] ' + (backend.name || '后端' + (i+1)) + ' URL无效或已过期，尝试下一个', 'warn')
+                    }
+                } catch(e) {
+                    // 继续尝试下一个后端
+                    continue
+                }
+            }
+
+            // 所有后端都失败，尝试汽水VIP搜索回退
+            try {
+                var qishuiUrl = await qishuiFallbackGetUrl(song)
+                if (qishuiUrl) {
+                    aiLogSafe('[' + song.pfName + '] 汽水VIP回退获取成功', 'success')
+                    return qishuiUrl
+                }
+            } catch(e) {}
+
+            // 汽水VIP也失败，跨平台网易云回退（用歌名搜索网易云同曲播放）
+            if (song.name && song.platform !== 'netease') {
+                try {
+                    var neteaseFallbackUrl = await neteaseCrossPlatformFallback(song)
+                    if (neteaseFallbackUrl) {
+                        aiLogSafe('[' + song.pfName + '] 网易云跨平台回退获取成功', 'success')
+                        return neteaseFallbackUrl
+                    }
+                } catch(e) {}
+            }
+
+            // 所有后端都失败，网易云兜底用直链
+            if (song.platform === 'netease') {
+                return 'https://music.163.com/song/media/outer/url?id=' + song.songId + '.mp3'
+            }
+
+            return ''
+        }
+
+        // 网易云跨平台回退：其他平台播放失败时，用歌名+歌手在网易云搜索同曲播放
+        var neteaseCrossPlatformFallback = async function(song) {
+            if (!song || !song.name) return ''
+            var keyword = song.name
+            if (song.artists && song.artists.length) keyword += ' ' + song.artists[0]
+            try {
+                var searchText = await shellCurl(
+                    'https://music.163.com/api/search/get?s=' + encodeURIComponent(keyword) + '&type=1&offset=0&limit=5',
+                    "-H 'User-Agent: Mozilla/5.0 (Linux; Android 10)' -H 'Referer: https://music.163.com/'"
+                )
+                if (!searchText) return ''
+                var searchData
+                try { searchData = JSON.parse(searchText) } catch(e) { return '' }
+                var songs = searchData && searchData.result && searchData.result.songs
+                if (!songs || !songs.length) return ''
+
+                // 取第一条结果依次用 Meting / GD Studio 获取播放地址
+                var neteaseId = songs[0].id
+                if (!neteaseId) return ''
+
+                var metingUrls = [
+                    'https://api.injahow.cn/meting/?server=netease&type=url&id=' + neteaseId,
+                    'https://meting.jinghuashang.cn/api?server=netease&type=url&id=' + neteaseId,
+                    'https://meting.mikus.ink/api?server=netease&type=url&id=' + neteaseId,
+                ]
+                for (var m = 0; m < metingUrls.length; m++) {
+                    var isValid = await validateAudioUrl(metingUrls[m])
+                    if (isValid) return metingUrls[m]
+                }
+
+                var urlText = await shellCurl(
+                    'https://music-api.gdstudio.xyz/api.php?types=url&source=netease&id=' + neteaseId + '&br=320',
+                    "-H 'User-Agent: Mozilla/5.0'"
+                )
+                if (!urlText) return ''
+                var urlData
+                try { urlData = JSON.parse(urlText) } catch(e) { return '' }
+                if (urlData && urlData.url && urlData.url.indexOf('http') === 0) {
+                    return urlData.url
+                }
+            } catch(e) {}
+            return ''
+        }
+
+        // 汽水VIP跨平台搜索回退（所有平台后端失败后尝试）
+        var qishuiFallbackGetUrl = async function(song) {
+            if (!song || !song.name) return ''
+            var keyword = song.name
+            if (song.artists && song.artists.length) keyword += ' ' + song.artists.join(' ')
+            try {
+                // 搜索
+                var searchText = await shellCurl(
+                    QISHUI_API + '?act=search&keywords=' + encodeURIComponent(keyword) + '&page=1&pagesize=5&type=music',
+                    "-H 'User-Agent: Mozilla/5.0'"
+                )
+                if (!searchText) return ''
+                var searchData
+                try { searchData = JSON.parse(searchText) } catch(e) { return '' }
+                var list = searchData && searchData.data && searchData.data.lists
+                if (!list || !list.length) return ''
+
+                // 取第一条结果获取URL
+                var firstSong = list[0]
+                var qishuiId = firstSong.id || firstSong.vid || ''
+                if (!qishuiId) return ''
+
+                var urlText = await shellCurl(
+                    QISHUI_API + '?act=song&id=' + qishuiId + '&quality=low',
+                    "-H 'User-Agent: Mozilla/5.0'"
+                )
+                if (!urlText) return ''
+                var urlData
+                try { urlData = JSON.parse(urlText) } catch(e) { return '' }
+                var songData = urlData && urlData.data
+                if (Array.isArray(songData)) songData = songData[0]
+                if (songData && songData.url) {
+                    // 如果有ekey需要代理解密
+                    if (songData.ekey) {
+                        try {
+                            var proxyCmd = "curl -s --max-time 20 -X POST '" + QISHUI_PROXY_API + "' " +
+                                "-H 'Content-Type: application/json' " +
+                                "-d '{\"url\":\"" + songData.url + "\",\"key\":\"" + (songData.ekey || '') + "\",\"filename\":\"KMusic\",\"ext\":\"aac\"}' 2>/dev/null"
+                            var _rs2 = typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : null
+                            var proxyRes = _rs2 ? await _rs2(proxyCmd) : null
+                            var proxyText = (proxyRes && proxyRes.content || '').trim()
+                            if (proxyText) {
+                                var proxyJson = JSON.parse(proxyText)
+                                if (Number(proxyJson.code) === 200 && proxyJson.url) return String(proxyJson.url)
+                            }
+                        } catch(e) {}
+                    }
+                    return String(songData.url)
+                }
+            } catch(e) {}
+            return ''
+        }
+
+        var aiLogSafe = function(msg, level) {
+            try { if (typeof addDiagLog === 'function') addDiagLog(msg, level || 'info') } catch(e) {}
+        }
+
+        var escapeHtml = function(s) {
+            if (!s) return ''
+            return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')
+        }
+
+        var showSearchLoading = function(text) {
+            var container = document.getElementById('sm_search_results')
+            if (!container) return
+            container.innerHTML = '<div class="sm-search-loading">' + (text || '🔍 搜索中...') + '</div>'
+            container.style.display = 'block'
+        }
+
+        var showSearchEmpty = function() {
+            var container = document.getElementById('sm_search_results')
+            if (!container) return
+            container.innerHTML = '<div class="sm-search-loading">未找到歌曲，试试其他关键词或平台</div>'
+            container.style.display = 'block'
+        }
+
+        var renderSearchResults = function() {
+            var container = document.getElementById('sm_search_results')
+            if (!container) return
+            if (!_searchResults.length) { showSearchEmpty(); return }
+
+            var html = ''
+            for (var i = 0; i < _searchResults.length; i++) {
+                var song = _searchResults[i]
+                var name = escapeHtml(song.name || '')
+                var artists = escapeHtml((song.artists || []).join(' / '))
+                var album = escapeHtml(song.album || '')
+                var dur = song.duration ? fmtTime(song.duration / 1000) : ''
+                var isCurrent = _currentIndex >= 0 && _playlist[_currentIndex] && _playlist[_currentIndex].pfId === song.id
+                var isFav = isFavorited(song.id)
+                html += '<div class="sm-search-item' + (isCurrent ? ' _loading' : '') + '" data-search-idx="' + i + '">' +
+                    '<div class="sm-search-info">' +
+                    '<div class="sm-search-title"><span class="sm-search-pf-tag _' + song.platform + '">' + song.pfName + '</span>' + name + (isCurrent ? ' <span class="sm-search-playing">▶ 播放中</span>' : '') + '</div>' +
+                    '<div class="sm-search-artist">' + artists + (album ? ' · ' + album : '') + '</div>' +
+                    '</div>' +
+                    '<span class="sm-fav-btn' + (isFav ? ' _active' : '') + '" data-fav-toggle="' + i + '" title="收藏">' + (isFav ? '❤️' : '🤍') + '</span>' +
+                    '<span class="sm-search-dur">' + dur + '</span>' +
+                    '</div>'
+            }
+            container.innerHTML = html
+            container.style.display = 'block'
+        }
+
+        var playSearchSong = async function(song) {
+            if (!song || !song.id) return
+            var title = (song.artists && song.artists.length ? song.artists.join(' / ') + ' - ' : '') + (song.name || '未知歌曲')
+
+            // 检查是否已在播放列表
+            for (var i = 0; i < _playlist.length; i++) {
+                if (_playlist[i].pfId === song.id) {
+                    loadSong(i)
+                    play()
+                    renderSearchResults()
+                    return
+                }
+            }
+
+            showToast('正在获取播放地址...', 'pink', 2000)
+
+            // 获取真实播放地址
+            var playUrl = await getPlayUrl(song)
+            if (!playUrl) {
+                showToast('获取播放地址失败，该歌曲可能需要VIP', 'red', 4000)
+                return
+            }
+
+            // 添加到播放列表
+            _playlist.push({ url: playUrl, title: title, lrc: '', pfId: song.id, platform: song.platform, songRef: song })
+            savePlaylist()
+            renderPlaylist()
+
+            // 加载并播放
+            loadSong(_playlist.length - 1)
+            play()
+            renderSearchResults()
+
+            showToast('正在播放: ' + title, 'green', 2500)
+
+            // 异步获取歌词
+            fetchLyricsForSong(song)
+        }
+
+        var fetchLyricsForSong = async function(song) {
+            var _rs = typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : null
+            if (!_rs) return
+
+            try {
+                var lrcText = ''
+
+                if (song.platform === 'netease') {
+                    var text = await shellCurl(
+                        'https://music.163.com/api/song/lyric?id=' + song.songId + '&lv=1&tv=-1',
+                        "-H 'Referer: https://music.163.com' -H 'User-Agent: Mozilla/5.0'"
+                    )
+                    if (text) {
+                        var data = JSON.parse(text)
+                        if (data.lrc && data.lrc.lyric) lrcText = data.lrc.lyric
+                    }
+                } else if (song.platform === 'qq') {
+                    var text = await shellCurl(
+                        'https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?songmid=' + song.songId + '&format=json',
+                        "-H 'Referer: https://y.qq.com' -H 'User-Agent: Mozilla/5.0'"
+                    )
+                    if (text) {
+                        if (text.charAt(0) !== '{') {
+                            var s = text.indexOf('{'), e = text.lastIndexOf('}')
+                            if (s >= 0 && e > s) text = text.substring(s, e + 1)
+                        }
+                        var data = JSON.parse(text)
+                        if (data && data.lyric) {
+                            // QQ歌词是base64的
+                            try { lrcText = atob(data.lyric) } catch(e) { lrcText = data.lyric }
+                        }
+                    }
+                } else if (song.platform === 'kugou') {
+                    var text = await shellCurl(
+                        'https://wwwapi.kugou.com/yy/index.php?r=play/getdata&hash=' + song.songId + '&album_id=' + (song.albumId || ''),
+                        "-H 'Referer: https://www.kugou.com' -H 'User-Agent: Mozilla/5.0'"
+                    )
+                    if (text) {
+                        var data = JSON.parse(text)
+                        if (data && data.data && data.data.lyrics) lrcText = data.data.lyrics
+                    }
+                }
+
+                if (lrcText) {
+                    _lrcData = parseLRC(lrcText)
+                    _lrcLineIndex = -1
+
+                    if (_currentIndex >= 0 && _playlist[_currentIndex] && _playlist[_currentIndex].pfId === song.id) {
+                        _playlist[_currentIndex].lrc = lrcText
+                        savePlaylist()
+                    }
+
+                    var ta = document.getElementById('sm_lrc_textarea')
+                    if (ta) ta.value = lrcText
+
+                    updateLyricsBar()
+                }
+            } catch(e) {}
+        }
+
+        // ---- 扫描本地音乐 ----
+        var scanLocalMusic = async function() {
+            try {
+                var _rs = typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : null
+                if (!_rs) { showToast('设备 Shell 不可用', 'red'); return }
+                showToast('正在扫描本地音乐...', 'pink', 3000)
+                var dirs = ['/sdcard/Music', '/sdcard/Download', '/sdcard/music', '/sdcard/songs', '/sdcard/Audio']
+                var exts = ['mp3', 'm4a', 'wav', 'ogg', 'flac', 'aac']
+                var found = []
+                for (var d = 0; d < dirs.length; d++) {
+                    var dir = dirs[d]
+                    var extPattern = exts.map(function(e) { return '-iname "*.' + e + '"' }).join(' -o ')
+                    var cmd = 'find "' + dir + '" -type f \\( ' + extPattern + ' \\) 2>/dev/null | head -50'
+                    var res = await _rs(cmd)
+                    if (res && res.content) {
+                        var lines = res.content.trim().split('\n').filter(function(l) { return l.trim() })
+                        for (var i = 0; i < lines.length; i++) {
+                            var path = lines[i].trim()
+                            if (!path) continue
+                            var name = path.split('/').pop()
+                            // 尝试构造可播放的 URL
+                            var url = path
+                            // 检查是否已有 HTTP 前缀可用
+                            var prefix = ''
+                            try { prefix = localStorage.getItem('smart_http_prefix') || '' } catch(e) {}
+                            if (prefix) {
+                                // 将 /sdcard/ 路径映射到 HTTP 静态路径
+                                var relPath = path.replace(/^\/sdcard\//, '').replace(/^\/data\//, '')
+                                url = prefix + 'sdm_update/../' + relPath
+                            }
+                            found.push({ url: url, title: name.replace(/\.[^.]+$/, ''), lrc: '', _local: true, _path: path })
+                        }
+                    }
+                }
+                if (!found.length) {
+                    showToast('未找到本地音乐文件', 'pink', 3000)
+                    return
+                }
+                // 去重：按 URL
+                var existing = {}
+                for (var i2 = 0; i2 < _playlist.length; i2++) existing[_playlist[i2].url] = true
+                var added = 0
+                for (var j = 0; j < found.length; j++) {
+                    if (!existing[found[j].url]) {
+                        _playlist.push(found[j])
+                        added++
+                    }
+                }
+                savePlaylist()
+                renderPlaylist()
+                showToast('扫描完成，新增 ' + added + ' 首歌曲（共 ' + _playlist.length + ' 首）', 'green', 4000)
+            } catch(e) {
+                showToast('扫描失败: ' + e, 'red', 4000)
+            }
+        }
+
+        // ---- 获取远程歌词 ----
+        var fetchRemoteLRC = async function() {
+            var urlInput = document.getElementById('sm_lrc_url_input')
+            var url = (urlInput && urlInput.value || '').trim()
+            if (!url) { showToast('请输入歌词 URL', 'red'); return }
+            try {
+                showToast('正在获取歌词...', 'pink', 2000)
+                var resp = await fetch(url, { cache: 'no-store' })
+                if (!resp.ok) throw new Error('HTTP ' + resp.status)
+                var text = await resp.text()
+                var ta = document.getElementById('sm_lrc_textarea')
+                if (ta) ta.value = text
+                showToast('歌词已获取，点「应用歌词」生效', 'green', 3000)
+            } catch(e) {
+                showToast('获取歌词失败: ' + (e.message || e), 'red', 4000)
+            }
+        }
+
+        // ---- 歌词开关 ----
+        var setLyricsOverlay = function(on) {
+            _lyricsOverlayVisible = on
+            var sw = document.getElementById('sm_lyrics_toggle')
+            if (sw) { if (on) sw.classList.add('_on'); else sw.classList.remove('_on') }
+            if (on) {
+                lyricsBar.classList.add('_show')
+                updateLyricsBar()
+                // 恢复位置
+                try {
+                    var pos = localStorage.getItem('smart_music_lyrics_pos')
+                    if (pos) {
+                        var p = JSON.parse(pos)
+                        setLyricsPosition(p.x, p.y)
+                    }
+                } catch(e) {}
+            } else {
+                lyricsBar.classList.remove('_show')
+            }
+            try { localStorage.setItem('smart_music_lyrics_bar', on ? '1' : '0') } catch(e) {}
+        }
+
+        // ---- 歌词拖动功能 ----
+        var _dragState = { dragging: false, startX: 0, startY: 0, origLeft: 0, origBottom: 0, moved: false }
+        var _lyricPosX = null  // null = 居中
+        var _lyricPosY = null  // null = 默认底部20px
+
+        var setLyricsPosition = function(x, y) {
+            _lyricPosX = x
+            _lyricPosY = y
+            lyricsBar.style.left = '0'
+            lyricsBar.style.right = 'auto'
+            lyricsBar.style.bottom = 'auto'
+            lyricsBar.style.top = y + 'px'
+            lyricsBar.style.transform = 'none'
+            // 水平居中于拖动点
+            lyricsBar.style.left = x + 'px'
+            lyricsBar.style.marginLeft = '0'
+        }
+
+        var resetLyricsPosition = function() {
+            _lyricPosX = null
+            _lyricPosY = null
+            lyricsBar.style.left = '50%'
+            lyricsBar.style.right = ''
+            lyricsBar.style.bottom = '20px'
+            lyricsBar.style.top = ''
+            lyricsBar.style.transform = 'translateX(-50%)'
+            try { localStorage.removeItem('smart_music_lyrics_pos') } catch(e) {}
+        }
+
+        var onLyricDragStart = function(e) {
+            _dragState.dragging = true
+            _dragState.moved = false
+            var pt = e.touches ? e.touches[0] : e
+            _dragState.startX = pt.clientX
+            _dragState.startY = pt.clientY
+            var rect = lyricsBar.getBoundingClientRect()
+            _dragState.origLeft = rect.left + rect.width / 2  // 中心点X
+            _dragState.origBottom = rect.bottom              // 底部Y
+            lyricsBar.classList.add('_dragging')
+            e.preventDefault()
+        }
+
+        var onLyricDragMove = function(e) {
+            if (!_dragState.dragging) return
+            var pt = e.touches ? e.touches[0] : e
+            var dx = pt.clientX - _dragState.startX
+            var dy = pt.clientY - _dragState.startY
+            if (Math.abs(dx) > 3 || Math.abs(dy) > 3) _dragState.moved = true
+            var newX = _dragState.origLeft + dx
+            var newBottom = window.innerHeight - (_dragState.origBottom + dy)
+            // 限制在屏幕内
+            var rect = lyricsBar.getBoundingClientRect()
+            var halfW = rect.width / 2
+            newX = Math.max(halfW, Math.min(window.innerWidth - halfW, newX))
+            newBottom = Math.max(10, Math.min(window.innerHeight - rect.height - 10, newBottom))
+            setLyricsPosition(newX, window.innerHeight - newBottom - rect.height)
+            e.preventDefault()
+        }
+
+        var onLyricDragEnd = function() {
+            if (!_dragState.dragging) return
+            _dragState.dragging = false
+            lyricsBar.classList.remove('_dragging')
+            if (_dragState.moved && _lyricPosX !== null && _lyricPosY !== null) {
+                try {
+                    localStorage.setItem('smart_music_lyrics_pos', JSON.stringify({ x: _lyricPosX, y: _lyricPosY }))
+                } catch(e) {}
+            }
+        }
+
+        // 绑定拖动事件
+        lyricsBar.addEventListener('mousedown', onLyricDragStart)
+        document.addEventListener('mousemove', onLyricDragMove)
+        document.addEventListener('mouseup', onLyricDragEnd)
+        lyricsBar.addEventListener('touchstart', onLyricDragStart, { passive: false })
+        document.addEventListener('touchmove', onLyricDragMove, { passive: false })
+        document.addEventListener('touchend', onLyricDragEnd)
+        // 双击重置位置
+        lyricsBar.addEventListener('dblclick', function() {
+            resetLyricsPosition()
+            showToast('歌词位置已重置', 'pink', 1500)
+        })
+
+        // ---- 面板显示/隐藏 ----
+        window.toggleMusicPlayer = function() {
+            if (_panelVisible) hidePanel(); else showPanel()
+        }
+
+        var showPanel = function() {
+            _panelVisible = true
+            panel.classList.add('_show')
+            overlay.classList.add('_show')
+            renderPlaylist()
+            renderFavorites()
+            // 恢复歌词开关状态
+            var savedLyrics = '1'
+            try { savedLyrics = localStorage.getItem('smart_music_lyrics_bar') || '1' } catch(e) {}
+            setLyricsOverlay(savedLyrics === '1')
+        }
+
+        var hidePanel = function() {
+            _panelVisible = false
+            panel.classList.remove('_show')
+            overlay.classList.remove('_show')
+        }
+
+        // ---- 事件绑定 ----
+        document.getElementById('sm_close_btn').onclick = hidePanel
+        overlay.onclick = hidePanel
+
+        document.getElementById('sm_play_btn').onclick = togglePlay
+        document.getElementById('sm_prev_btn').onclick = playPrev
+        document.getElementById('sm_next_btn').onclick = playNext
+
+        // 播放模式切换（单曲循环 / 顺序播放）
+        var updatePlayModeBtn = function() {
+            var btn = document.getElementById('sm_mode_btn')
+            if (!btn) return
+            if (_playMode === 'single') {
+                btn.textContent = '🔂'
+                btn.title = '单曲循环（点击切换为顺序播放）'
+                btn.style.background = 'linear-gradient(135deg,#ec4899,#be185d)'
+            } else {
+                btn.textContent = '🔁'
+                btn.title = '顺序播放（点击切换为单曲循环）'
+                btn.style.background = 'linear-gradient(135deg,#f59e0b,#d97706)'
+            }
+        }
+        document.getElementById('sm_mode_btn').onclick = function() {
+            _playMode = _playMode === 'single' ? 'sequence' : 'single'
+            try { localStorage.setItem('smart_music_playmode', _playMode) } catch(e) {}
+            updatePlayModeBtn()
+            showToast(_playMode === 'single' ? '已切换为单曲循环' : '已切换为顺序播放', _playMode === 'single' ? 'green' : 'pink', 2000)
+        }
+        updatePlayModeBtn()
+
+        // 后台播放开关
+        _updateBgSwitch()
+        var _bgSw = document.getElementById('sm_bg_switch')
+        if (_bgSw) _bgSw.onclick = _toggleBgPlay
+
+        // 自动续播开关
+        var _updateAutoPlaySwitch = function() {
+            var sw = document.getElementById('sm_autoplay_switch')
+            if (sw) {
+                if (_autoPlayEnabled) sw.classList.add('_on')
+                else sw.classList.remove('_on')
+            }
+        }
+        _updateAutoPlaySwitch()
+        var _autoPlaySw = document.getElementById('sm_autoplay_switch')
+        if (_autoPlaySw) {
+            _autoPlaySw.onclick = function() {
+                _autoPlayEnabled = !_autoPlayEnabled
+                try { localStorage.setItem('smart_music_autoplay', _autoPlayEnabled ? '1' : '0') } catch(e) {}
+                _updateAutoPlaySwitch()
+                showToast('自动续播: ' + (_autoPlayEnabled ? '开启' : '关闭'), 'green', 1500)
+            }
+        }
+
+        // ADB 设备播放按钮
+        var _adbPlayBtn = document.getElementById('sm_adb_play_btn')
+        if (_adbPlayBtn) _adbPlayBtn.onclick = function() { playOnDevice() }
+        var _adbStopBtn = document.getElementById('sm_adb_stop_btn')
+        if (_adbStopBtn) _adbStopBtn.onclick = function() { stopDevicePlay() }
+        // 初始化 ADB 状态显示
+        ;(async function() {
+            if (_runShell) {
+                var available = await _checkAdbAvailable()
+                _updateAdbStatus(available ? '设备可用，点击推送播放' : '未检测到可用设备', false)
+            } else {
+                _updateAdbStatus('需要 Root/Shell 权限', false)
+            }
+        })()
+
+        // 小窗模式按钮
+        var _miniBtn = document.getElementById('sm_minimize_btn')
+        if (_miniBtn) _miniBtn.onclick = toggleMiniMode
+
+        // 小窗拖动事件
+        panel.addEventListener('mousedown', _onMiniDragStart)
+        panel.addEventListener('touchstart', _onMiniDragStart, { passive: false })
+        document.addEventListener('mousemove', _onMiniDragMove)
+        document.addEventListener('touchmove', _onMiniDragMove, { passive: false })
+        document.addEventListener('mouseup', _onMiniDragEnd)
+        document.addEventListener('touchend', _onMiniDragEnd)
+
+        // 高级后台同步开关
+        _updateBgSyncSwitch()
+        var _bgSyncSw = document.getElementById('sm_bgsync_switch')
+        if (_bgSyncSw) _bgSyncSw.onclick = _toggleBgSync
+
+        // 后台音乐控制按钮
+        var _bgPrevBtn = document.getElementById('sm_bg_prev_btn')
+        if (_bgPrevBtn) _bgPrevBtn.onclick = function() { bgMusicPrev() }
+        var _bgPlayBtn = document.getElementById('sm_bg_play_btn')
+        if (_bgPlayBtn) _bgPlayBtn.onclick = function() { bgMusicPlayPause() }
+        var _bgNextBtn = document.getElementById('sm_bg_next_btn')
+        if (_bgNextBtn) _bgNextBtn.onclick = function() { bgMusicNext() }
+
+        // 从 localStorage 恢复后台同步状态
+        try {
+            if (localStorage.getItem('smart_music_bgsync') === '1' && _runShell) {
+                _startBgSync()
+                _updateBgSyncSwitch()
+            }
+        } catch(e) {}
+
+        // 添加歌曲
+        document.getElementById('sm_add_btn').onclick = function() {
+            var urlInput = document.getElementById('sm_url_input')
+            var titleInput = document.getElementById('sm_title_input')
+            var url = (urlInput.value || '').trim()
+            var title = (titleInput.value || '').trim()
+            if (!url) { showToast('请输入音频 URL', 'red'); return }
+            if (!title) {
+                title = url.split('/').pop().replace(/\.[^.]+$/, '') || ('歌曲' + (_playlist.length + 1))
+            }
+            _playlist.push({ url: url, title: title, lrc: '' })
+            savePlaylist()
+            renderPlaylist()
+            urlInput.value = ''
+            titleInput.value = ''
+            showToast('已添加: ' + title, 'green', 2000)
+            // 如果是第一首，自动选中
+            if (_currentIndex < 0) loadSong(_playlist.length - 1)
+        }
+
+        // 回车添加
+        document.getElementById('sm_url_input').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') document.getElementById('sm_add_btn').click()
+        })
+
+        // 扫描本地
+        document.getElementById('sm_scan_btn').onclick = scanLocalMusic
+
+        // Listen1 多源搜索
+        document.getElementById('sm_search_btn').onclick = searchAll
+        document.getElementById('sm_search_input').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') searchAll()
+        })
+        // 平台切换
+        var pfBtns = document.querySelectorAll('#sm_platform_filter .sm-pf-btn')
+        pfBtns.forEach(function(btn) {
+            btn.addEventListener('click', function() {
+                var pf = btn.getAttribute('data-pf')
+                _activePlatforms[pf] = !_activePlatforms[pf]
+                if (_activePlatforms[pf]) btn.classList.add('_on')
+                else btn.classList.remove('_on')
+            })
+        })
+        // 搜索结果点击播放
+        document.getElementById('sm_search_results').addEventListener('click', function(e) {
+            var favBtn = e.target.closest('.sm-fav-btn')
+            if (favBtn) {
+                e.stopPropagation()
+                var favIdx = parseInt(favBtn.getAttribute('data-fav-toggle'))
+                if (!isNaN(favIdx) && _searchResults[favIdx]) {
+                    toggleFavorite(_searchResults[favIdx])
+                }
+                return
+            }
+            var item = e.target.closest('.sm-search-item')
+            if (!item || item.classList.contains('_loading')) return
+            var idx = parseInt(item.getAttribute('data-search-idx'))
+            if (!isNaN(idx) && _searchResults[idx]) {
+                playSearchSong(_searchResults[idx])
+            }
+        })
+
+        // 播放列表点击
+        document.getElementById('sm_playlist_container').addEventListener('click', function(e) {
+            var plFavBtn = e.target.closest('[data-pl-fav]')
+            if (plFavBtn) {
+                e.stopPropagation()
+                var plFavIdx = parseInt(plFavBtn.getAttribute('data-pl-fav'))
+                if (!isNaN(plFavIdx) && _playlist[plFavIdx] && _playlist[plFavIdx].songRef) {
+                    toggleFavorite(_playlist[plFavIdx].songRef)
+                }
+                return
+            }
+            var delBtn = e.target.closest('._del')
+            if (delBtn) {
+                e.stopPropagation()
+                var delIdx = parseInt(delBtn.getAttribute('data-del'))
+                _playlist.splice(delIdx, 1)
+                savePlaylist()
+                if (delIdx === _currentIndex) {
+                    _audio.pause()
+                    _isPlaying = false
+                    _currentIndex = -1
+                    updatePlayBtn()
+                    if (_playlist.length > 0) loadSong(0)
+                }
+                renderPlaylist()
+                showToast('已删除', 'pink', 1500)
+                return
+            }
+            var item = e.target.closest('.sm-playlist-item')
+            if (item) {
+                var idx = parseInt(item.getAttribute('data-idx'))
+                loadSong(idx)
+                play()
+            }
+        })
+
+        // 进度条点击
+        document.getElementById('sm_seek_bar').addEventListener('click', function(e) {
+            var rect = this.getBoundingClientRect()
+            var pct = (e.clientX - rect.left) / rect.width
+            if (_audio.duration) {
+                _audio.currentTime = _audio.duration * pct
+                updateProgress()
+            }
+        })
+
+        // 音量条点击
+        document.getElementById('sm_vol_bar').addEventListener('click', function(e) {
+            var rect = this.getBoundingClientRect()
+            var pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width))
+            _audio.volume = pct
+            var fill = document.getElementById('sm_vol_fill')
+            if (fill) fill.style.width = (pct * 100) + '%'
+            var pctEl = document.getElementById('sm_vol_pct')
+            if (pctEl) pctEl.textContent = Math.round(pct * 100) + '%'
+        })
+
+        // Tab 切换
+        document.getElementById('sm_tab_playlist').onclick = function() {
+            this.classList.add('_active')
+            document.getElementById('sm_tab_favorites').classList.remove('_active')
+            document.getElementById('sm_tab_lyrics').classList.remove('_active')
+            document.getElementById('sm_playlist_tab').style.display = ''
+            document.getElementById('sm_favorites_tab').style.display = 'none'
+            document.getElementById('sm_lyrics_tab').style.display = 'none'
+        }
+        document.getElementById('sm_tab_favorites').onclick = function() {
+            this.classList.add('_active')
+            document.getElementById('sm_tab_playlist').classList.remove('_active')
+            document.getElementById('sm_tab_lyrics').classList.remove('_active')
+            document.getElementById('sm_playlist_tab').style.display = 'none'
+            document.getElementById('sm_favorites_tab').style.display = ''
+            document.getElementById('sm_lyrics_tab').style.display = 'none'
+            renderFavorites()
+        }
+        document.getElementById('sm_tab_lyrics').onclick = function() {
+            this.classList.add('_active')
+            document.getElementById('sm_tab_playlist').classList.remove('_active')
+            document.getElementById('sm_tab_favorites').classList.remove('_active')
+            document.getElementById('sm_playlist_tab').style.display = 'none'
+            document.getElementById('sm_favorites_tab').style.display = 'none'
+            document.getElementById('sm_lyrics_tab').style.display = ''
+        }
+
+        // 收藏列表点击
+        document.getElementById('sm_favorites_container').addEventListener('click', function(e) {
+            var favDel = e.target.closest('[data-fav-del]')
+            if (favDel) {
+                e.stopPropagation()
+                var delIdx = parseInt(favDel.getAttribute('data-fav-del'))
+                if (!isNaN(delIdx) && _favorites[delIdx]) {
+                    var removedName = _favorites[delIdx].name || '未知'
+                    _favorites.splice(delIdx, 1)
+                    saveFavorites()
+                    renderFavorites()
+                    renderSearchResults()
+                    renderPlaylist()
+                    showToast('已移除收藏: ' + removedName, 'pink', 1500)
+                }
+                return
+            }
+            var favItem = e.target.closest('.sm-fav-item')
+            if (favItem) {
+                var idx = parseInt(favItem.getAttribute('data-fav-idx'))
+                if (!isNaN(idx) && _favorites[idx]) {
+                    playFavorite(_favorites[idx])
+                }
+            }
+        })
+
+        // 应用歌词
+        document.getElementById('sm_apply_lrc_btn').onclick = function() {
+            var ta = document.getElementById('sm_lrc_textarea')
+            var lrcText = (ta.value || '').trim()
+            _lrcData = parseLRC(lrcText)
+            _lrcLineIndex = -1
+            if (_lrcData.length) {
+                showToast('歌词已应用（' + _lrcData.length + ' 行）', 'green', 2500)
+            } else {
+                // 纯文本歌词：按行存储，时间间隔均匀
+                var lines = lrcText.split('\n').filter(function(l) { return l.trim() })
+                if (lines.length) {
+                    _lrcData = lines.map(function(line, i) {
+                        return { time: i * 5, text: line.trim() }
+                    })
+                    showToast('纯文本歌词已应用（' + lines.length + ' 行，每5秒切换）', 'green', 3000)
+                } else {
+                    showToast('歌词为空', 'red')
+                }
+            }
+            updateLyricsBar()
+        }
+
+        // 保存歌词到当前歌曲
+        document.getElementById('sm_save_lrc_btn').onclick = function() {
+            if (_currentIndex < 0) { showToast('请先选择歌曲', 'red'); return }
+            var ta = document.getElementById('sm_lrc_textarea')
+            _playlist[_currentIndex].lrc = (ta.value || '').trim()
+            savePlaylist()
+            showToast('歌词已保存到「' + _playlist[_currentIndex].title + '」', 'green', 2500)
+        }
+
+        // 获取远程歌词
+        document.getElementById('sm_fetch_lrc_btn').onclick = fetchRemoteLRC
+
+        // 歌词悬浮条开关
+        document.getElementById('sm_lyrics_toggle').onclick = function() {
+            setLyricsOverlay(!_lyricsOverlayVisible)
+        }
+
+        // audio 事件
+        _audio.addEventListener('ended', function() {
+            _isPlaying = false
+            updatePlayBtn()
+            stopProgressTimer()
+            if (_playMode === 'single' && _currentIndex >= 0) {
+                // 单曲循环：重新播放当前歌曲
+                _audio.currentTime = 0
+                _audio.play().then(function() {
+                    _isPlaying = true
+                    updatePlayBtn()
+                    startProgressTimer()
+                }).catch(function() {})
+            } else {
+                // 顺序播放：播放下一首
+                playNext()
+            }
+        })
+
+        _audio.addEventListener('loadedmetadata', function() {
+            updateProgress()
+        })
+
+        _audio.addEventListener('error', function() {
+            _isPlaying = false
+            updatePlayBtn()
+            stopProgressTimer()
+
+            // 自动重试：如果当前歌曲有 songRef，尝试重新获取播放地址
+            if (_currentIndex >= 0 && _playlist[_currentIndex] && _playlist[_currentIndex].songRef && _retryCount < 2) {
+                _retryCount++
+                showToast('播放地址已过期，正在重新获取...（第' + _retryCount + '次）', 'pink', 3000)
+                ;(async function() {
+                    var songObj = _playlist[_currentIndex].songRef
+                    var newUrl = await getPlayUrl(songObj)
+                    if (newUrl) {
+                        _playlist[_currentIndex].url = newUrl
+                        savePlaylist()
+                        renderPlaylist()
+                        _audio.src = newUrl
+                        _audio.load()
+                        _audio.play().then(function() {
+                            _isPlaying = true
+                            updatePlayBtn()
+                            startProgressTimer()
+                        }).catch(function(e) {
+                            showToast('重新获取后仍无法播放: ' + (e.message || ''), 'red', 4000)
+                        })
+                    } else {
+                        showToast('音频加载失败，该歌曲可能需要VIP或暂无可用音源', 'red', 4000)
+                    }
+                })()
+            } else {
+                showToast('音频加载失败，请检查 URL 是否可访问', 'red', 4000)
+            }
+        })
+
+        // 初始渲染
+        renderPlaylist()
+
+        // 初始化音量条
+        var volFill = document.getElementById('sm_vol_fill')
+        if (volFill) volFill.style.width = '80%'
+
+        // 自动续播（延迟一下确保 DOM 就绪）
+        if (_autoPlayEnabled) {
+            setTimeout(function() { _tryAutoResume() }, 800)
+        }
+
+        addDiagLog('音乐播放器模块已加载（播放列表 ' + _playlist.length + ' 首）', 'success')
+    })()
+    }, 300);
+
+    // ============ AI 智能助手模块（设备巡检 + 网络监控 + 待执行命令审批） ============
+    // 【性能优化】延迟600ms加载，优先渲染主界面
+    setTimeout(function() {
+    ;(function() {
+        // ---- 状态 ----
+        var _aiRunning = false
+        var _aiCheckTimer = null        // 设备巡检定时器
+        var _netCheckTimer = null       // 网络监控定时器
+        var _panelVisible = false
+        var _pendingCommands = []       // {id, command, description, reason, category, status: 'pending'|'approved'|'rejected'|'done'|'failed', result}
+        var _aiLogs = []               // {time, text, level}
+        var _netHistory = []           // {time, ping, loss, dns, status}
+        var _lastNetNotify = 0         // 上次网络通知时间
+        var _netNotifyCooldown = 120000 // 2分钟冷却
+        var _cmdIdCounter = 1
+        var _scanCount = 0
+        var _issuesFound = 0
+        var _netStatus = { ping: -1, loss: -1, dns: -1, status: '未知', suggestion: '' }
+
+        // 从 localStorage 恢复设置
+        try { _aiRunning = localStorage.getItem('smart_ai_running') === '1' } catch(e) {}
+        var _autoApproveSafe = false
+        try { _autoApproveSafe = localStorage.getItem('smart_ai_auto_safe') === '1' } catch(e) {}
+
+        var showToast = function(msg, color, dur) {
+            try { if (typeof createToast === 'function') createToast(msg, color || 'pink', dur || 3000) } catch(e) {}
+        }
+
+        // getShell 兼容层（基于全局 runShellWithRoot）
+        // 修复：getShell is not defined
+        var getShell = function() {
+            if (typeof runShellWithRoot !== 'function') return null
+            // 返回一个兼容对象，调用方式: _rs(cmd, timeout)
+            return function(cmd, timeoutMs) {
+                return new Promise(function(resolve) {
+                    try {
+                        runShellWithRoot(cmd, timeoutMs || 5000).then(function(r) {
+                            // 统一返回格式: {content, success}
+                            if (typeof r === 'string') {
+                                resolve({ content: r, success: true })
+                            } else if (r && typeof r === 'object') {
+                                resolve({ content: r.content || r.stdout || '', success: !!r.success })
+                            } else {
+                                resolve({ content: '', success: false })
+                            }
+                        }).catch(function() {
+                            resolve({ content: '', success: false })
+                        })
+                    } catch(e) {
+                        resolve({ content: '', success: false })
+                    }
+                })
+            }
+        }
+
+        var aiLog = function(msg, level) {
+            var now = new Date()
+            var t = String(now.getHours()).padStart(2,'0') + ':' + String(now.getMinutes()).padStart(2,'0') + ':' + String(now.getSeconds()).padStart(2,'0')
+            var icon = level === 'warn' ? '⚠️' : level === 'error' ? '🔴' : level === 'success' ? '✅' : level === 'net' ? '📡' : 'ℹ️'
+            _aiLogs.unshift({ time: t, text: msg, level: level || 'info', icon: icon })
+            if (_aiLogs.length > 100) _aiLogs.length = 100
+            renderAILogs()
+        }
+
+        var getShell = function() {
+            return typeof runShellWithRoot !== 'undefined' ? runShellWithRoot : null
+        }
+
+        // ---- CSS ----
+        var style = document.createElement('style')
+        style.textContent = `
+        #smart_ai_panel {
+            position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            width: 420px; max-width: 94vw; max-height: 88vh; overflow-y: auto;
+            z-index: 100002; border-radius: 18px; padding: 0;
+            background: linear-gradient(135deg, rgba(20,18,35,.97), rgba(35,28,55,.97), rgba(45,25,50,.97));
+            border: 1px solid rgba(216,180,254,.45);
+            box-shadow: 0 8px 50px rgba(0,0,0,.7), 0 0 0 1px rgba(216,180,254,.2), 0 0 40px rgba(167,139,250,.25), 0 0 66px rgba(255,158,205,.16);
+            display: none; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+        #smart_ai_panel._show { display: block; animation: smart_ai_fadein .25s ease; }
+        @keyframes smart_ai_fadein { from { opacity:0; transform:translate(-50%,-48%) } to { opacity:1; transform:translate(-50%,-50%) } }
+        #smart_ai_overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,.45); z-index: 100001; display: none; }
+        #smart_ai_overlay._show { display: block; }
+        #smart_ai_fab {
+            position: fixed; bottom: 70px; right: 16px; z-index: 100003;
+            width: 52px; height: 52px; border-radius: 50%; border: none; cursor: pointer;
+            background: linear-gradient(135deg, #6366f1, #8b5cf6); color: #fff; font-size: 22px;
+            box-shadow: 0 4px 20px rgba(99,102,241,.5), 0 0 0 2px rgba(167,139,250,.2);
+            display: none; align-items: center; justify-content: center; transition: transform .2s;
+        }
+        #smart_ai_fab._show { display: flex; }
+        #smart_ai_fab._running { background: linear-gradient(135deg, #22c55e, #16a34a); box-shadow: 0 4px 20px rgba(34,197,94,.5); }
+        #smart_ai_fab._running::before { content: ''; position: absolute; inset: -4px; border-radius: 50%; border: 2px solid rgba(34,197,94,.4); animation: smart_ai_pulse 1.5s ease-in-out infinite; }
+        #smart_ai_fab._haspending { background: linear-gradient(135deg, #f59e0b, #ef4444); box-shadow: 0 4px 20px rgba(245,158,11,.5); }
+        @keyframes smart_ai_pulse { 0%,100% { transform: scale(1); opacity: .6 } 50% { transform: scale(1.3); opacity: 0 } }
+        #smart_ai_fab .fab-badge { position: absolute; top: -4px; right: -4px; min-width: 18px; height: 18px; border-radius: 9px; background: #ef4444; color: #fff; font-size: 10px; font-weight: bold; display: flex; align-items: center; justify-content: center; padding: 0 4px; }
+        .ai-section { padding: 12px 16px; }
+        .ai-header { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; border-bottom: 1px solid rgba(167,139,250,.15); background: linear-gradient(135deg, rgba(99,102,241,.1), rgba(139,92,246,.08)); border-radius: 18px 18px 0 0; }
+        .ai-title { font-size: 15px; font-weight: bold; background: linear-gradient(90deg, #818cf8, #c4b5fd); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+        .ai-close { background: rgba(255,255,255,.1); border: none; color: #fff; width: 28px; height: 28px; border-radius: 50%; cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; transition: all .2s; }
+        .ai-close:hover { background: rgba(255,100,100,.3); }
+        .ai-btn { border: none; border-radius: 10px; padding: 8px 16px; font-size: 13px; font-weight: bold; color: #fff; cursor: pointer; transition: all .2s; }
+        .ai-btn:active { transform: scale(.95); }
+        .ai-btn-start { background: linear-gradient(135deg, #22c55e, #16a34a); }
+        .ai-btn-stop { background: linear-gradient(135deg, #ef4444, #dc2626); }
+        .ai-btn-scan { background: linear-gradient(135deg, #6366f1, #8b5cf6); }
+        .ai-btn-approve { background: linear-gradient(135deg, #22c55e, #16a34a); }
+        .ai-btn-reject { background: linear-gradient(135deg, #6b7280, #4b5563); }
+        .ai-btn-execall { background: linear-gradient(135deg, #f59e0b, #d97706); }
+        .ai-status-card { padding: 12px; border-radius: 12px; background: rgba(255,255,255,.04); border: 1px solid rgba(167,139,250,.1); margin-bottom: 8px; }
+        .ai-status-row { display: flex; justify-content: space-between; align-items: center; font-size: 12px; margin-bottom: 4px; }
+        .ai-status-row:last-child { margin-bottom: 0; }
+        .ai-status-val { font-weight: bold; }
+        .ai-status-val._good { color: #4ade80; }
+        .ai-status-val._warn { color: #fbbf24; }
+        .ai-status-val._bad { color: #f87171; }
+        .ai-status-val._info { color: #60a5fa; }
+        .ai-cmd-item { padding: 10px 12px; border-radius: 12px; margin-bottom: 8px; background: rgba(255,255,255,.04); border: 1px solid rgba(167,139,250,.15); transition: all .2s; }
+        .ai-cmd-item._pending { border-color: rgba(245,158,11,.4); background: rgba(245,158,11,.06); }
+        .ai-cmd-item._approved { border-color: rgba(34,197,94,.3); }
+        .ai-cmd-item._rejected { opacity: .4; }
+        .ai-cmd-item._done { border-color: rgba(34,197,94,.2); }
+        .ai-cmd-item._failed { border-color: rgba(239,68,68,.3); background: rgba(239,68,68,.06); }
+        .ai-cmd-reason { font-size: 11px; color: rgba(255,255,255,.6); margin-bottom: 4px; line-height: 1.4; }
+        .ai-cmd-text { font-size: 11px; font-family: monospace; background: rgba(0,0,0,.3); padding: 6px 8px; border-radius: 6px; color: #c4b5fd; word-break: break-all; margin-bottom: 6px; max-height: 80px; overflow-y: auto; }
+        .ai-cmd-actions { display: flex; gap: 6px; }
+        .ai-cmd-actions .ai-btn { padding: 5px 12px; font-size: 11px; }
+        .ai-cmd-cat { display: inline-block; font-size: 10px; padding: 1px 8px; border-radius: 8px; margin-right: 6px; }
+        .ai-cmd-cat._storage { background: rgba(96,165,250,.2); color: #60a5fa; }
+        .ai-cmd-cat._memory { background: rgba(167,139,250,.2); color: #a78bfa; }
+        .ai-cmd-cat._network { background: rgba(52,211,153,.2); color: #34d399; }
+        .ai-cmd-cat._system { background: rgba(251,191,36,.2); color: #fbbf24; }
+        .ai-cmd-cat._battery { background: rgba(255,158,205,.2); color: #ff9ecd; }
+        .ai-cmd-result { font-size: 10px; color: rgba(34,197,94,.7); margin-top: 4px; font-family: monospace; }
+        .ai-cmd-result._err { color: rgba(239,68,68,.7); }
+        .ai-log-area { width: 100%; box-sizing: border-box; height: 140px; overflow-y: auto; padding: 8px; border-radius: 10px; background: rgba(0,0,0,.25); border: 1px solid rgba(167,139,250,.1); font-size: 11px; line-height: 1.6; }
+        .ai-log-line { padding: 1px 0; }
+        .ai-log-time { color: rgba(255,255,255,.3); margin-right: 4px; }
+        .ai-empty { text-align: center; padding: 16px; color: rgba(255,255,255,.25); font-size: 12px; }
+        .ai-net-bar { height: 4px; border-radius: 2px; background: rgba(255,255,255,.1); margin-top: 4px; overflow: hidden; }
+        .ai-net-bar-fill { height: 100%; border-radius: 2px; transition: width .5s ease; }
+        .ai-switch-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+        .ai-switch { position: relative; width: 40px; height: 22px; border-radius: 11px; background: rgba(255,255,255,.15); cursor: pointer; transition: background .25s; flex-shrink: 0; }
+        .ai-switch._on { background: linear-gradient(135deg, #22c55e, #16a34a); }
+        .ai-switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: transform .25s; }
+        .ai-switch._on::after { transform: translateX(18px); }
+        .ai-switch-label { font-size: 12px; color: rgba(255,255,255,.6); }
+        .ai-hint { font-size: 10px; color: rgba(255,255,255,.25); margin-top: 6px; line-height: 1.5; }
+        .ai-section-title { font-size: 12px; font-weight: bold; color: rgba(196,181,253,.8); margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+        .ai-badge { font-size: 10px; padding: 1px 8px; border-radius: 8px; background: rgba(245,158,11,.2); color: #fbbf24; }
+        .ai-badge._0 { display: none; }
+
+        /* ===== PicoClaw 聊天窗口样式 ===== */
+        .ai-tabs { display: flex; gap: 2px; padding: 0 16px; background: linear-gradient(135deg, rgba(99,102,241,.1), rgba(139,92,246,.08)); border-bottom: 1px solid rgba(167,139,250,.15); }
+        .ai-tab {
+            padding: 10px 16px; font-size: 13px; color: rgba(255,255,255,.5);
+            cursor: pointer; border-bottom: 2px solid transparent; transition: all .2s;
+            font-weight: 500;
+        }
+        .ai-tab._active { color: #c4b5fd; border-bottom-color: #8b5cf6; }
+        .ai-tab:hover { color: rgba(255,255,255,.8); }
+        .ai-tab-content { display: none; }
+        .ai-tab-content._active { display: block; }
+
+        /* 聊天区域 */
+        .chat-container { display: flex; flex-direction: column; height: 420px; }
+        .chat-messages {
+            flex: 1; overflow-y: auto; padding: 12px 16px;
+            display: flex; flex-direction: column; gap: 10px;
+        }
+        .chat-msg { max-width: 85%; display: flex; gap: 8px; align-items: flex-start; }
+        .chat-msg._user { align-self: flex-end; flex-direction: row-reverse; }
+        .chat-avatar {
+            width: 28px; height: 28px; border-radius: 50%; flex-shrink: 0;
+            display: flex; align-items: center; justify-content: center; font-size: 14px;
+        }
+        .chat-msg._user .chat-avatar { background: linear-gradient(135deg, #6366f1, #8b5cf6); }
+        .chat-msg._ai .chat-avatar { background: linear-gradient(135deg, #22c55e, #16a34a); }
+        .chat-bubble {
+            padding: 8px 12px; border-radius: 12px; font-size: 12px;
+            line-height: 1.5; word-break: break-word; white-space: pre-wrap;
+        }
+        .chat-msg._user .chat-bubble {
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+            color: #fff; border-bottom-right-radius: 4px;
+        }
+        .chat-msg._ai .chat-bubble {
+            background: rgba(255,255,255,.08); color: #e2e8f0;
+            border-bottom-left-radius: 4px; border: 1px solid rgba(255,255,255,.06);
+        }
+        .chat-bubble code { background: rgba(0,0,0,.3); padding: 1px 5px; border-radius: 4px; font-size: 11px; font-family: monospace; }
+        .chat-bubble pre { background: rgba(0,0,0,.3); padding: 8px; border-radius: 6px; overflow-x: auto; margin: 6px 0; }
+        .chat-bubble pre code { background: transparent; padding: 0; }
+
+        .chat-input-area {
+            display: flex; gap: 8px; padding: 10px 16px;
+            border-top: 1px solid rgba(167,139,250,.1);
+            background: rgba(0,0,0,.15);
+        }
+        .chat-input {
+            flex: 1; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.1);
+            border-radius: 10px; padding: 8px 12px; color: #fff; font-size: 12px;
+            outline: none; resize: none; font-family: inherit;
+        }
+        .chat-input:focus { border-color: rgba(139,92,246,.5); background: rgba(255,255,255,.08); }
+        .chat-send-btn {
+            background: linear-gradient(135deg, #22c55e, #16a34a); border: none;
+            color: #fff; padding: 0 16px; border-radius: 10px; font-size: 12px;
+            font-weight: bold; cursor: pointer; transition: all .2s;
+        }
+        .chat-send-btn:active { transform: scale(.95); }
+        .chat-send-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+        .chat-status-bar {
+            padding: 6px 16px; font-size: 10px; color: rgba(255,255,255,.4);
+            display: flex; justify-content: space-between; align-items: center;
+            border-bottom: 1px solid rgba(167,139,250,.08);
+        }
+        .chat-status-dot {
+            display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+            margin-right: 4px;
+        }
+        .chat-status-dot._ok { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+        .chat-status-dot._bad { background: #ef4444; }
+        .chat-status-dot._warn { background: #f59e0b; box-shadow: 0 0 6px #f59e0b; }
+        .chat-typing { font-size: 11px; color: rgba(255,255,255,.4); font-style: italic; }
+
+        .chat-empty { text-align: center; padding: 40px 20px; color: rgba(255,255,255,.3); }
+        .chat-empty-icon { font-size: 36px; margin-bottom: 10px; }
+        .chat-empty-title { font-size: 14px; font-weight: bold; margin-bottom: 6px; color: rgba(255,255,255,.5); }
+        .chat-empty-desc { font-size: 11px; line-height: 1.6; }
+
+        .chat-quick-actions { display: flex; gap: 6px; flex-wrap: wrap; padding: 8px 16px 0; }
+        .chat-quick-btn {
+            font-size: 10px; padding: 4px 10px; border-radius: 12px;
+            background: rgba(99,102,241,.15); border: 1px solid rgba(99,102,241,.3);
+            color: #a5b4fc; cursor: pointer; transition: all .2s;
+        }
+        .chat-quick-btn:hover { background: rgba(99,102,241,.3); }
+
+        /* 本地工具箱按钮 */
+        .chat-local-btn {
+            font-size: 11px; padding: 8px 6px; border-radius: 8px;
+            background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.1);
+            color: rgba(255,255,255,.8); cursor: pointer; transition: all .2s;
+            text-align: center;
+        }
+        .chat-local-btn:hover { background: rgba(255,255,255,.1); border-color: rgba(255,255,255,.2); }
+        .chat-local-btn:active { transform: scale(0.96); }
+        .chat-local-btn._primary {
+            background: linear-gradient(135deg,#8b5cf6,#6366f1); border: none;
+            color: #fff; font-weight: bold;
+        }
+        .chat-local-btn._warn {
+            background: rgba(239,68,68,.1); border-color: rgba(239,68,68,.3);
+            color: #fca5a5;
+        }
+        .chat-cmd-output {
+            margin: 10px; padding: 10px;
+            background: rgba(0,0,0,.3); border-radius: 8px;
+            font-family: monospace; font-size: 11px;
+            color: #94a3b8; max-height: 200px;
+            overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+        }
+
+        /* 安装/配置向导视图 */
+        .chat-setup-view {
+            flex: 1; display: flex; flex-direction: column; align-items: center;
+            justify-content: center; padding: 24px 20px; text-align: center;
+        }
+        .chat-setup-icon { font-size: 48px; margin-bottom: 16px; }
+        .chat-setup-title { font-size: 16px; font-weight: bold; color: #fff; margin-bottom: 8px; }
+        .chat-setup-desc { font-size: 12px; color: rgba(255,255,255,.45); line-height: 1.6; margin-bottom: 20px; }
+        .chat-setup-steps { width: 100%; max-width: 280px; margin-bottom: 20px; text-align: left; }
+        .chat-step { display: flex; gap: 12px; padding: 10px 0; border-bottom: 1px solid rgba(255,255,255,.05); }
+        .chat-step:last-child { border-bottom: none; }
+        .chat-step-num {
+            width: 24px; height: 24px; border-radius: 50%; flex-shrink: 0;
+            background: linear-gradient(135deg, #8b5cf6, #6366f1);
+            display: flex; align-items: center; justify-content: center;
+            font-size: 12px; font-weight: bold; color: #fff;
+        }
+        .chat-step-text { flex: 1; }
+        .chat-step-title { font-size: 12px; font-weight: bold; color: rgba(255,255,255,.8); margin-bottom: 2px; }
+        .chat-step-desc { font-size: 11px; color: rgba(255,255,255,.35); line-height: 1.4; }
+        .chat-setup-actions { display: flex; flex-direction: column; gap: 8px; width: 100%; max-width: 240px; }
+        .chat-setup-btn {
+            padding: 10px 16px; border-radius: 10px; font-size: 13px;
+            font-weight: bold; cursor: pointer; border: none; transition: all .2s;
+        }
+        .chat-setup-btn:active { transform: scale(.97); }
+        .chat-setup-btn._primary {
+            background: linear-gradient(135deg, #22c55e, #16a34a); color: #fff;
+        }
+        .chat-setup-btn._secondary {
+            background: rgba(99,102,241,.15); color: #a5b4fc;
+            border: 1px solid rgba(99,102,241,.3);
+        }
+        .chat-setup-btn._secondary:hover { background: rgba(99,102,241,.25); }
+
+        /* API Key 输入框 */
+        .chat-api-input {
+            width: 100%; box-sizing: border-box;
+            background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.1);
+            border-radius: 8px; padding: 8px 10px; color: #fff; font-size: 12px;
+            outline: none; font-family: inherit;
+        }
+        .chat-api-input:focus { border-color: rgba(139,92,246,.5); background: rgba(255,255,255,.08); }
+        .chat-api-select {
+            width: 100%; box-sizing: border-box;
+            background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.1);
+            border-radius: 8px; padding: 8px 10px; color: #fff; font-size: 12px;
+            outline: none;
+        }
+        .chat-api-select:focus { border-color: rgba(139,92,246,.5); }
+        .chat-api-select option { background: #1e1e2e; color: #fff; }
+
+        /* 进度条 */
+        .chat-progress-bar {
+            width: 100%; height: 6px; background: rgba(255,255,255,.08);
+            border-radius: 3px; overflow: hidden;
+        }
+        .chat-progress-fill {
+            height: 100%; width: 0%;
+            background: linear-gradient(90deg, #22c55e, #16a34a);
+            border-radius: 3px; transition: width .3s ease;
+        }
+        `
+        document.head.appendChild(style)
+
+        // ---- 创建面板 ----
+        var overlay = document.createElement('div')
+        overlay.id = 'smart_ai_overlay'
+        document.body.appendChild(overlay)
+
+        var panel = document.createElement('div')
+        panel.id = 'smart_ai_panel'
+        panel.innerHTML = `
+            <div class="ai-header">
+                <span class="ai-title">🤖 AI 智能助手</span>
+                <button class="ai-close" id="ai_close_btn">×</button>
+            </div>
+
+            <!-- Tab 切换 -->
+            <div class="ai-tabs">
+                <div class="ai-tab _active" data-tab="assistant">🛠️ 智能助手</div>
+                <div class="ai-tab" data-tab="chat">💬 PicoClaw 聊天</div>
+            </div>
+
+            <!-- Tab 1：智能助手（原有功能） -->
+            <div class="ai-tab-content _active" id="ai_tab_assistant">
+
+            <div class="ai-section">
+                <div style="display:flex;gap:8px;margin-bottom:10px;">
+                    <button class="ai-btn ai-btn-start" id="ai_start_btn" style="flex:1">▶ 启动巡检</button>
+                    <button class="ai-btn ai-btn-scan" id="ai_scan_now_btn" style="flex:1">🔍 立即检查</button>
+                </div>
+                <button class="ai-btn ai-btn-deep" id="ai_deep_diag_btn" style="width:100%;margin-bottom:10px;background:linear-gradient(135deg,#8b5cf6,#6366f1);">
+                    🦞 AI 深度诊断（PicoClaw）
+                </button>
+                <div class="ai-switch-row" style="margin-bottom:8px">
+                    <span class="ai-switch-label">显示AI悬浮按钮</span>
+                    <div class="ai-switch _on" id="ai_fab_switch"></div>
+                </div>
+                <div class="ai-switch-row" style="margin-bottom:8px">
+                    <span class="ai-switch-label">自动批准低风险安全命令（清缓存等）</span>
+                    <div class="ai-switch" id="ai_auto_approve_switch"></div>
+                </div>
+                <div class="ai-hint">AI 发现问题后会将要执行的命令放入下方待审批队列，你同意后才会执行。网络方面只通知建议，不做任何限速操作。</div>
+            </div>
+
+            <div class="ai-section" style="border-top:1px solid rgba(167,139,250,.1)">
+                <div class="ai-section-title">📡 网络状态监控 <span class="ai-badge _0" id="ai_net_badge"></span></div>
+                <div class="ai-status-card">
+                    <div class="ai-status-row">
+                        <span>延迟</span>
+                        <span class="ai-status-val _info" id="ai_net_ping">-</span>
+                    </div>
+                    <div class="ai-status-row">
+                        <span>丢包率</span>
+                        <span class="ai-status-val _info" id="ai_net_loss">-</span>
+                    </div>
+                    <div class="ai-status-row">
+                        <span>DNS解析</span>
+                        <span class="ai-status-val _info" id="ai_net_dns">-</span>
+                    </div>
+                    <div class="ai-status-row">
+                        <span>状态评估</span>
+                        <span class="ai-status-val _info" id="ai_net_status">未检测</span>
+                    </div>
+                    <div class="ai-status-row">
+                        <span>AI建议</span>
+                        <span style="font-size:11px;color:rgba(255,255,255,.5);text-align:right;max-width:200px" id="ai_net_suggestion">-</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="ai-section" style="border-top:1px solid rgba(167,139,250,.1)">
+                <div class="ai-section-title">
+                    💻 AI 代码任务
+                    <span style="font-size:10px;color:rgba(255,255,255,.3);font-weight:normal">描述任务，AI生成命令，批准后执行</span>
+                </div>
+                <div style="display:flex;gap:6px;margin-bottom:8px;">
+                    <input type="text" class="ai-input" id="ai_task_input" placeholder="例：清理日志文件 / 查看CPU占用 / 重启网络..." style="flex:1" />
+                    <button class="ai-btn ai-btn-execall" id="ai_gen_btn" style="background:linear-gradient(135deg,#10b981,#059669);flex-shrink:0">生成命令</button>
+                </div>
+                <div id="ai_task_result" style="display:none;margin-bottom:8px">
+                    <div style="font-size:11px;color:rgba(255,255,255,.4);margin-bottom:4px">AI生成的命令（请仔细审查）：</div>
+                    <div class="ai-cmd-box" id="ai_task_cmd_display" style="font-family:monospace;font-size:12px;background:rgba(0,0,0,.3);padding:8px 10px;border-radius:8px;border:1px solid rgba(255,255,255,.08);word-break:break-all;white-space:pre-wrap;margin-bottom:6px"></div>
+                    <div style="display:flex;gap:6px;">
+                        <button class="ai-btn ai-btn-approve" id="ai_task_exec_btn" style="flex:1">✅ 批准执行</button>
+                        <button class="ai-btn ai-btn-reject" id="ai_task_cancel_btn">取消</button>
+                    </div>
+                </div>
+                <div id="ai_task_loading" style="display:none;text-align:center;padding:12px;color:rgba(255,255,255,.4);font-size:12px">🤖 AI正在生成命令...</div>
+            </div>
+
+            <div class="ai-section" style="border-top:1px solid rgba(167,139,250,.1)">
+                <div class="ai-section-title">
+                    🔧 待审批命令
+                    <span class="ai-badge _0" id="ai_pending_badge">0</span>
+                </div>
+                <div id="ai_pending_container" style="max-height:300px;overflow-y:auto;margin-bottom:8px">
+                    <div class="ai-empty">暂无待执行命令，AI巡检发现问题后会在此建议</div>
+                </div>
+                <button class="ai-btn ai-btn-execall" id="ai_approve_all_btn" style="width:100%;display:none">✅ 全部批准执行</button>
+            </div>
+
+            <div class="ai-section" style="border-top:1px solid rgba(167,139,250,.1)">
+                <div class="ai-section-title">📋 AI 日志</div>
+                <div class="ai-log-area" id="ai_log_area">
+                    <div class="ai-empty">AI未启动</div>
+                </div>
+            </div>
+
+            <div class="ai-section" style="border-top:1px solid rgba(167,139,250,.1)">
+                <div class="ai-section-title">📊 巡检统计</div>
+                <div class="ai-status-card">
+                    <div class="ai-status-row"><span>巡检次数</span><span class="ai-status-val _info" id="ai_scan_count">0</span></div>
+                    <div class="ai-status-row"><span>发现问题</span><span class="ai-status-val _warn" id="ai_issues_count">0</span></div>
+                    <div class="ai-status-row"><span>已执行命令</span><span class="ai-status-val _good" id="ai_exec_count">0</span></div>
+                    <div class="ai-status-row"><span>运行状态</span><span class="ai-status-val _bad" id="ai_run_status">未启动</span></div>
+                </div>
+            </div>
+
+            </div><!-- /ai_tab_assistant -->
+
+            <!-- Tab 2：PicoClaw 聊天 -->
+            <div class="ai-tab-content" id="ai_tab_chat">
+                <div class="chat-status-bar">
+                    <div>
+                        <span class="chat-status-dot" id="picoclaw_status_dot"></span>
+                        <span id="picoclaw_status_text">检测中...</span>
+                    </div>
+                    <div id="picoclaw_status_actions" style="display:flex;gap:6px;">
+                        <button id="picoclaw_open_panel" style="font-size:10px;padding:2px 8px;border-radius:6px;background:rgba(99,102,241,.2);border:1px solid rgba(99,102,241,.3);color:#a5b4fc;cursor:pointer">打开面板</button>
+                    </div>
+                </div>
+                <div class="chat-container">
+                    <!-- 安装向导（未安装时显示） -->
+                    <div class="chat-setup-view" id="chat_setup_install">
+                        <div class="chat-setup-icon">📦</div>
+                        <div class="chat-setup-title">一键安装 PicoClaw</div>
+                        <div class="chat-setup-desc">
+                            AI 助手功能需要 PicoClaw 驱动<br/>
+                            点击下方按钮自动完成安装
+                        </div>
+
+                        <!-- API Key 输入 -->
+                        <div style="width:100%;max-width:280px;margin-bottom:16px;text-align:left">
+                            <div style="font-size:11px;color:rgba(255,255,255,.5);margin-bottom:4px">API Key（可选，安装后配置）</div>
+                            <input type="text" class="chat-api-input" id="pc_api_key_input" placeholder="输入你的 LLM API Key（如 DeepSeek）" />
+                            <div style="font-size:10px;color:rgba(255,255,255,.3);margin-top:4px">
+                                支持 DeepSeek、OpenAI、硅基流动等 30+ 服务商
+                            </div>
+                        </div>
+
+                        <!-- API 服务商选择 -->
+                        <div style="width:100%;max-width:280px;margin-bottom:12px;text-align:left">
+                            <div style="font-size:11px;color:rgba(255,255,255,.5);margin-bottom:4px">AI 服务商</div>
+                            <select class="chat-api-select" id="pc_provider_select">
+                                <option value="deepseek">DeepSeek（推荐）</option>
+                                <option value="siliconflow">硅基流动（有免费额度）</option>
+                                <option value="openai">OpenAI</option>
+                                <option value="dashscope">阿里云百炼</option>
+                                <option value="custom">自定义（其他）</option>
+                            </select>
+                        </div>
+
+                        <!-- 免费方案提示 -->
+                        <div style="width:100%;max-width:280px;margin-bottom:16px;padding:10px 12px;background:rgba(59,130,246,.1);border:1px solid rgba(59,130,246,.3);border-radius:8px;text-align:left">
+                            <div style="font-size:11px;color:#60a5fa;font-weight:bold;margin-bottom:4px">💡 免费方案推荐</div>
+                            <div style="font-size:10px;color:rgba(255,255,255,.6);line-height:1.5">
+                                硅基流动(SiliconFlow)每日提供免费额度，注册即可使用：<br/>
+                                <span style="color:#93c5fd">https://cloud.siliconflow.cn</span>
+                            </div>
+                        </div>
+
+                        <div class="chat-setup-actions" style="width:100%;max-width:280px">
+                            <button class="chat-setup-btn _primary" id="pc_oneclick_install_btn">🚀 一键安装 PicoClaw</button>
+                            <button class="chat-setup-btn _secondary" id="pc_open_plugin_btn">🦞 从小龙虾APP提取</button>
+                        </div>
+
+                        <!-- 安装进度 -->
+                        <div class="chat-install-progress" id="chat_install_progress" style="display:none;width:100%;max-width:280px;margin-top:16px;text-align:left">
+                            <div style="font-size:11px;color:rgba(255,255,255,.5);margin-bottom:6px" id="pc_install_status">准备中...</div>
+                            <div class="chat-progress-bar">
+                                <div class="chat-progress-fill" id="pc_progress_fill"></div>
+                            </div>
+                            <div style="font-size:10px;color:rgba(255,255,255,.3);margin-top:6px" id="pc_install_log">点击开始安装</div>
+                        </div>
+                    </div>
+
+                    <!-- 配置向导（已安装但未配置/未运行时显示） -->
+                    <div class="chat-setup-view" id="chat_setup_config" style="display:none">
+                        <div class="chat-setup-icon">⚙️</div>
+                        <div class="chat-setup-title">配置 AI 服务商</div>
+                        <div class="chat-setup-desc">
+                            PicoClaw 已安装，输入 API Key<br/>
+                            一键配置，立即使用
+                        </div>
+
+                        <!-- API Key 输入 -->
+                        <div style="width:100%;max-width:280px;margin-bottom:12px;text-align:left">
+                            <div style="font-size:11px;color:rgba(255,255,255,.5);margin-bottom:4px">API Key</div>
+                            <input type="text" class="chat-api-input" id="pc_config_api_input" placeholder="输入你的 API Key" />
+                        </div>
+
+                        <!-- API 服务商选择 -->
+                        <div style="width:100%;max-width:280px;margin-bottom:12px;text-align:left">
+                            <div style="font-size:11px;color:rgba(255,255,255,.5);margin-bottom:4px">AI 服务商</div>
+                            <select class="chat-api-select" id="pc_config_provider_select">
+                                <option value="deepseek">DeepSeek（推荐）</option>
+                                <option value="siliconflow">硅基流动（有免费额度）</option>
+                                <option value="openai">OpenAI</option>
+                                <option value="dashscope">阿里云百炼</option>
+                                <option value="custom">自定义（其他）</option>
+                            </select>
+                        </div>
+
+                        <!-- 免费方案提示 -->
+                        <div style="width:100%;max-width:280px;margin-bottom:16px;padding:10px 12px;background:rgba(59,130,246,.1);border:1px solid rgba(59,130,246,.3);border-radius:8px;text-align:left">
+                            <div style="font-size:11px;color:#60a5fa;font-weight:bold;margin-bottom:4px">💡 免费方案推荐</div>
+                            <div style="font-size:10px;color:rgba(255,255,255,.6);line-height:1.5">
+                                硅基流动(SiliconFlow)每日提供免费额度，注册即可使用：<br/>
+                                <span style="color:#93c5fd">https://cloud.siliconflow.cn</span>
+                            </div>
+                        </div>
+
+                        <div class="chat-setup-actions" style="width:100%;max-width:280px">
+                            <button class="chat-setup-btn _primary" id="pc_quick_config_btn">🔑 一键配置 API</button>
+                            <button class="chat-setup-btn _secondary" id="pc_open_config_btn">📋 打开配置面板</button>
+                            <div style="display:flex;gap:8px">
+                                <button class="chat-setup-btn _secondary" id="pc_retry_check_btn" style="flex:1">🔄 重新检测</button>
+                                <button class="chat-setup-btn _secondary" id="pc_diagnose_btn" style="flex:1;background:linear-gradient(135deg,#f59e0b,#d97706);">🔍 诊断</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 聊天消息区域（正常使用时显示） -->
+                    <div class="chat-messages" id="chat_messages" style="display:none">
+                        <div class="chat-empty" id="chat_empty">
+                            <div class="chat-empty-icon">🦞</div>
+                            <div class="chat-empty-title">PicoClaw AI 助手</div>
+                            <div class="chat-empty-desc">
+                                可以执行命令、查询信息、调试问题<br/>
+                                试试下面的快捷操作吧 👇
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- 本地工具箱模式（无API时显示） -->
+                    <div class="chat-local-tools" id="chat_local_tools" style="display:none;padding:12px;overflow-y:auto;max-height:60vh">
+                        <div style="text-align:center;margin-bottom:16px">
+                            <div style="font-size:36px;margin-bottom:8px">🔧</div>
+                            <div style="font-size:16px;font-weight:bold;color:#fff">本地工具箱</div>
+                            <div style="font-size:12px;color:rgba(255,255,255,.5);margin-top:4px">无需 AI · 点击直接执行</div>
+                        </div>
+                        
+                        <!-- 系统信息 -->
+                        <div style="margin-bottom:14px">
+                            <div style="font-size:11px;color:rgba(255,255,255,.4);margin-bottom:6px;padding-left:4px">📊 系统信息</div>
+                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+                                <button class="chat-local-btn" data-cmd="uname -a && echo '---' && cat /proc/version 2>/dev/null | cut -c1-80">系统版本</button>
+                                <button class="chat-local-btn" data-cmd="cat /proc/cpuinfo 2>/dev/null | grep 'model name' | head -1 && echo '---' && cat /proc/cpuinfo 2>/dev/null | grep 'BogoMIPS' | head -1">CPU 信息</button>
+                                <button class="chat-local-btn" data-cmd="cat /proc/meminfo 2>/dev/null | head -6">内存信息</button>
+                                <button class="chat-local-btn" data-cmd="df -h / /data 2>/dev/null">存储空间</button>
+                                <button class="chat-local-btn" data-cmd="cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null && echo '°C (原始值)' && cat /sys/class/thermal/thermal_zone1/temp 2>/dev/null && echo '°C (zone1)'">温度信息</button>
+                                <button class="chat-local-btn" data-cmd="uptime && echo '---' && cat /proc/uptime 2>/dev/null">运行时长</button>
+                            </div>
+                        </div>
+                        
+                        <!-- 网络工具 -->
+                        <div style="margin-bottom:14px">
+                            <div style="font-size:11px;color:rgba(255,255,255,.4);margin-bottom:6px;padding-left:4px">📡 网络工具</div>
+                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+                                <button class="chat-local-btn" data-cmd="ip addr show 2>/dev/null | grep 'inet ' | head -10">IP 地址</button>
+                                <button class="chat-local-btn" data-cmd="ip route show 2>/dev/null && echo '---DNS---' && getprop net.dns1 2>/dev/null && getprop net.dns2 2>/dev/null">路由/DNS</button>
+                                <button class="chat-local-btn" data-cmd="ping -c 3 -W 2 223.5.5.5 2>&1">网络连通性</button>
+                                <button class="chat-local-btn" data-cmd="ping -c 2 -W 3 baidu.com 2>&1">DNS 解析</button>
+                                <button class="chat-local-btn" data-cmd="netstat -tlnp 2>/dev/null | head -15 || ss -tlnp 2>/dev/null | head -15">端口监听</button>
+                                <button class="chat-local-btn" data-cmd="cat /proc/net/dev 2>/dev/null | head -10">网卡流量</button>
+                            </div>
+                        </div>
+                        
+                        <!-- 清理优化 -->
+                        <div style="margin-bottom:14px">
+                            <div style="font-size:11px;color:rgba(255,255,255,.4);margin-bottom:6px;padding-left:4px">🧹 清理优化</div>
+                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+                                <button class="chat-local-btn" data-cmd="sync && echo 3 > /proc/sys/vm/drop_caches 2>/dev/null && echo '缓存已清理'">清理缓存</button>
+                                <button class="chat-local-btn" data-cmd="du -sh /data/local/tmp/* 2>/dev/null | sort -rh | head -10">大文件排查</button>
+                                <button class="chat-local-btn" data-cmd="ps -ef 2>/dev/null | head -15 || ps 2>/dev/null | head -15">进程列表</button>
+                                <button class="chat-local-btn" data-cmd="top -bn1 2>/dev/null | head -15">资源占用 TOP</button>
+                            </div>
+                        </div>
+                        
+                        <!-- 设备控制 -->
+                        <div style="margin-bottom:14px">
+                            <div style="font-size:11px;color:rgba(255,255,255,.4);margin-bottom:6px;padding-left:4px">⚙️ 设备控制</div>
+                            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+                                <button class="chat-local-btn _warn" data-cmd="reboot">重启设备</button>
+                                <button class="chat-local-btn _warn" data-cmd="svc wifi disable && svc wifi enable 2>/dev/null || echo '需要系统权限'">重启网络</button>
+                            </div>
+                        </div>
+                        
+                        <!-- 配置 AI 入口 -->
+                        <div style="text-align:center;padding-top:8px;border-top:1px solid rgba(255,255,255,.1)">
+                            <div style="font-size:11px;color:rgba(255,255,255,.3);margin-bottom:8px">想要 AI 智能分析？</div>
+                            <button class="chat-local-btn _primary" id="local_goto_config_btn" style="width:100%;max-width:200px">🔑 配置 API Key 启用 AI</button>
+                        </div>
+                    </div>
+                    
+                    <!-- 命令输出显示区域 -->
+                    <div class="chat-cmd-output" id="chat_cmd_output" style="display:none;margin:10px;padding:10px;background:rgba(0,0,0,.3);border-radius:8px;font-family:monospace;font-size:11px;color:#94a3b8;max-height:200px;overflow-y:auto;white-space:pre-wrap;word-break:break-all"></div>
+                    
+                    <div class="chat-quick-actions" id="chat_quick_actions" style="display:none">
+                        <button class="chat-quick-btn" data-q="查看系统信息">📊 系统信息</button>
+                        <button class="chat-quick-btn" data-q="清理缓存">🧹 清理缓存</button>
+                        <button class="chat-quick-btn" data-q="查看网络状态">📡 网络状态</button>
+                        <button class="chat-quick-btn" data-q="查看温度">🌡️ 温度信息</button>
+                        <button class="chat-quick-btn" data-q="深度诊断设备问题">🔧 深度诊断</button>
+                        <button class="chat-quick-btn" data-q="生成流量查询命令">📶 查流量</button>
+                        <button class="chat-quick-btn" data-q="检查电池健康状态：读电池电量、电压、温度、循环状态并给出评估">🔋 电池体检</button>
+                        <button class="chat-quick-btn" data-q="分析存储空间：各分区占用、大文件在哪、哪些可以安全清理，直接给出结论">💾 存储分析</button>
+                        <button class="chat-quick-btn" data-q="网络没网了？帮我修复：自己诊断网络状态、找到问题、尝试修复并验证，修好为止">🛠️ 修复网络</button>
+                        <button class="chat-quick-btn" data-q="帮我做一次全面体检并顺手优化：CPU、内存、存储、网络都检查一遍，发现能安全优化的问题就直接处理掉，最后汇报">🩺 全面体检+优化</button>
+                    </div>
+                    <div class="chat-input-area" id="chat_input_area" style="display:none">
+                        <textarea class="chat-input" id="chat_input" placeholder="输入消息，回车发送，Shift+回车换行..." rows="1"></textarea>
+                        <button class="chat-send-btn" id="chat_send_btn">发送</button>
+                    </div>
+                </div>
+            </div><!-- /ai_tab_chat -->
+        `
+        document.body.appendChild(panel)
+
+        // ---- 悬浮按钮 ----
+        var fab = document.createElement('button')
+        fab.id = 'smart_ai_fab'
+        fab.innerHTML = '🤖<span class="fab-badge _0" id="ai_fab_badge"></span>'
+        fab.onclick = function() { toggleAIPanel() }
+        document.body.appendChild(fab)
+
+        // ---- 待执行命令管理 ----
+        var addPendingCommand = function(command, description, reason, category, isSafe) {
+            // 检查是否已存在相同命令（避免重复）
+            for (var i = 0; i < _pendingCommands.length; i++) {
+                if (_pendingCommands[i].command === command && _pendingCommands[i].status === 'pending') {
+                    return // 已存在待执行的相同命令
+                }
+            }
+            var cmd = {
+                id: _cmdIdCounter++,
+                command: command,
+                description: description,
+                reason: reason,
+                category: category || 'system',
+                status: 'pending',
+                isSafe: !!isSafe,
+                result: '',
+                timestamp: Date.now()
+            }
+            _pendingCommands.push(cmd)
+            if (_pendingCommands.length > 50) _pendingCommands.shift()
+            _issuesFound++
+            renderPendingCommands()
+            updateStats()
+
+            // 自动批准安全命令
+            if (_autoApproveSafe && isSafe) {
+                aiLog('安全命令自动批准: ' + description, 'success')
+                setTimeout(function() { executeCommand(cmd.id) }, 500)
+            } else {
+                aiLog('发现待处理问题: ' + reason, 'warn')
+                showToast('AI发现问题: ' + description, 'red', 4000)
+                updateFAB()
+            }
+        }
+
+        var executeCommand = async function(id) {
+            var cmd = null
+            for (var i = 0; i < _pendingCommands.length; i++) {
+                if (_pendingCommands[i].id === id) { cmd = _pendingCommands[i]; break }
+            }
+            if (!cmd || cmd.status !== 'pending') return
+            var _rs = getShell()
+            if (!_rs) { aiLog('Shell不可用，无法执行', 'error'); return }
 
