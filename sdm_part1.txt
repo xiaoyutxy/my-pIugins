@@ -1,4 +1,3 @@
-
 //<script>
 //@@SDM_PLUGIN_ID:a1b2c3@@
 (async () => {
@@ -9,7 +8,7 @@ try {
     let DIAG_LOG = []
     let SCAN_INTERVAL_MS = 10000
     let _isScanning = false
-    const PLUGIN_VERSION = '3.6.9'
+    const PLUGIN_VERSION = '3.7.0'
 
     // ════════════════════════════════════════════════════════════
     // 自有更新推送机制 ★ 改成你自己的 GitHub 仓库 ★
