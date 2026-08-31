@@ -1,6 +1,6 @@
 {
   "rev": "3.7.0",
-  "js": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-pIugins@main/sdm.js",
+  "js": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-pIugins@main/sdm_v370.js",
   "notes": "电池面板美化 + 无电池模式温度面板美化 + 全新桌面悬浮AI宠物 + 组件化增量更新",
   "components_base": "gh/xiaoyutxy/my-pIugins@main/components",
   "components": {
