@@ -1,0 +1,15 @@
+{
+  "rev": "1.0.0",
+  "js": "modules/game-booster/module.js",
+  "changelog": [
+    {
+      "title": "游戏加速与限速 v1.0.0",
+      "items": [
+        "游戏一键加速",
+        "常见游戏支持",
+        "去云控限速器"
+      ]
+    }
+  ],
+  "notes": "游戏加速与限速模块初始版本"
+}

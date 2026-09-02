@@ -1,0 +1,15 @@
+{
+  "rev": "1.0.0",
+  "js": "modules/signal-monitor/module.js",
+  "changelog": [
+    {
+      "title": "5G信号监控 v1.0.0",
+      "items": [
+        "实时信号强度监控",
+        "信号质量评估",
+        "历史数据统计"
+      ]
+    }
+  ],
+  "notes": "5G信号监控模块初始版本"
+}

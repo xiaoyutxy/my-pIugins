@@ -1,0 +1,15 @@
+{
+  "rev": "1.0.0",
+  "js": "modules/device-manager/module.js",
+  "changelog": [
+    {
+      "title": "设备管理器 v1.0.0",
+      "items": [
+        "设备扫描与列表展示",
+        "活动日志记录",
+        "网络诊断工具"
+      ]
+    }
+  ],
+  "notes": "设备管理器模块初始版本"
+}

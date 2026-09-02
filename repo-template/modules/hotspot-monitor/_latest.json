@@ -1,0 +1,15 @@
+{
+  "rev": "1.0.0",
+  "js": "modules/hotspot-monitor/module.js",
+  "changelog": [
+    {
+      "title": "热点流量监控 v1.0.0",
+      "items": [
+        "热点设备列表",
+        "实时流量统计",
+        "设备上下线监控"
+      ]
+    }
+  ],
+  "notes": "热点流量监控模块初始版本"
+}
