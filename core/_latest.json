@@ -1,0 +1,15 @@
+{
+  "rev": "1.0.0",
+  "js": "modules/ai-assistant/module.js",
+  "changelog": [
+    {
+      "title": "AI智能助手 v1.0.0",
+      "items": [
+        "设备自动巡检",
+        "网络状态监控",
+        "AI悬浮球面板"
+      ]
+    }
+  ],
+  "notes": "AI智能助手模块初始版本"
+}
