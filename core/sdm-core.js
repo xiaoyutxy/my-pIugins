@@ -3,19 +3,19 @@
 (async () => {
 try {
     // ════════════════════════════════════════════════════════════
-    //  SDM 模块化核心框架 v1.0.0
+    //  SDM 模块化核心框架 v1.1.0
     //  - 管理5个独立模块的安装/更新/加载
     //  - 每个模块独立版本号，独立从 GitHub 更新
     //  - 安装时自动组合所有已安装模块
     // ════════════════════════════════════════════════════════════
-    const CORE_VERSION = '1.0.0';
+    const CORE_VERSION = '1.1.0';
     const CORE_SIG = '@@SDM_CORE_PLUGIN_ID:sdm-core-modular@@';
 
-    // ─── 你的 GitHub 仓库配置（改这里就行）───
-    const MY_GITHUB_USER = 'your-github-username';   // 改成你的 GitHub 用户名
-    const MY_GITHUB_REPO = 'sdm-modular-plugins';     // 改成你的仓库名
-    const MY_GITHUB_BRANCH = 'main';                   // 分支名
-    // ──────────────────────────────────────────
+    // ─── GitHub 仓库配置 ───
+    const MY_GITHUB_USER = 'xiaoyutxy';
+    const MY_GITHUB_REPO = 'my-pIugins';
+    const MY_GITHUB_BRANCH = 'main';
+    // ──────────────────────
 
     const CDN_ORIGIN = 'cdn.jsdelivr.net';
     const CDN_MIRRORS = ['fastly.jsdelivr.net', 'testingcf.jsdelivr.net', 'cdn.jsdmirror.com', 'jsd.onmicrosoft.cn'];
@@ -36,9 +36,9 @@ try {
     ];
 
     // 全局状态
-    let _installedModules = {};    // { moduleId: version }
-    let _moduleManifests = {};     // { moduleId: manifest }
-    let _moduleLoaded = {};        // { moduleId: true/false }
+    let _installedModules = {};
+    let _moduleVersions = {};       // { moduleId: latestVersion }
+    let _moduleLoaded = {};
     let _bestCdnNode = null;
     let _probeTs = 0;
     let _updating = false;
@@ -63,7 +63,7 @@ try {
         if (_bestCdnNode && Date.now() - _probeTs < 300000) return _bestCdnNode;
         const candidates = [CDN_ORIGIN, ...CDN_MIRRORS];
         const probeOne = async (node) => {
-            const testUrl = `https://${node}/gh/${MY_GITHUB_USER}/${MY_GITHUB_REPO}@${MY_GITHUB_BRANCH}/core/_latest.json?_=${Date.now()}`;
+            const testUrl = `https://${node}/gh/${MY_GITHUB_USER}/${MY_GITHUB_REPO}@${MY_GITHUB_BRANCH}/modules/device-manager.js?_=${Date.now()}`;
             const start = Date.now();
             const r = await _run(`curl -sL --connect-timeout 3 --max-time 5 -w '%{http_code}' -o /dev/null ${_sq(testUrl)}`, 8000).catch(() => ({ content: '0' }));
             return { node, rtt: Date.now() - start, ok: String(r?.content || '').trim() === '200' };
@@ -86,36 +86,45 @@ try {
         await _run(`echo ${_sq(json)} > ${_sq(VERSION_FILE)}`, 2000);
     };
 
-    // ─── 获取模块 manifest（多源取最新）───
-    const _fetchModuleManifest = async (moduleId) => {
+    // ─── 从 JS 文件头部解析版本号 ───
+    const _parseVersionFromCode = (code) => {
+        const match = code.match(/\/\/\s*Version:\s*(\d+\.\d+\.\d+)/i);
+        return match ? match[1] : null;
+    };
+
+    // ─── 获取模块最新版本（下载文件头部解析）───
+    const _fetchModuleVersion = async (moduleId) => {
         const t = Date.now();
-        const jsonFile = `modules/${moduleId}/_latest.json`;
-        const srcs = [RAW_BASE + jsonFile + '?t=' + t];
+        const jsFile = `modules/${moduleId}.js`;
+        const srcs = [RAW_BASE + jsFile + '?t=' + t];
         for (const node of [CDN_ORIGIN, ...CDN_MIRRORS]) {
-            srcs.push(GH_BASE.replace('https://' + CDN_ORIGIN, 'https://' + node) + jsonFile + '?_=' + t);
+            srcs.push(`https://${node}/gh/${MY_GITHUB_USER}/${MY_GITHUB_REPO}@${MY_GITHUB_BRANCH}/${jsFile}?_=${t}`);
         }
+
         const jobs = srcs.map(async (url) => {
-            const tmp = `/data/local/tmp/_sdmm_${moduleId}_${Math.random().toString(36).slice(2,7)}.tmp`;
-            const r = await _run(`curl -sL --fail --connect-timeout 5 --max-time 15 ${_sq(url)} -o ${_sq(tmp)}; ec=$?; [ "$ec" -eq 0 ] && echo __OK__ || echo __FAIL__:$ec`, 20000);
+            const tmp = `/data/local/tmp/_sdmmv_${moduleId}_${Math.random().toString(36).slice(2,7)}.tmp`;
+            // 只下载前 500 字节来检查版本
+            const r = await _run(`curl -sL --fail --connect-timeout 5 --max-time 15 -r 0-499 ${_sq(url)} -o ${_sq(tmp)} 2>/dev/null; ec=$?; [ "$ec" -eq 0 ] && echo __OK__ || echo __FAIL__:$ec`, 20000);
             if (!String(r?.content || '').includes('__OK__')) { await _run(`rm -f ${_sq(tmp)}`, 1000); return null; }
             const rd = await _run(`cat ${_sq(tmp)}`, 3000);
             await _run(`rm -f ${_sq(tmp)}`, 1000);
-            const text = String(rd?.content || '').trim();
-            if (!text || text[0] !== '{') return null;
-            try { const j = JSON.parse(text); return j.rev ? j : null; } catch { return null; }
+            const text = String(rd?.content || '');
+            const ver = _parseVersionFromCode(text);
+            return ver;
         });
+
         const got = await Promise.all(jobs);
-        let best = null;
-        for (const j of got) { if (j && (!best || _cmpVer(j.rev, best.rev) > 0)) best = j; }
-        return best;
+        let bestVer = null;
+        for (const v of got) { if (v && (!bestVer || _cmpVer(v, bestVer) > 0)) bestVer = v; }
+        return bestVer;
     };
 
     // ─── 下载模块 JS 文件 ───
-    const _downloadModule = async (moduleId, manifest) => {
+    const _downloadModule = async (moduleId) => {
         const bestNode = await _probeCdn();
         const nodes = [bestNode, ...CDN_MIRRORS.filter(m => m !== bestNode), CDN_ORIGIN].filter((v, i, a) => a.indexOf(v) === i);
 
-        const jsPath = `modules/${moduleId}/module.js`;
+        const jsPath = `modules/${moduleId}.js`;
         const cdnUrl = `https://${CDN_ORIGIN}/gh/${MY_GITHUB_USER}/${MY_GITHUB_REPO}@${MY_GITHUB_BRANCH}/${jsPath}`;
         const rawUrl = `${RAW_BASE}${jsPath}`;
         const srcList = [...nodes.map(n => cdnUrl.replace(CDN_ORIGIN, n)), rawUrl].filter((v, i, a) => a.indexOf(v) === i);
@@ -124,7 +133,6 @@ try {
         for (const src of srcList) {
             const dlR = await _run(`curl -sL --fail --connect-timeout 8 --max-time 90 ${_sq(src)} -o ${_sq(destFile)}; ec=$?; [ "$ec" -eq 0 ] && echo __OK__ || echo __FAIL__:$ec`, 95000);
             if (String(dlR?.content || '').includes('__OK__')) {
-                // 校验文件大小
                 const chk = await _run(`wc -c < ${_sq(destFile)}`, 2000);
                 const size = parseInt(chk?.content || '0');
                 if (size > 500) return destFile;
@@ -134,9 +142,8 @@ try {
     };
 
     // ─── 安装/更新单个模块 ───
-    const _installModule = async (moduleId, manifest) => {
-        const version = manifest.rev;
-        const jsFile = await _downloadModule(moduleId, manifest);
+    const _installModule = async (moduleId) => {
+        const jsFile = await _downloadModule(moduleId);
         if (!jsFile) throw new Error('模块下载失败');
 
         // 读取并校验模块代码
@@ -153,6 +160,9 @@ try {
         if (!moduleCode.includes(moduleSig)) {
             throw new Error('模块签名校验失败，文件可能被篡改');
         }
+
+        // 从代码中解析版本号
+        const version = _parseVersionFromCode(moduleCode) || '1.0.0';
 
         // 保存版本
         _installedModules[moduleId] = version;
@@ -174,7 +184,6 @@ try {
 
         try {
             const code = new TextDecoder().decode(Uint8Array.from(atob(b64), c => c.charCodeAt(0)));
-            // 在全局作用域执行模块代码
             const fn = new Function('SDM', code);
             fn(window.SDM);
             _moduleLoaded[moduleId] = true;
@@ -185,19 +194,17 @@ try {
         }
     };
 
-    // ─── 卸载模块（从内存中移除UI和状态）───
+    // ─── 卸载模块 ───
     const _unloadModule = async (moduleId) => {
-        // 触发模块卸载事件
         window.SDM?.emit('module:unload', moduleId);
         _moduleLoaded[moduleId] = false;
-        // 删除模块文件
         await _run(`rm -f ${_sq(MODULES_DIR + '/' + moduleId + '.js')}`, 2000);
         delete _installedModules[moduleId];
         await _saveVersions(_installedModules);
     };
 
     // ════════════════════════════════════════════════════════════
-    //  事件总线（模块间通信）
+    //  事件总线
     // ════════════════════════════════════════════════════════════
     const _eventBus = {
         _listeners: {},
@@ -218,27 +225,22 @@ try {
     };
 
     // ════════════════════════════════════════════════════════════
-    //  SDM 全局 API（供模块调用）
+    //  SDM 全局 API
     // ════════════════════════════════════════════════════════════
     window.SDM = {
         version: CORE_VERSION,
         modules: MODULE_DEFS,
         installed: _installedModules,
         loaded: _moduleLoaded,
-        // 事件总线
         on: _eventBus.on.bind(_eventBus),
         off: _eventBus.off.bind(_eventBus),
         emit: _eventBus.emit.bind(_eventBus),
-        // 工具
         runShell: _run,
         wait: _wait,
-        // UI 工具
         toast: (msg, color, dur) => {
             try { if (typeof createToast === 'function') createToast(msg, color || 'green', dur || 2000); } catch(e) {}
         },
-        // 获取模块容器
         getContainer: () => document.getElementById('sdm-modules-container'),
-        // 注册模块 UI 面板
         registerPanel: (moduleId, panelHtml) => {
             const container = document.getElementById('sdm-modules-container');
             if (!container) return;
@@ -263,8 +265,6 @@ try {
         .sdm-core-btn { font-size:.55rem; padding:6px 14px; border-radius:10px; border:1px solid rgba(255,255,255,.15); background:rgba(255,255,255,.06); color:#fff; cursor:pointer; transition:all .2s; }
         .sdm-core-btn:hover { transform:translateY(-1px); background:rgba(255,255,255,.1); }
         .sdm-core-btn.primary { background:linear-gradient(135deg,#a78bfa,#8b5cf6); border-color:rgba(167,139,250,.5); }
-        .sdm-core-btn.success { background:linear-gradient(135deg,#4ade80,#22c55e); border-color:rgba(74,222,128,.5); }
-        .sdm-core-btn.warning { background:linear-gradient(135deg,#fbbf24,#f59e0b); border-color:rgba(251,191,36,.5); color:#1e293b; }
         .sdm-version-badge { display:inline-block; font-size:.45rem; font-weight:bold; color:#fff; background:linear-gradient(135deg,#a78bfa,#f472b6); padding:2px 9px; border-radius:10px; box-shadow:0 1px 6px rgba(244,114,182,.35); border:1px solid rgba(255,214,232,.35); }
         .sdm-modules-grid { display:grid; grid-template-columns:1fr; gap:10px; }
         @media (min-width:500px) { .sdm-modules-grid { grid-template-columns:1fr 1fr; } }
@@ -322,7 +322,6 @@ try {
             <div id="sdm-modules-container"></div>
         `;
 
-        // 插入到页面
         const target = document.querySelector('.functions-container') || document.body;
         if (target.tagName === 'BODY') {
             document.body.appendChild(wrapper);
@@ -330,9 +329,7 @@ try {
             target.insertAdjacentElement('afterend', wrapper);
         }
 
-        // 绑定事件
         document.getElementById('sdm_show_modules').onclick = () => {
-            const btn = document.getElementById('collapse_sdm_modules');
             const collapseEl = document.getElementById('collapse_sdm_modules');
             if (collapseEl.style.height === '0px' || !collapseEl.style.height) {
                 collapseEl.style.height = collapseEl.scrollHeight + 'px';
@@ -355,7 +352,7 @@ try {
 
         grid.innerHTML = MODULE_DEFS.map(m => {
             const installed = _installedModules[m.id];
-            const latest = _moduleManifests[m.id]?.rev;
+            const latest = _moduleVersions[m.id];
             const hasUpdate = installed && latest && _cmpVer(latest, installed) > 0;
             const isInstalled = !!installed;
 
@@ -394,7 +391,6 @@ try {
             `;
         }).join('');
 
-        // 绑定按钮事件
         grid.querySelectorAll('.install-btn').forEach(btn => {
             btn.onclick = () => {
                 const moduleId = btn.dataset.module;
@@ -459,7 +455,6 @@ try {
 
         if (action === 'install' || action === 'update') {
             const steps = [
-                { id: 'manifest', label: '获取版本信息' },
                 { id: 'download', label: '下载模块代码' },
                 { id: 'install', label: action === 'update' ? '更新模块' : '安装模块' },
                 { id: 'load', label: '加载模块' },
@@ -468,17 +463,11 @@ try {
             const flow = _showProgress(`${action === 'update' ? '更新' : '安装'} ${moduleDef.name}`, steps);
 
             try {
-                flow.setStep('manifest', 'running');
-                const manifest = await _fetchModuleManifest(moduleId);
-                if (!manifest) throw new Error('无法获取模块版本信息');
-                _moduleManifests[moduleId] = manifest;
-                flow.setStep('manifest', 'done');
-
                 flow.setStep('download', 'running');
                 flow.setStep('download', 'done');
 
                 flow.setStep('install', 'running');
-                const result = await _installModule(moduleId, manifest);
+                const result = await _installModule(moduleId);
                 flow.setStep('install', 'done');
 
                 flow.setStep('load', 'running');
@@ -518,16 +507,16 @@ try {
 
         const results = await Promise.all(MODULE_DEFS.map(async (m) => {
             try {
-                const manifest = await _fetchModuleManifest(m.id);
-                if (manifest) _moduleManifests[m.id] = manifest;
-                return { id: m.id, manifest };
-            } catch { return { id: m.id, manifest: null }; }
+                const ver = await _fetchModuleVersion(m.id);
+                if (ver) _moduleVersions[m.id] = ver;
+                return { id: m.id, ver };
+            } catch { return { id: m.id, ver: null }; }
         }));
 
         let updateCount = 0;
         results.forEach(r => {
             const installed = _installedModules[r.id];
-            if (installed && r.manifest && _cmpVer(r.manifest.rev, installed) > 0) {
+            if (installed && r.ver && _cmpVer(r.ver, installed) > 0) {
                 updateCount++;
             }
         });
@@ -546,13 +535,9 @@ try {
     //  初始化
     // ════════════════════════════════════════════════════════════
     const _init = async () => {
-        // 读取已安装模块
         _installedModules = await _readVersions();
-
-        // 渲染主 UI
         _renderUI();
 
-        // 加载所有已安装模块
         let loadedCount = 0;
         for (const m of MODULE_DEFS) {
             if (_installedModules[m.id]) {
@@ -563,12 +548,12 @@ try {
 
         _updateInstalledCount();
 
-        // 延迟检查更新（不阻塞初始化）
+        // 延迟检查更新
         setTimeout(async () => {
             for (const m of MODULE_DEFS) {
                 try {
-                    const manifest = await _fetchModuleManifest(m.id);
-                    if (manifest) _moduleManifests[m.id] = manifest;
+                    const ver = await _fetchModuleVersion(m.id);
+                    if (ver) _moduleVersions[m.id] = ver;
                 } catch {}
             }
             _renderModuleCards();
