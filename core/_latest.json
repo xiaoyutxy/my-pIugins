@@ -1,15 +1,1 @@
-{
-  "rev": "1.0.0",
-  "js": "modules/ai-assistant/module.js",
-  "changelog": [
-    {
-      "title": "AI智能助手 v1.0.0",
-      "items": [
-        "设备自动巡检",
-        "网络状态监控",
-        "AI悬浮球面板"
-      ]
-    }
-  ],
-  "notes": "AI智能助手模块初始版本"
-}
+{"version":"4.0.0","changelog":[{"title":"模块化架构重构","items":["拆分为1个核心+5个独立模块","支持单独更新每个模块","一键安装所有模块","Sakura Dream二次元主题完整保留"]}]}
