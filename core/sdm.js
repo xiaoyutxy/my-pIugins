@@ -479,24 +479,29 @@ try {
 html.sdm-no-fx #IFRAME_SMART,html.sdm-no-fx #IFRAME_SMART *:not(.sdm-check-btn):not(.sdm-btn-icon-wrap):not(.sdm-btn-icon):not(.sdm-deco-1):not(.sdm-deco-2):not(.sdm-update-tip):not(.sdm-update-badge),html.sdm-no-fx #IFRAME_SMART *:not(.sdm-check-btn):not(.sdm-btn-icon-wrap):not(.sdm-btn-icon):not(.sdm-deco-1):not(.sdm-deco-2):not(.sdm-update-tip):not(.sdm-update-badge)::before,html.sdm-no-fx #IFRAME_SMART *:not(.sdm-check-btn):not(.sdm-btn-icon-wrap):not(.sdm-btn-icon):not(.sdm-deco-1):not(.sdm-deco-2):not(.sdm-update-tip):not(.sdm-update-badge)::after{animation-duration:1ms !important;animation-delay:0s !important;animation-iteration-count:1 !important;transition-duration:1ms !important;transition-delay:0s !important}
 html.sdm-no-fx #smart_fx_toggle{background:linear-gradient(135deg,#64748b,#475569,#334155) !important;box-shadow:none !important}
 html.sdm-no-fx .sdm-check-btn.loading .sdm-btn-icon{animation:sdm_spin 1s linear infinite !important}
-.sdm-mod-grid{display:grid;grid-template-columns:1fr;gap:10px}
+.sdm-mod-grid{display:grid;grid-template-columns:1fr;gap:12px}
 @media(min-width:500px){.sdm-mod-grid{grid-template-columns:1fr 1fr}}
-.sdm-mod-card{background:linear-gradient(135deg,rgba(255,255,255,.04),rgba(255,255,255,.02));border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:12px;transition:all .25s;position:relative;overflow:hidden}
-.sdm-mod-card:hover{border-color:rgba(255,255,255,.2);transform:translateY(-2px)}
-.sdm-mod-card .micon{width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:1.3rem;margin-bottom:8px}
-.sdm-mod-card .mname{font-size:.65rem;font-weight:700;color:#fff;margin-bottom:4px}
-.sdm-mod-card .mdesc{font-size:.5rem;color:#94a3b8;line-height:1.5;margin-bottom:10px;min-height:32px}
-.sdm-mod-card .mstat{display:flex;align-items:center;justify-content:space-between}
-.sdm-mod-card .mver{font-size:.45rem;color:#64748b}
+.sdm-mod-card{background:linear-gradient(135deg,rgba(255,255,255,.05),rgba(255,255,255,.02));border:1px solid rgba(255,255,255,.12);border-radius:16px;padding:14px;transition:all .25s cubic-bezier(.34,1.56,.64,1);position:relative;overflow:hidden}
+.sdm-mod-card:hover{border-color:rgba(255,255,255,.25);transform:translateY(-3px);box-shadow:0 8px 24px rgba(0,0,0,.2)}
+.sdm-mod-card.has-update{border-color:rgba(251,191,36,.5);background:linear-gradient(135deg,rgba(251,191,36,.1),rgba(245,158,11,.05));animation:sdm_ring_pulse 2.5s ease-out infinite}
+.sdm-mod-card.installed{border-color:rgba(74,222,128,.3)}
+.sdm-mod-card .micon{width:48px;height:48px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:1.4rem;margin-bottom:10px;box-shadow:0 2px 10px rgba(0,0,0,.2)}
+.sdm-mod-card .mname{font-size:.68rem;font-weight:700;color:#fff;margin-bottom:5px;display:flex;align-items:center;gap:6px}
+.sdm-mod-card .mdesc{font-size:.5rem;color:#94a3b8;line-height:1.5;margin-bottom:10px;min-height:30px}
+.sdm-mod-card .mver-row{margin-bottom:10px;padding:6px 10px;border-radius:10px;background:rgba(0,0,0,.2);border:1px solid rgba(255,255,255,.05)}
+.sdm-mod-card .mbtn-row{display:flex;gap:6px}
+.sdm-mod-card .mver{font-size:.48rem;color:#94a3b8}
 .sdm-mod-card .mver.installed{color:#86efac}
-.sdm-mod-card .mbtn{font-size:.5rem;padding:4px 12px;border-radius:8px;border:none;cursor:pointer;font-weight:600;transition:all .2s}
-.sdm-mod-card .mbtn.install{background:linear-gradient(135deg,#4ade80,#22c55e);color:#052e16}
-.sdm-mod-card .mbtn.update{background:linear-gradient(135deg,#fbbf24,#f59e0b);color:#422006;animation:sdm_ring_pulse 2s ease-in-out infinite}
-.sdm-mod-card .mbtn.uninstall{background:rgba(248,113,113,.2);color:#fca5a5;border:1px solid rgba(248,113,113,.3)}
-.sdm-mod-card .mbtn:hover{transform:scale(1.05)}
-.sdm-mod-card .mbadge{position:absolute;top:8px;right:8px;font-size:.4rem;padding:2px 8px;border-radius:8px;font-weight:600}
-.sdm-mod-card .mbadge.installed{background:rgba(74,222,128,.2);color:#86efac}
-.sdm-mod-card .mbadge.update{background:rgba(251,191,36,.2);color:#fbbf24;animation:sdm_ring_pulse 2s ease-in-out infinite}
+.sdm-mod-card .mbtn{font-size:.52rem;padding:6px 14px;border-radius:10px;border:none;cursor:pointer;font-weight:600;transition:all .2s;flex:1;text-align:center}
+.sdm-mod-card .mbtn.install{background:linear-gradient(135deg,#4ade80,#22c55e);color:#052e16;box-shadow:0 2px 10px rgba(34,197,94,.35)}
+.sdm-mod-card .mbtn.update{background:linear-gradient(135deg,#fbbf24,#f59e0b);color:#422006;box-shadow:0 2px 10px rgba(251,191,36,.4);animation:sdm_ring_pulse 2s ease-in-out infinite}
+.sdm-mod-card .mbtn.uninstall{background:rgba(248,113,113,.15);color:#fca5a5;border:1px solid rgba(248,113,113,.3)}
+.sdm-mod-card .mbtn:hover{transform:scale(1.04)}
+.sdm-mod-card .mbtn:active{transform:scale(.96)}
+.sdm-mod-card .mbadge{position:absolute;top:10px;right:10px;font-size:.42rem;padding:3px 10px;border-radius:10px;font-weight:600;letter-spacing:.3px}
+.sdm-mod-card .mbadge.installed{background:rgba(74,222,128,.18);color:#86efac;border:1px solid rgba(74,222,128,.3)}
+.sdm-mod-card .mbadge.update{background:rgba(251,191,36,.2);color:#fbbf24;border:1px solid rgba(251,191,36,.4);animation:sdm_ring_pulse 2s ease-in-out infinite}
+.sdm-mod-card .mbadge.new{background:rgba(96,165,250,.18);color:#60a5fa;border:1px solid rgba(96,165,250,.35)}
 .sdm-progress-mask{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);z-index:999999;display:flex;align-items:center;justify-content:center}
 .sdm-progress-box{width:88vw;max-width:340px;background:linear-gradient(135deg,rgba(20,18,35,.97),rgba(35,28,55,.97));border:1px solid rgba(196,132,252,.4);border-radius:16px;padding:16px;color:#fff}
 .sdm-progress-box .ptitle{font-size:.7rem;font-weight:700;margin-bottom:10px}
@@ -534,27 +539,22 @@ html.sdm-no-fx .sdm-check-btn.loading .sdm-btn-icon{animation:sdm_spin 1s linear
         </div>
         <div class="collapse" id="collapse_SMART" data-name="close" style="height:0px;overflow:hidden;">
         <div class="collapse_box">
-            <div class="sdm2-card" style="padding:14px;margin-bottom:10px;border-radius:18px;background:linear-gradient(135deg,rgba(167,139,250,.1),rgba(244,114,182,.06),rgba(125,211,252,.06));border:1px solid rgba(167,139,250,.2);">
+            <div class="sdm2-card" style="padding:14px;margin-bottom:10px;border-radius:18px;background:linear-gradient(135deg,rgba(167,139,250,.12),rgba(244,114,182,.08),rgba(125,211,252,.08));border:1px solid rgba(167,139,250,.25);">
                 <span class="sdm2-deco d1">📦</span><span class="sdm2-deco d2">✨</span><span class="sdm2-paw">🐾</span>
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:6px;">
-                    <div style="display:flex;align-items:center;gap:8px;">
-                        <div style="width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,#a78bfa,#c084fc,#f472b6);display:flex;align-items:center;justify-content:center;font-size:1.1rem;box-shadow:0 2px 14px rgba(167,139,250,.5);animation:sdm2_pet_dance 3s ease-in-out infinite;">🧩</div>
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
+                    <div style="display:flex;align-items:center;gap:10px;">
+                        <div style="width:46px;height:46px;border-radius:50%;background:linear-gradient(135deg,#a78bfa,#c084fc,#f472b6,#fb7185);background-size:200% 100%;animation:sdm2_rainbow_flow 4s linear infinite;display:flex;align-items:center;justify-content:center;font-size:1.3rem;box-shadow:0 3px 18px rgba(167,139,250,.5),0 0 24px rgba(244,114,182,.3);">🧩</div>
                         <div>
-                            <div style="font-size:.7rem;" class="smart-grad-text sdm2-title-glow">智能设备管理器模块安装中心</div>
-                            <div style="font-size:.5rem;opacity:.5;">已安装 <span id="sdm_installed_count">0</span>/5 个模块 <span class="sdm2-chip-star">🌟</span></div>
+                            <div style="font-size:.75rem;font-weight:bold;" class="smart-grad-text sdm2-title-glow">智能设备管理器模块安装中心</div>
+                            <div style="font-size:.5rem;opacity:.6;margin-top:2px;">已安装 <span id="sdm_installed_count" style="color:#86efac;font-weight:bold;">0</span>/5 · 可更新 <span id="sdm_update_count" style="color:#fbbf24;font-weight:bold;">0</span> 个 <span class="sdm2-chip-star">🌟</span></div>
                         </div>
                     </div>
                     <div style="display:flex;gap:6px;flex-wrap:wrap;">
-                        <button class="smart_action_btn" id="sdm_install_all" style="${_bs}background:linear-gradient(135deg,#4ade80,#22c55e,#16a34a);font-size:.5rem;padding:6px 14px;box-shadow:0 2px 12px rgba(74,222,128,.35);">⚡ 一键安装模块</button>
-                        <button class="smart_action_btn" id="sdm_check_all_updates" style="${_bs}background:linear-gradient(135deg,#fbbf24,#f59e0b);font-size:.5rem;padding:6px 14px;box-shadow:0 2px 12px rgba(251,191,36,.35);">🔄 检查更新</button>
-                        <button class="smart_action_btn" id="sdm_show_modules" style="${_bs}background:linear-gradient(135deg,#a78bfa,#8b5cf6);font-size:.5rem;padding:6px 14px;box-shadow:0 2px 12px rgba(167,139,250,.35);">📦 模块管理</button>
+                        <button class="smart_action_btn" id="sdm_install_all_top" style="${_bs}background:linear-gradient(135deg,#4ade80,#22c55e,#16a34a);font-size:.5rem;padding:7px 16px;box-shadow:0 3px 14px rgba(74,222,128,.4);">⚡ 一键安装全部</button>
+                        <button class="smart_action_btn" id="sdm_check_all_updates_top" style="${_bs}background:linear-gradient(135deg,#fbbf24,#f59e0b);font-size:.5rem;padding:7px 16px;box-shadow:0 3px 14px rgba(251,191,36,.4);">🔄 检查更新</button>
                     </div>
                 </div>
-                <div class="collapse" id="collapse_sdm_modules" data-name="close" style="height:0px;overflow:hidden;">
-                    <div class="collapse_box">
-                        <div class="sdm-mod-grid" id="sdm_modules_grid"></div>
-                    </div>
-                </div>
+                <div class="sdm-mod-grid" id="sdm_modules_grid"></div>
             </div>
             <div id="sdm-modules-container"></div>
             <div class="sdm2-card" style="padding:14px;margin-bottom:10px;border-radius:18px;background:linear-gradient(135deg,rgba(192,132,252,.05),rgba(255,158,205,.04));border:1px solid rgba(192,132,252,.14);">
@@ -688,25 +688,39 @@ html.sdm-no-fx .sdm-check-btn.loading .sdm-btn-icon{animation:sdm_spin 1s linear
     const _renderModuleCards = () => {
         const grid = document.getElementById('sdm_modules_grid');
         if (!grid) return;
+        let updateCount = 0;
         grid.innerHTML = MODULE_DEFS.map(m => {
             const installed = _installedModules[m.id];
             const latest = _moduleVersions[m.id];
             const hasUpdate = installed && latest && _cmpVer(latest, installed) > 0;
+            if (hasUpdate) updateCount++;
             const isInstalled = !!installed;
-            let badgeHtml = '', btnHtml = '', verHtml = '';
+            let badgeHtml = '', btnHtml = '', verHtml = '', statusClass = '';
             if (isInstalled) {
-                verHtml = `<span class="mver installed">v${installed}</span>`;
-                if (hasUpdate) { badgeHtml = `<span class="mbadge update">可更新 v${latest}</span>`; btnHtml = `<button class="mbtn update" data-module="${m.id}" data-action="update">更新</button>`; }
-                else { badgeHtml = `<span class="mbadge installed">已安装</span>`; btnHtml = `<button class="mbtn uninstall" data-module="${m.id}" data-action="uninstall">卸载</button>`; }
+                if (hasUpdate) {
+                    statusClass = 'has-update';
+                    badgeHtml = `<span class="mbadge update">🆕 可更新 v${latest}</span>`;
+                    verHtml = `<span class="mver">当前 v${installed} → <span style="color:#fbbf24;">v${latest}</span></span>`;
+                    btnHtml = `<button class="mbtn update" data-module="${m.id}" data-action="update">⬆️ 更新模块</button>`;
+                } else {
+                    statusClass = 'installed';
+                    badgeHtml = `<span class="mbadge installed">✅ 已安装</span>`;
+                    verHtml = `<span class="mver installed">v${installed} · 最新</span>`;
+                    btnHtml = `<button class="mbtn uninstall" data-module="${m.id}" data-action="uninstall">🗑️ 卸载</button>`;
+                }
             } else {
-                verHtml = `<span class="mver">${latest ? '最新 v'+latest : '未安装'}</span>`;
-                btnHtml = `<button class="mbtn install" data-module="${m.id}" data-action="install">安装</button>`;
+                statusClass = 'not-installed';
+                badgeHtml = `<span class="mbadge new">📦 新模块</span>`;
+                verHtml = `<span class="mver">${latest ? '最新 v'+latest : '点击安装'}</span>`;
+                btnHtml = `<button class="mbtn install" data-module="${m.id}" data-action="install">📥 安装模块</button>`;
             }
-            return `<div class="sdm-mod-card sdm-fade-in">${badgeHtml}<div class="micon" style="background:${m.color}22;">${m.icon}</div><div class="mname">${m.name}</div><div class="mdesc">${m.desc}</div><div class="mstat">${verHtml}${btnHtml}</div></div>`;
+            return `<div class="sdm-mod-card sdm-fade-in ${statusClass}">${badgeHtml}<div class="micon" style="background:${m.color}22;">${m.icon}</div><div class="mname">${m.name}</div><div class="mdesc">${m.desc}</div><div class="mver-row">${verHtml}</div><div class="mbtn-row">${btnHtml}</div></div>`;
         }).join('');
         grid.querySelectorAll('.mbtn').forEach(btn => {
             btn.onclick = () => _handleModuleAction(btn.dataset.module, btn.dataset.action);
         });
+        const uEl = document.getElementById('sdm_update_count');
+        if (uEl) uEl.textContent = updateCount;
     };
 
     const _updateInstalledCount = () => {
@@ -864,17 +878,10 @@ html.sdm-no-fx .sdm-check-btn.loading .sdm-btn-icon{animation:sdm_spin 1s linear
     }
 
     // ─── 按钮绑定 ───
-    const installAllBtn = document.getElementById('sdm_install_all');
+    const installAllBtn = document.getElementById('sdm_install_all_top');
     if (installAllBtn) installAllBtn.onclick = _installAllModules;
-    const checkAllBtn = document.getElementById('sdm_check_all_updates');
+    const checkAllBtn = document.getElementById('sdm_check_all_updates_top');
     if (checkAllBtn) checkAllBtn.onclick = _checkAllUpdates;
-    const showModulesBtn = document.getElementById('sdm_show_modules');
-    if (showModulesBtn) showModulesBtn.onclick = () => {
-        const el = document.getElementById('collapse_sdm_modules');
-        if (!el) return;
-        if (el.style.height === '0px' || !el.style.height) { el.style.height = el.scrollHeight + 'px'; el.dataset.name = 'open'; }
-        else { el.style.height = '0px'; el.dataset.name = 'close'; }
-    };
 
     // ════════════════════════════════════════════════════════════
     //  初始化
