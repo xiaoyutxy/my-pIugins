@@ -64,7 +64,7 @@ try {
         const ts = new Date().toLocaleTimeString();
         ACTIVITY_LOG.unshift('[' + ts + '] ' + msg);
         if (ACTIVITY_LOG.length > 200) ACTIVITY_LOG.pop();
-        const el = getCachedEl('#smart_log_area');
+        const el = document.querySelector('#smart_log_area');
         if (el) el.value = ACTIVITY_LOG.join('\n');
     };
     const addDiagLog = (msg, type) => {
@@ -72,7 +72,7 @@ try {
         const prefix = type === 'error' ? '❌ ' : type === 'success' ? '✅ ' : type === 'net' ? '📡 ' : type === 'warn' ? '⚠️ ' : 'ℹ️ ';
         DIAG_LOG.unshift('[' + ts + '] ' + prefix + msg);
         if (DIAG_LOG.length > 200) DIAG_LOG.pop();
-        const el = getCachedEl('#smart_diag_log');
+        const el = document.querySelector('#smart_diag_log');
         if (el) el.value = DIAG_LOG.join('\n');
     };
 
@@ -341,8 +341,6 @@ try {
     window.SDM = {
         version: PLUGIN_VERSION,
         modules: MODULE_DEFS,
-        installed: _installedModules,
-        loaded: _moduleLoaded,
         on: _eventBus.on.bind(_eventBus),
         off: _eventBus.off.bind(_eventBus),
         emit: _eventBus.emit.bind(_eventBus),
@@ -374,6 +372,9 @@ try {
         getUFIData: () => { try { return getUFIData(); } catch { return null; } },
         GH: { user: MY_GITHUB_USER, repo: MY_GITHUB_REPO, branch: MY_GITHUB_BRANCH }
     };
+    // 使用 getter 确保始终返回最新引用
+    Object.defineProperty(window.SDM, 'installed', { get: () => _installedModules });
+    Object.defineProperty(window.SDM, 'loaded', { get: () => _moduleLoaded });
 
     // ════════════════════════════════════════════════════════════
     //  CSS · Sakura Dream 主题
@@ -503,6 +504,12 @@ html.sdm-no-fx .sdm-check-btn.loading .sdm-btn-icon{animation:sdm_spin 1s linear
 .sdm-mod-card .mbadge.update{background:rgba(251,191,36,.2);color:#fbbf24;border:1px solid rgba(251,191,36,.4);animation:sdm_ring_pulse 2s ease-in-out infinite}
 .sdm-mod-card .mbadge.new{background:rgba(96,165,250,.18);color:#60a5fa;border:1px solid rgba(96,165,250,.35)}
 .sdm-progress-mask{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);z-index:999999;display:flex;align-items:center;justify-content:center}
+.sdm-modal-mask{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.65);z-index:999998;display:flex;align-items:center;justify-content:center;padding:20px;box-sizing:border-box}
+.sdm-modal-box{width:100%;max-width:420px;background:linear-gradient(135deg,rgba(20,18,35,.98),rgba(35,28,55,.98));border:1px solid rgba(196,132,252,.4);border-radius:20px;overflow:hidden;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.sdm-modal-header{padding:14px 16px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid rgba(196,132,252,.2);background:linear-gradient(135deg,rgba(167,139,250,.1),rgba(244,114,182,.06))}
+.sdm-modal-close{font-size:.65rem;color:#94a3b8;cursor:pointer;width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,.06);transition:all .2s}
+.sdm-modal-close:hover{background:rgba(248,113,113,.2);color:#f87171}
+.sdm-modal-body{padding:14px;overflow-y:auto;flex:1}
 .sdm-progress-box{width:88vw;max-width:340px;background:linear-gradient(135deg,rgba(20,18,35,.97),rgba(35,28,55,.97));border:1px solid rgba(196,132,252,.4);border-radius:16px;padding:16px;color:#fff}
 .sdm-progress-box .ptitle{font-size:.7rem;font-weight:700;margin-bottom:10px}
 .sdm-progress-step{display:flex;align-items:center;gap:8px;padding:4px 0;font-size:.55rem}
@@ -535,63 +542,13 @@ html.sdm-no-fx .sdm-check-btn.loading .sdm-btn-icon{animation:sdm_spin 1s linear
             </span>
             <span id="smart_author_display" style="display:none;font-size:.4rem;margin-left:4px;background:linear-gradient(135deg,#a78bfa,#ec4899);color:white;padding:2px 8px;border-radius:8px;font-weight:bold;">✨ 小宇同学</span>
             <span id="smart_fx_toggle" title="一键关闭本插件所有动画特效（卡顿时用）" style="display:inline-block;font-size:.5rem;font-weight:bold;color:white;cursor:pointer;margin-left:6px;background:linear-gradient(135deg,#a78bfa,#818cf8,#60a5fa);padding:4px 14px;border-radius:14px;border:1px solid rgba(196,181,253,.55);box-shadow:0 2px 12px rgba(129,140,248,.4),0 0 16px rgba(167,139,250,.3);transition:all .25s;">✨ 特效开</span>
+            <span id="sdm_module_mgr_btn" style="display:inline-block;font-size:.5rem;font-weight:bold;color:white;cursor:pointer;margin-left:6px;background:linear-gradient(135deg,#a78bfa,#f472b6);padding:4px 14px;border-radius:14px;border:1px solid rgba(255,182,193,.5);box-shadow:0 2px 12px rgba(236,72,153,.4);transition:all .25s;">🧩 模块管理</span>
             <span id="sdm_toggle_btn" style="display:inline-block;font-size:.5rem;font-weight:bold;color:white;cursor:pointer;margin-left:6px;background:linear-gradient(135deg,#f472b6,#ec4899);padding:4px 14px;border-radius:14px;border:1px solid rgba(255,182,193,.5);box-shadow:0 2px 12px rgba(236,72,153,.4);transition:all .25s;">⬇️ 展开</span>
             <div style="display:inline-block;" id="collapse_SMART_btn"></div>
         </div>
         <div class="collapse" id="collapse_SMART" data-name="open" style="height:auto;overflow:visible;">
         <div class="collapse_box">
-            <div class="sdm2-card" style="padding:14px;margin-bottom:10px;border-radius:18px;background:linear-gradient(135deg,rgba(167,139,250,.12),rgba(244,114,182,.08),rgba(125,211,252,.08));border:1px solid rgba(167,139,250,.25);">
-                <span class="sdm2-deco d1">📦</span><span class="sdm2-deco d2">✨</span><span class="sdm2-paw">🐾</span>
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;flex-wrap:wrap;gap:8px;">
-                    <div style="display:flex;align-items:center;gap:10px;">
-                        <div style="width:46px;height:46px;border-radius:50%;background:linear-gradient(135deg,#a78bfa,#c084fc,#f472b6,#fb7185);background-size:200% 100%;animation:sdm2_rainbow_flow 4s linear infinite;display:flex;align-items:center;justify-content:center;font-size:1.3rem;box-shadow:0 3px 18px rgba(167,139,250,.5),0 0 24px rgba(244,114,182,.3);">🧩</div>
-                        <div>
-                            <div style="font-size:.75rem;font-weight:bold;" class="smart-grad-text sdm2-title-glow">智能设备管理器模块安装中心</div>
-                            <div style="font-size:.5rem;opacity:.6;margin-top:2px;">已安装 <span id="sdm_installed_count" style="color:#86efac;font-weight:bold;">0</span>/5 · 可更新 <span id="sdm_update_count" style="color:#fbbf24;font-weight:bold;">0</span> 个 <span class="sdm2-chip-star">🌟</span></div>
-                        </div>
-                    </div>
-                    <div style="display:flex;gap:6px;flex-wrap:wrap;">
-                        <button class="smart_action_btn" id="sdm_install_all_top" style="${_bs}background:linear-gradient(135deg,#4ade80,#22c55e,#16a34a);font-size:.5rem;padding:7px 16px;box-shadow:0 3px 14px rgba(74,222,128,.4);">⚡ 一键安装全部</button>
-                        <button class="smart_action_btn" id="sdm_check_all_updates_top" style="${_bs}background:linear-gradient(135deg,#fbbf24,#f59e0b);font-size:.5rem;padding:7px 16px;box-shadow:0 3px 14px rgba(251,191,36,.4);">🔄 检查更新</button>
-                    </div>
-                </div>
-                <div class="sdm-mod-grid" id="sdm_modules_grid"></div>
-            </div>
             <div id="sdm-modules-container"></div>
-            <div class="sdm2-card" style="padding:14px;margin-bottom:10px;border-radius:18px;background:linear-gradient(135deg,rgba(192,132,252,.05),rgba(255,158,205,.04));border:1px solid rgba(192,132,252,.14);">
-                <span class="sdm2-deco d1">⭐</span><span class="sdm2-deco d3">✨</span>
-                <div class="title" style="font-size:.7rem;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
-                    <span class="smart-grad-text sdm2-title-glow">📜 活动日志</span>
-                    <button style="${_bs}background:linear-gradient(135deg,#fb7185,#f43f5e);font-size:.45rem;padding:3px 10px;box-shadow:0 2px 10px rgba(244,63,94,.35);" id="smart_clear_log">清空</button>
-                </div>
-                <textarea id="smart_log_area" disabled style="font-size:.5rem !important;border:none;padding:8px;margin:0;width:100%;height:120px;border-radius:12px;overflow-x:hidden;background:linear-gradient(135deg,rgba(20,12,28,.55),rgba(30,18,44,.45));color:rgba(255,214,232,.7);border:1px solid rgba(192,132,252,.2);" placeholder="暂无日志 ✨"></textarea>
-            </div>
-            <div class="sdm2-card" style="padding:14px;border-radius:18px;margin-bottom:10px;border:1px solid rgba(255,158,205,.2);background:linear-gradient(135deg,rgba(255,158,205,.07),rgba(196,79,196,.05),rgba(192,132,252,.05));">
-                <span class="sdm2-deco d1">💫</span><span class="sdm2-deco d2">📊</span><span class="sdm2-paw">🐱</span>
-                <div class="title" style="font-size:.7rem;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
-                    <span class="smart-grad-text sdm2-title-glow">📊 网络诊断日志</span>
-                    <button id="smart_clear_diaglog" style="font-size:.45rem;padding:3px 10px;${_bs}background:linear-gradient(135deg,#fb7185,#f43f5e);box-shadow:0 2px 10px rgba(244,63,94,.35);">清空</button>
-                </div>
-                <textarea id="smart_diag_log" disabled style="font-size:.5rem !important;border:none;padding:8px;margin:0;width:100%;height:100px;border-radius:12px;overflow-x:hidden;background:linear-gradient(135deg,rgba(20,12,28,.55),rgba(30,18,44,.45));color:rgba(255,214,232,.7);border:1px solid rgba(255,158,205,.18);" placeholder="暂无诊断日志 ✨"></textarea>
-            </div>
-            <div class="sdm2-card" style="padding:14px;border-radius:18px;margin-bottom:10px;border:1px solid rgba(125,211,252,.2);background:linear-gradient(135deg,rgba(125,211,252,.07),rgba(192,132,252,.05),rgba(255,158,205,.04));">
-                <span class="sdm2-deco d1">📝</span><span class="sdm2-deco d2">🌟</span><span class="sdm2-deco d3">🎀</span>
-                <div class="title" style="font-size:.7rem;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;">
-                    <span class="smart-grad-text sdm2-title-glow">📝 插件讲解</span>
-                </div>
-                <div style="padding:16px 12px;font-size:.6rem;line-height:1.8;color:rgba(255,255,255,.78);text-align:center;">
-                    <div style="font-size:.65rem;font-weight:bold;margin-bottom:10px;background:linear-gradient(135deg,#7dd3fc,#c084fc,#ff9ecd);background-size:200% 100%;animation:sdm2_rainbow_flow 5s linear infinite;-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;">📖 插件简介</div>
-                    <div style="margin-bottom:12px;">本插件制作于小宇同学 <span class="sdm2-chip-star">✨</span></div>
-                    <div style="padding:10px 14px;border-radius:12px;background:rgba(192,132,252,.09);border:1px solid rgba(192,132,252,.18);margin-bottom:10px;">
-                        <div style="font-size:.55rem;opacity:.6;margin-bottom:4px;">联系方式</div>
-                        <div style="font-size:.6rem;font-weight:bold;color:#c084fc;">QQ：1085465022</div>
-                        <div style="font-size:.5rem;opacity:.5;margin-top:4px;">有问题QQ联系</div>
-                    </div>
-                    <div style="font-size:.5rem;opacity:.5;">(っ｡´ω｡)っ 感谢使用本插件 ✨</div>
-                </div>
-            </div>
-            <div id="SMART_action_box" style="margin-bottom:10px;display:flex;gap:8px;flex-wrap:wrap"></div>
-            <div style="margin-top:8px;text-align:right;font-size:.45rem;opacity:.75;">Smart Device Manager <span style="opacity:.6;">QQ 1085465022</span> <span class="sdm2-chip-star">🌸</span></div>
         </div>
         </div>
     </div>`;
@@ -718,15 +675,63 @@ html.sdm-no-fx .sdm-check-btn.loading .sdm-btn-icon{animation:sdm_spin 1s linear
         };
     }
 
-    // ─── 清空日志按钮 ───
-    var clearLogBtn = document.querySelector('#smart_clear_log');
-    if (clearLogBtn) clearLogBtn.onclick = function() { ACTIVITY_LOG = []; var el = document.querySelector('#smart_log_area'); if (el) el.value = ''; };
-    var clearDiagBtn = document.querySelector('#smart_clear_diaglog');
-    if (clearDiagBtn) clearDiagBtn.onclick = function() { DIAG_LOG = []; var el = document.querySelector('#smart_diag_log'); if (el) el.value = ''; };
+    // ─── 清空日志按钮（由模块提供，核心不绑定） ───
 
     // ════════════════════════════════════════════════════════════
-    //  模块管理 UI
+    //  模块管理弹窗 UI
     // ════════════════════════════════════════════════════════════
+    let _moduleModal = null;
+
+    const _openModuleManager = () => {
+        if (_moduleModal) { _moduleModal.style.display = 'flex'; _renderModuleCards(); return; }
+        const mask = document.createElement('div');
+        mask.className = 'sdm-modal-mask';
+        mask.innerHTML = `
+            <div class="sdm-modal-box sdm-fade-in">
+                <div class="sdm-modal-header">
+                    <div style="display:flex;align-items:center;gap:10px;">
+                        <div style="width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,#a78bfa,#c084fc,#f472b6,#fb7185);background-size:200% 100%;animation:sdm2_rainbow_flow 4s linear infinite;display:flex;align-items:center;justify-content:center;font-size:1.1rem;box-shadow:0 2px 12px rgba(167,139,250,.4);">🧩</div>
+                        <div>
+                            <div style="font-size:.72rem;font-weight:bold;" class="smart-grad-text sdm2-title-glow">智能设备管理器模块安装中心</div>
+                            <div style="font-size:.45rem;opacity:.6;margin-top:2px;">已安装 <span id="sdm_installed_count" style="color:#86efac;font-weight:bold;">0</span>/5 · 可更新 <span id="sdm_update_count" style="color:#fbbf24;font-weight:bold;">0</span> 个</div>
+                        </div>
+                    </div>
+                    <span class="sdm-modal-close" id="sdm_modal_close">✕</span>
+                </div>
+                <div class="sdm-modal-body">
+                    <div style="display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap;">
+                        <button class="smart_action_btn" id="sdm_install_all_modal" style="flex:1;min-width:100px;${_bs}background:linear-gradient(135deg,#4ade80,#22c55e,#16a34a);font-size:.5rem;padding:7px 12px;box-shadow:0 2px 10px rgba(74,222,128,.4);">⚡ 一键安装全部</button>
+                        <button class="smart_action_btn" id="sdm_check_all_modal" style="flex:1;min-width:100px;${_bs}background:linear-gradient(135deg,#fbbf24,#f59e0b);font-size:.5rem;padding:7px 12px;box-shadow:0 2px 10px rgba(251,191,36,.4);">🔄 检查更新</button>
+                    </div>
+                    <div class="sdm-mod-grid" id="sdm_modules_grid"></div>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(mask);
+        _moduleModal = mask;
+
+        // 关闭按钮
+        mask.querySelector('#sdm_modal_close').onclick = () => { mask.style.display = 'none'; };
+        mask.onclick = (e) => { if (e.target === mask) mask.style.display = 'none'; };
+
+        // 按钮绑定
+        mask.querySelector('#sdm_install_all_modal').onclick = async () => {
+            await _installAllModules();
+            _renderModuleCards();
+        };
+        mask.querySelector('#sdm_check_all_modal').onclick = async () => {
+            await _checkAllUpdates();
+            _renderModuleCards();
+        };
+
+        _renderModuleCards();
+        _updateInstalledCount();
+    };
+
+    // 模块管理按钮绑定
+    const mgrBtn = document.getElementById('sdm_module_mgr_btn');
+    if (mgrBtn) mgrBtn.onclick = _openModuleManager;
+
     const _renderModuleCards = () => {
         const grid = document.getElementById('sdm_modules_grid');
         if (!grid) return;
@@ -919,19 +924,27 @@ html.sdm-no-fx .sdm-check-btn.loading .sdm-btn-icon{animation:sdm_spin 1s linear
         });
     }
 
-    // ─── 按钮绑定 ───
-    const installAllBtn = document.getElementById('sdm_install_all_top');
-    if (installAllBtn) installAllBtn.onclick = _installAllModules;
-    const checkAllBtn = document.getElementById('sdm_check_all_updates_top');
-    if (checkAllBtn) checkAllBtn.onclick = _checkAllUpdates;
+    // ─── 按钮绑定（模块管理弹窗内的按钮在弹窗创建时绑定） ───
 
     // ════════════════════════════════════════════════════════════
     //  初始化
     // ════════════════════════════════════════════════════════════
     const _init = async () => {
         _installedModules = await _readVersions();
-        _renderModuleCards();
-        _updateInstalledCount();
+
+        // 校验：版本记录存在但文件不存在的模块，从已安装列表中移除
+        let cleaned = false;
+        for (const m of MODULE_DEFS) {
+            if (_installedModules[m.id]) {
+                const jsFile = `${MODULES_DIR}/${m.id}.js`;
+                const chk = await _run(`[ -s ${_sq(jsFile)} ] && echo EXISTS || echo NONE`, 2000);
+                if (!String(chk?.content || '').includes('EXISTS')) {
+                    delete _installedModules[m.id];
+                    cleaned = true;
+                }
+            }
+        }
+        if (cleaned) await _saveVersions(_installedModules);
 
         // 加载已安装的模块
         let loadedCount = 0;
@@ -941,7 +954,6 @@ html.sdm-no-fx .sdm-check-btn.loading .sdm-btn-icon{animation:sdm_spin 1s linear
                 if (ok) loadedCount++;
             }
         }
-        _updateInstalledCount();
 
         // 延迟检查更新
         setTimeout(async () => {
@@ -949,7 +961,6 @@ html.sdm-no-fx .sdm-check-btn.loading .sdm-btn-icon{animation:sdm_spin 1s linear
                 try { const ver = await _fetchModuleVersion(m.id); if (ver) _moduleVersions[m.id] = ver; } catch {}
             }
             try { const coreVer = await _checkCoreUpdate(); if (coreVer) { const btn = document.getElementById('sdm_check_update_btn'); if (btn) btn.classList.add('has-update'); } } catch {}
-            _renderModuleCards();
         }, 3000);
 
         addDiagLog('SDM模块化核心 v' + PLUGIN_VERSION + ' 已启动，已加载 ' + loadedCount + '/' + MODULE_DEFS.length + ' 个模块', 'success');
