@@ -535,9 +535,10 @@ html.sdm-no-fx .sdm-check-btn.loading .sdm-btn-icon{animation:sdm_spin 1s linear
             </span>
             <span id="smart_author_display" style="display:none;font-size:.4rem;margin-left:4px;background:linear-gradient(135deg,#a78bfa,#ec4899);color:white;padding:2px 8px;border-radius:8px;font-weight:bold;">✨ 小宇同学</span>
             <span id="smart_fx_toggle" title="一键关闭本插件所有动画特效（卡顿时用）" style="display:inline-block;font-size:.5rem;font-weight:bold;color:white;cursor:pointer;margin-left:6px;background:linear-gradient(135deg,#a78bfa,#818cf8,#60a5fa);padding:4px 14px;border-radius:14px;border:1px solid rgba(196,181,253,.55);box-shadow:0 2px 12px rgba(129,140,248,.4),0 0 16px rgba(167,139,250,.3);transition:all .25s;">✨ 特效开</span>
+            <span id="sdm_toggle_btn" style="display:inline-block;font-size:.5rem;font-weight:bold;color:white;cursor:pointer;margin-left:6px;background:linear-gradient(135deg,#f472b6,#ec4899);padding:4px 14px;border-radius:14px;border:1px solid rgba(255,182,193,.5);box-shadow:0 2px 12px rgba(236,72,153,.4);transition:all .25s;">⬇️ 展开</span>
             <div style="display:inline-block;" id="collapse_SMART_btn"></div>
         </div>
-        <div class="collapse" id="collapse_SMART" data-name="close" style="height:0px;overflow:hidden;">
+        <div class="collapse" id="collapse_SMART" data-name="open" style="height:auto;overflow:visible;">
         <div class="collapse_box">
             <div class="sdm2-card" style="padding:14px;margin-bottom:10px;border-radius:18px;background:linear-gradient(135deg,rgba(167,139,250,.12),rgba(244,114,182,.08),rgba(125,211,252,.08));border:1px solid rgba(167,139,250,.25);">
                 <span class="sdm2-deco d1">📦</span><span class="sdm2-deco d2">✨</span><span class="sdm2-paw">🐾</span>
@@ -599,6 +600,47 @@ html.sdm-no-fx .sdm-check-btn.loading .sdm-btn-icon{animation:sdm_spin 1s linear
 
     // ─── collapse 组件初始化 ───
     try { if (typeof collapseGen === 'function') { collapseGen('SMART', '🌸 智能设备管理器'); } } catch(e) {}
+
+    // ─── 强制默认展开面板 ───
+    function _sdmForceExpand() {
+        const panel = document.getElementById('collapse_SMART');
+        const btn = document.getElementById('sdm_toggle_btn');
+        if (panel) {
+            panel.style.height = 'auto';
+            panel.style.overflow = 'visible';
+            panel.dataset.name = 'open';
+        }
+        if (btn) {
+            btn.textContent = '⬆️ 收起';
+        }
+    }
+    // 多次尝试确保展开（因为collapseGen可能是异步的）
+    setTimeout(_sdmForceExpand, 100);
+    setTimeout(_sdmForceExpand, 500);
+    setTimeout(_sdmForceExpand, 1000);
+
+    // ─── 展开/收起按钮绑定 ───
+    const sdmToggleBtn = document.getElementById('sdm_toggle_btn');
+    if (sdmToggleBtn) {
+        sdmToggleBtn.onclick = function() {
+            const panel = document.getElementById('collapse_SMART');
+            if (!panel) return;
+            const isOpen = panel.dataset.name === 'open' || (panel.style.height !== '0px' && panel.style.height !== '');
+            if (isOpen) {
+                // 收起
+                panel.style.height = '0px';
+                panel.style.overflow = 'hidden';
+                panel.dataset.name = 'close';
+                sdmToggleBtn.textContent = '⬇️ 展开';
+            } else {
+                // 展开
+                panel.style.height = 'auto';
+                panel.style.overflow = 'visible';
+                panel.dataset.name = 'open';
+                sdmToggleBtn.textContent = '⬆️ 收起';
+            }
+        };
+    }
 
     // ─── 漂浮爱心装饰 ───
     ;(function sdm2Ambience() {
