@@ -5,8 +5,8 @@
 // 此文件为独立插件,由 SDM 统一更新管理器管理
 // ─────────────────────────────────────────────────────────
 
-const PLUGIN_ID = 'sdm-music';
-const PLUGIN_VERSION = '3.6.9.0';
+var PLUGIN_ID = 'sdm-music';
+var PLUGIN_VERSION = '3.6.9.0';
 
 if (typeof SDMUpdater !== 'undefined' && SDMUpdater && SDMUpdater.register) {
     SDMUpdater.register({ id: PLUGIN_ID, name: 'NMP音乐播放器', version: PLUGIN_VERSION, file: 'plugins/sdm-music.js' });
