@@ -1,39 +1,17 @@
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────
 // 插件: 去云控限速器+流量监控+SMS
 // ID: sdm-nettools
 // 版本: 3.6.9.0
-// 此文件为独立插件，由 SDM 统一更新管理器管理
-// ─────────────────────────────────────────────────────────────────────────────
+// 此文件为独立插件,由 SDM 统一更新管理器管理
+// ─────────────────────────────────────────────────────────
 
 const PLUGIN_ID = 'sdm-nettools';
 const PLUGIN_VERSION = '3.6.9.0';
 
-// 注册到统一更新管理器
 if (typeof SDMUpdater !== 'undefined' && SDMUpdater && SDMUpdater.register) {
     SDMUpdater.register({ id: PLUGIN_ID, name: '去云控限速器+流量监控+SMS', version: PLUGIN_VERSION, file: 'plugins/sdm-nettools.js' });
 }
-        // ============================================================
 
-        // 初始渲染
-        renderPendingCommands()
-        renderAILogs()
-        updateStats()
-        updateRunStatus()
-        updateFAB()
-
-        // 如果之前在运行，自动恢复
-        if (_aiRunning) {
-            setTimeout(function() {
-                aiLog('AI助手自动恢复运行', 'success')
-                startAI()
-            }, 2000)
-        }
-
-        addDiagLog('AI智能助手模块已加载', 'success')
-    })()
-    }, 600);
-
-    // ============ 去云控限速器 ============
     ;(async () => {
         const ZTE_SH_DIR = "/data/fuck_zte_net_limit"
         const ZTE_SH_FILE = "/data/fuck_zte_net_limit/fuck_zte.sh"
@@ -159,7 +137,6 @@ sync
         addDiagLog('去云控限速器模块已加载', 'success')
     })()
 
-    // ============ 限速器高级版 ============
     ;(async () => {
         // 获取热点连接的所有设备（返回 {name, ip, mac} 列表）
         var _scanHotspotDevices = async function() {
@@ -442,7 +419,7 @@ sync
                 btn.textContent = '✅ 已应用'
                 btn.style.background = 'linear-gradient(135deg,#10b981,#059669)'
                 createToast('限速已应用：' + applyCount + '台限速, ' + removeCount + '台解除', 'green', 3000)
-                setTimeout(function() {
+                setTimeout(async function() {
                     if (document.getElementById('slimit_overlay')) document.body.removeChild(overlay)
                 }, 1500)
             }
@@ -476,9 +453,7 @@ sync
         addDiagLog('限速器高级版模块已加载', 'success')
     })()
 
-    // ============ 流量监控 · 套餐告警（自动发短信提醒） ============
-    // 【性能优化】延迟500ms加载
-    setTimeout(function() {
+    setTimeout(async function() {
     ;(async () => {
         const TRAFFIC_DATA_DIR = '/data/traffic_monitor'
         const TRAFFIC_DATA_FILE = TRAFFIC_DATA_DIR + '/data.json'
@@ -1515,7 +1490,7 @@ sync
                 var msg = '【流量测试】当前已用' + usedGB + 'GB，剩余' + leftGB + 'GB，套餐共' + _tcfg.planTotal + 'GB。短信功能正常。'
                 var res = await _sendSms(_tcfg.warnPhone, msg)
                 testSmsBtn.textContent = res.success ? '✅ 发送成功' : '❌ 发送失败'
-                setTimeout(function() {
+                setTimeout(async function() {
                     testSmsBtn.textContent = '📱 测试短信'
                     testSmsBtn.disabled = false
                 }, 2000)
@@ -1874,7 +1849,7 @@ sync
         _bindTrafficEvents()
 
         // 延迟启动监控，避免阻塞
-        setTimeout(function() {
+        setTimeout(async function() {
             _initTrafficMonitor()
             addDiagLog('流量监控模块已加载 (' + _getCarrierName() + ')', 'success')
         }, 800)
@@ -1882,8 +1857,7 @@ sync
     })()
     }, 500);
 
-    // ============ 游戏加速器开关（已收进工具栏按钮区） ============
-    ;(() => {
+    ;(async () => {
         // ---- 工具栏按钮状态CSS ----
         var _fbStyle = document.createElement('style')
         _fbStyle.textContent = `
@@ -2032,10 +2006,8 @@ sync
         addDiagLog('游戏加速按钮已收进工具栏', 'success')
     })()
 
-    // ============ 5G信号监控模块 ============
-    // 【性能优化】延迟400ms加载，避免阻塞主界面
-    setTimeout(function() {
-    ;(function() {
+    setTimeout(async function() {
+    ;(async function() {
         var _smContainer = document.querySelector('.functions-container') || document.body
         _smContainer.insertAdjacentHTML("afterend", `
 <style>
@@ -2407,7 +2379,7 @@ sync
         function parseSignalFromPage() {
             return new Promise(function(resolve) {
                 try {
-                    setTimeout(function() {
+                    setTimeout(async function() {
                         try {
                             var pageText = document.body.innerText
                             var signalData = null
@@ -2554,4 +2526,6 @@ sync
 
         setTimeout(initSignalMonitor, 500)
         addDiagLog('5G信号监控模块已加载', 'success')
+    })();
+    }, 400);
 // ── sdm-nettools 插件结束 ──
