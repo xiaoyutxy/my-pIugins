@@ -3,7 +3,7 @@
 // 版本: 3.6.9
 // 由 SDM 统一更新管理器管理所有子插件
 // ─────────────────────────────────────────────────────────────────────────────
-const PLUGIN_VERSION = '3.6.9';
+const PLUGIN_VERSION = '3.6.9.1';
 //<script>
 //@@SDM_PLUGIN_ID:a1b2c3@@
 (async () => {
@@ -14,7 +14,7 @@ try {
     let DIAG_LOG = []
     let SCAN_INTERVAL_MS = 10000
     let _isScanning = false
-    const PLUGIN_VERSION = '3.6.9'
+    const PLUGIN_VERSION = '3.6.9.1'
 
     // ════════════════════════════════════════════════════════════
     // 自有更新推送机制 ★ 改成你自己的 GitHub 仓库 ★
@@ -659,15 +659,149 @@ try {
         return { id: plugin.id, ok: false, error: '所有源下载失败', tried: triedUrls };
     };
 
+    // ════════════════════════════════════════════════════════════
+    // SDM 插件管理器浮窗（安装面板 + 日志）
+    // ════════════════════════════════════════════════════════════
+    const _sdmLogEntries = [];
+    const _sdmLog = (msg, type) => {
+        type = type || 'info';
+        const ts = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+        _sdmLogEntries.push({ ts, msg, type });
+        const logEl = document.getElementById('sdm_mgr_log');
+        if (logEl) {
+            const color = type === 'error' ? '#f87171' : type === 'ok' ? '#86efac' : type === 'warn' ? '#fbbf24' : '#94a3b8';
+            logEl.insertAdjacentHTML('beforeend', `<div style="color:${color}">[${ts}] ${msg}</div>`);
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+        console.log('[SDM] ' + msg);
+    };
+
+    const _sdmShowManagerPanel = () => {
+        if (document.getElementById('sdm_mgr_panel')) return;
+        const fab = document.createElement('div');
+        fab.id = 'sdm_mgr_fab';
+        fab.textContent = '🔧';
+        fab.style.cssText = 'position:fixed;right:12px;bottom:12px;width:46px;height:46px;border-radius:50%;background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;font-size:22px;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:99999;box-shadow:0 4px 14px rgba(0,0,0,.4);user-select:none';
+        const panel = document.createElement('div');
+        panel.id = 'sdm_mgr_panel';
+        panel.style.cssText = 'position:fixed;right:12px;bottom:68px;width:92vw;max-width:400px;max-height:72vh;background:#1e293b;color:#e2e8f0;border-radius:14px;padding:14px;font-size:13px;z-index:99998;box-shadow:0 6px 28px rgba(0,0,0,.5);overflow:hidden;display:none;flex-direction:column';
+        panel.innerHTML = `
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+                <div style="font-weight:800;font-size:15px">🔧 SDM 插件管理器</div>
+                <div id="sdm_mgr_close" style="cursor:pointer;color:#94a3b8;font-size:18px">✕</div>
+            </div>
+            <div id="sdm_mgr_list" style="flex:1;overflow:auto"></div>
+            <div style="margin-top:10px;display:flex;gap:8px">
+                <button id="sdm_mgr_check" style="flex:1;font-size:12px;padding:6px 0;border-radius:8px;border:1px solid rgba(96,165,250,.4);background:rgba(96,165,250,.18);color:#93c5fd;cursor:pointer">检查更新</button>
+                <button id="sdm_mgr_reload" style="flex:1;font-size:12px;padding:6px 0;border-radius:8px;border:1px solid rgba(34,197,94,.4);background:rgba(34,197,94,.18);color:#86efac;cursor:pointer">重载全部</button>
+            </div>
+            <div style="margin-top:8px;font-weight:700;color:#94a3b8;font-size:12px">📋 日志</div>
+            <div id="sdm_mgr_log" style="margin-top:4px;height:130px;overflow:auto;background:rgba(0,0,0,.35);border-radius:8px;padding:8px;font-size:10px;line-height:1.7;font-family:monospace"></div>
+        `;
+        document.body.appendChild(fab);
+        document.body.appendChild(panel);
+        fab.onclick = () => {
+            panel.style.display = panel.style.display === 'none' ? 'flex' : 'none';
+            if (panel.style.display === 'flex') _sdmRefreshMgrList();
+        };
+        panel.querySelector('#sdm_mgr_close').onclick = () => { panel.style.display = 'none'; };
+        panel.querySelector('#sdm_mgr_check').onclick = () => _sdmMgrCheckAll();
+        panel.querySelector('#sdm_mgr_reload').onclick = () => { _sdmLoadAllPlugins(); };
+        _sdmRefreshMgrList();
+        _sdmLog('插件管理器已启动', 'ok');
+    };
+
+    const _sdmRefreshMgrList = async () => {
+        const listEl = document.getElementById('sdm_mgr_list');
+        if (!listEl) return;
+        listEl.innerHTML = '';
+        for (const p of SDM_SUB_PLUGINS) {
+            const verR = await _sdmRun(`cat ${_sdmSq(SDM_PLUGIN_CACHE_DIR + '/' + p.id + '.ver')} 2>/dev/null || echo 未安装`, 2000);
+            const localVer = String(verR?.content || '').trim() || '未安装';
+            const row = document.createElement('div');
+            row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.06)';
+            row.innerHTML = `
+                <div style="flex:1;min-width:0">
+                    <div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${p.id}</div>
+                    <div style="font-size:10px;color:#94a3b8">本地: ${localVer}${p.cloud ? ' · 云端: ' + p.cloud : ''}</div>
+                </div>
+                <button data-id="${p.id}" class="sdm_mgr_upd" style="font-size:11px;padding:5px 12px;border-radius:7px;border:1px solid rgba(34,197,94,.4);background:rgba(34,197,94,.2);color:#86efac;cursor:pointer;white-space:nowrap">更新</button>
+            `;
+            listEl.appendChild(row);
+        }
+        listEl.querySelectorAll('.sdm_mgr_upd').forEach(btn => {
+            btn.onclick = () => _sdmUpdateSinglePlugin(btn.dataset.id);
+        });
+    };
+
+    const _sdmMgrCheckAll = async () => {
+        _sdmLog('检查云端版本...', 'info');
+        for (const srcFn of SDM_CDN_SOURCES) {
+            const src = srcFn('plugins/manifest.json');
+            const tmp = '/data/local/tmp/_sdm_mf_chk.tmp';
+            const dl = await _sdmRun(`curl -sL --fail --connect-timeout 5 --max-time 15 ${_sdmSq(src)} -o ${_sdmSq(tmp)} 2>/dev/null; ec=$?; [ "$ec" -eq 0 ] && echo __OK__ || echo __FAIL__:$ec`, 20000);
+            if (!String(dl?.content || '').includes('__OK__')) { await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000); continue; }
+            const r = await _sdmRun(`cat ${_sdmSq(tmp)}`, 3000);
+            const text = String(r?.content || '').trim();
+            await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
+            if (!text || text[0] !== '{') continue;
+            try {
+                const j = JSON.parse(text);
+                for (const p of SDM_SUB_PLUGINS) {
+                    const mp = (j.plugins || []).find(x => x.id === p.id);
+                    if (mp) p.cloud = mp.version;
+                }
+                _sdmLog('云端版本获取成功', 'ok');
+                _sdmRefreshMgrList();
+                return;
+            } catch (e) { continue; }
+        }
+        _sdmLog('获取云端版本失败：所有源不可达', 'error');
+    };
+
+    const _sdmUpdateSinglePlugin = async (pluginId) => {
+        const p = SDM_SUB_PLUGINS.find(x => x.id === pluginId);
+        if (!p) return;
+        _sdmLog(`开始更新 ${pluginId}...`, 'info');
+        const tmp = `/data/local/tmp/_sdm_sub_${pluginId}_upd.js`;
+        for (const srcFn of SDM_CDN_SOURCES) {
+            const src = srcFn(p.file);
+            const dl = await _sdmRun(`curl -sL --fail --connect-timeout 5 --max-time 20 ${_sdmSq(src)} -o ${_sdmSq(tmp)} 2>/dev/null; ec=$?; [ "$ec" -eq 0 ] && echo __OK__ || echo __FAIL__:$ec`, 25000);
+            if (!String(dl?.content || '').includes('__OK__')) { await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000); continue; }
+            const r = await _sdmRun(`cat ${_sdmSq(tmp)}`, 15000);
+            const code = String(r?.content || '').trim();
+            if (code.length < 100) { await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000); continue; }
+            if (code.includes('const PLUGIN_ID =') || code.includes('const PLUGIN_VERSION =')) { await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000); continue; }
+            try {
+                _sdmExecPluginCode(code, pluginId);
+                const cacheFile = `${SDM_PLUGIN_CACHE_DIR}/${pluginId}.js`;
+                const verFile = `${SDM_PLUGIN_CACHE_DIR}/${pluginId}.ver`;
+                await _sdmRun(`mkdir -p ${_sdmSq(SDM_PLUGIN_CACHE_DIR)}`, 2000);
+                await _sdmRun(`cp ${_sdmSq(tmp)} ${_sdmSq(cacheFile)} && echo ${_sdmSq(p.version)} > ${_sdmSq(verFile)}`, 5000);
+                await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
+                _sdmLog(`${pluginId} 更新成功 ✓`, 'ok');
+                _sdmRefreshMgrList();
+                return;
+            } catch (e) {
+                await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
+                _sdmLog(`${pluginId} 执行失败: ${e?.message || e}`, 'error');
+                continue;
+            }
+        }
+        _sdmLog(`${pluginId} 更新失败：无可用源`, 'error');
+    };
+
     // 加载所有子插件（顺序加载，保持与原单体文件相同的初始化顺序）
     const _sdmLoadAllPlugins = async () => {
         const results = [];
         let okCount = 0;
         let failCount = 0;
         for (const plugin of SDM_SUB_PLUGINS) {
+            _sdmLog(`加载 ${plugin.id}...`, 'info');
             const r = await _sdmLoadSubPlugin(plugin);
             results.push(r);
-            if (r.ok) okCount++; else failCount++;
+            if (r.ok) { okCount++; _sdmLog(`${plugin.id} 加载成功 (${r.from})`, 'ok'); }
+            else { failCount++; _sdmLog(`${plugin.id} 加载失败`, 'error'); }
         }
         if (failCount > 0) {
             const failed = results.filter(r => !r.ok).map(r => r.id).join(', ');
@@ -689,6 +823,9 @@ try {
         // 后台检查更新
         setTimeout(() => _sdmBgCheck(), 3000);
     };
+
+    // 启动插件管理器浮窗（安装面板 + 日志，独立于子插件 UI，始终可用）
+    _sdmShowManagerPanel();
 
     // 延迟 500ms 启动子插件加载（等更新管理器初始化完成）
     setTimeout(() => { _sdmLoadAllPlugins(); }, 500);
