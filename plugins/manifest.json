@@ -1,0 +1,54 @@
+{
+  "version": "3.6.9.0",
+  "plugins": [
+    {
+      "id": "sdm-ai",
+      "name": "AI设备巡检+网络监控",
+      "version": "3.6.9.0",
+      "file": "plugins/sdm-ai.js",
+      "size": 231283
+    },
+    {
+      "id": "sdm-battery",
+      "name": "电池监控pro+充电控制器",
+      "version": "3.6.9.0",
+      "file": "plugins/sdm-battery.js",
+      "size": 119018
+    },
+    {
+      "id": "sdm-core",
+      "name": "主面板+游戏加速+工单系统",
+      "version": "3.6.9.0",
+      "file": "plugins/sdm-core.js",
+      "size": 164330
+    },
+    {
+      "id": "sdm-hotspot",
+      "name": "热点流量监控",
+      "version": "3.6.9.0",
+      "file": "plugins/sdm-hotspot.js",
+      "size": 96785
+    },
+    {
+      "id": "sdm-music",
+      "name": "NMP音乐播放器",
+      "version": "3.6.9.0",
+      "file": "plugins/sdm-music.js",
+      "size": 128139
+    },
+    {
+      "id": "sdm-nettools",
+      "name": "去云控限速器+流量监控+SMS",
+      "version": "3.6.9.0",
+      "file": "plugins/sdm-nettools.js",
+      "size": 149640
+    },
+    {
+      "id": "sdm-pet",
+      "name": "桌面悬浮AI宠物",
+      "version": "3.6.9.0",
+      "file": "plugins/sdm-pet.js",
+      "size": 51844
+    }
+  ]
+}
