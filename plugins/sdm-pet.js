@@ -1,19 +1,18 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// 插件: 桌面悬浮宠物
+// ─────────────────────────────────────────────────────────
+// 插件: 桌面悬浮AI宠物
 // ID: sdm-pet
 // 版本: 3.6.9.0
-// 此文件为独立插件，由 SDM 统一更新管理器管理
-// ─────────────────────────────────────────────────────────────────────────────
+// 此文件为独立插件,由 SDM 统一更新管理器管理
+// ─────────────────────────────────────────────────────────
 
 const PLUGIN_ID = 'sdm-pet';
 const PLUGIN_VERSION = '3.6.9.0';
 
-// 注册到统一更新管理器
 if (typeof SDMUpdater !== 'undefined' && SDMUpdater && SDMUpdater.register) {
-    SDMUpdater.register({ id: PLUGIN_ID, name: '桌面悬浮宠物', version: PLUGIN_VERSION, file: 'plugins/sdm-pet.js' });
+    SDMUpdater.register({ id: PLUGIN_ID, name: '桌面悬浮AI宠物', version: PLUGIN_VERSION, file: 'plugins/sdm-pet.js' });
 }
-    // 功能：屏幕内自由走动、AI聊天、天气播报、穿衣建议、版本更新提醒、设备状态汇报
-    // ═══════════════════════════════════════════════════════════════════════════
+
+(async () => {
     setTimeout(function() {
     ;(function() {
         if (window._desktopPetLoaded) return;
@@ -980,4 +979,6 @@ if (typeof SDMUpdater !== 'undefined' && SDMUpdater && SDMUpdater.register) {
 
         console.log('[DesktopPet] 桌面宠物模块已启动 v1.0');
     })();
+    }, 1500);
+})();
 // ── sdm-pet 插件结束 ──
