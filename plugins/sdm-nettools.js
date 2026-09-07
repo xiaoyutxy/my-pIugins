@@ -5,8 +5,8 @@
 // 此文件为独立插件,由 SDM 统一更新管理器管理
 // ─────────────────────────────────────────────────────────
 
-const PLUGIN_ID = 'sdm-nettools';
-const PLUGIN_VERSION = '3.6.9.0';
+var PLUGIN_ID = 'sdm-nettools';
+var PLUGIN_VERSION = '3.6.9.0';
 
 if (typeof SDMUpdater !== 'undefined' && SDMUpdater && SDMUpdater.register) {
     SDMUpdater.register({ id: PLUGIN_ID, name: '去云控限速器+流量监控+SMS', version: PLUGIN_VERSION, file: 'plugins/sdm-nettools.js' });
