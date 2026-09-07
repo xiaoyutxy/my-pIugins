@@ -1,0 +1,77 @@
+# SDM Plugins Release Template
+
+## 发布步骤
+
+1. 在 GitHub 仓库页面点击 **Draft a new release**
+2. Tag 版本号格式：v3.6.9 (带 v 前缀)
+3. Release title：SDM v3.6.9 - 插件独立更新版
+4. 在 Release body 中粘贴以下内容：
+
+---
+
+<!-- SDM_MANIFEST
+{
+  "version": "3.6.9",
+  "plugins": [
+    {
+      "id": "sdm-core",
+      "file": "plugins/sdm-core.js",
+      "version": "3.6.9.0"
+    },
+    {
+      "id": "sdm-music",
+      "file": "plugins/sdm-music.js",
+      "version": "3.6.9.0"
+    },
+    {
+      "id": "sdm-ai",
+      "file": "plugins/sdm-ai.js",
+      "version": "3.6.9.0"
+    },
+    {
+      "id": "sdm-nettools",
+      "file": "plugins/sdm-nettools.js",
+      "version": "3.6.9.0"
+    },
+    {
+      "id": "sdm-hotspot",
+      "file": "plugins/sdm-hotspot.js",
+      "version": "3.6.9.0"
+    },
+    {
+      "id": "sdm-battery",
+      "file": "plugins/sdm-battery.js",
+      "version": "3.6.9.0"
+    },
+    {
+      "id": "sdm-pet",
+      "file": "plugins/sdm-pet.js",
+      "version": "3.6.9.0"
+    }
+  ]
+}
+-->
+
+## 更新内容
+
+- **SDM核心面板**: [填写更新内容]
+- **音乐播放器**: [填写更新内容]
+- **AI助手**: [填写更新内容]
+- **网络工具箱**: [填写更新内容]
+- **热点流量监控**: [填写更新内容]
+- **电池监控**: [填写更新内容]
+- **桌面AI宠物**: [填写更新内容]
+
+## 上传插件文件
+
+将以下文件拖入 Assets 区域：
+
+- plugins/sdm-core.js
+- plugins/sdm-music.js
+- plugins/sdm-ai.js
+- plugins/sdm-nettools.js
+- plugins/sdm-hotspot.js
+- plugins/sdm-battery.js
+- plugins/sdm-pet.js
+
+---
