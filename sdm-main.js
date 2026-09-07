@@ -517,18 +517,49 @@ try {
     setTimeout(() => { _sdmCleanup(); }, 1500);
 
     // ════════════════════════════════════════════════════════════
+    // SDMUpdater — 全局更新管理器（精简版，供子插件注册）
+    // 完整版在 updater/sdm-updater.js
+    // ════════════════════════════════════════════════════════════
+    if (typeof window.SDMUpdater === 'undefined') {
+        window.SDMUpdater = {
+            version: '1.0.0',
+            _registry: [],
+            register: function(info) {
+                if (!info || !info.id) return;
+                var existing = this._registry.findIndex(function(x) { return x.id === info.id; });
+                if (existing >= 0) this._registry[existing] = info;
+                else this._registry.push(info);
+            },
+            checkAll: async function(plugins) {
+                try {
+                    var r = await fetch('https://api.github.com/repos/xiaoyutxy/my-pIugins/releases/latest');
+                    var rel = await r.json();
+                    var manifest = null;
+                    try { manifest = JSON.parse(rel.body.match(/```json\n([\s\S]*?)\n```/)?.[1] || '{}'); } catch(_) {}
+                    return (plugins || this._registry).map(function(p) {
+                        var cloud = manifest && (manifest.plugins||[]).find(function(x){return x.id===p.id;});
+                        return { id: p.id, name: p.name, localVersion: p.version, cloudVersion: cloud?cloud.version:rel.tag_name, hasUpdate: cloud?cloud.version!==p.version:false, file: cloud?cloud.file:p.file };
+                    });
+                } catch(e) {
+                    return (plugins || this._registry).map(function(p) { return { id: p.id, name: p.name, localVersion: p.version, cloudVersion: null, hasUpdate: false }; });
+                }
+            }
+        };
+    }
+
+    // ════════════════════════════════════════════════════════════
     // 子插件加载器
     // 从 GitHub/jsDelivr 拉取 7 个子插件并在当前作用域执行
     // 优先读本地缓存（/data/sdm/plugins/），无缓存才联网拉取
     // ════════════════════════════════════════════════════════════
     const SDM_SUB_PLUGINS = [
-        { id: 'sdm-core',     file: 'plugins/sdm-core.js',     version: '3.6.9.0' },
-        { id: 'sdm-music',    file: 'plugins/sdm-music.js',    version: '3.6.9.0' },
-        { id: 'sdm-ai',       file: 'plugins/sdm-ai.js',       version: '3.6.9.0' },
-        { id: 'sdm-nettools', file: 'plugins/sdm-nettools.js', version: '3.6.9.0' },
-        { id: 'sdm-hotspot',  file: 'plugins/sdm-hotspot.js',  version: '3.6.9.0' },
-        { id: 'sdm-battery',  file: 'plugins/sdm-battery.js',  version: '3.6.9.0' },
-        { id: 'sdm-pet',      file: 'plugins/sdm-pet.js',      version: '3.6.9.0' }
+        { id: 'sdm-core',     file: 'plugins/sdm-core.js',     version: '3.6.9.1' },
+        { id: 'sdm-music',    file: 'plugins/sdm-music.js',    version: '3.6.9.1' },
+        { id: 'sdm-ai',       file: 'plugins/sdm-ai.js',       version: '3.6.9.1' },
+        { id: 'sdm-nettools', file: 'plugins/sdm-nettools.js', version: '3.6.9.1' },
+        { id: 'sdm-hotspot',  file: 'plugins/sdm-hotspot.js',  version: '3.6.9.1' },
+        { id: 'sdm-battery',  file: 'plugins/sdm-battery.js',  version: '3.6.9.1' },
+        { id: 'sdm-pet',      file: 'plugins/sdm-pet.js',      version: '3.6.9.1' }
     ];
     const SDM_PLUGIN_CACHE_DIR = '/data/sdm/plugins';
 
