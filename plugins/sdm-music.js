@@ -1,18 +1,18 @@
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────
 // 插件: NMP音乐播放器
 // ID: sdm-music
 // 版本: 3.6.9.0
-// 此文件为独立插件，由 SDM 统一更新管理器管理
-// ─────────────────────────────────────────────────────────────────────────────
+// 此文件为独立插件,由 SDM 统一更新管理器管理
+// ─────────────────────────────────────────────────────────
 
 const PLUGIN_ID = 'sdm-music';
 const PLUGIN_VERSION = '3.6.9.0';
 
-// 注册到统一更新管理器
 if (typeof SDMUpdater !== 'undefined' && SDMUpdater && SDMUpdater.register) {
     SDMUpdater.register({ id: PLUGIN_ID, name: 'NMP音乐播放器', version: PLUGIN_VERSION, file: 'plugins/sdm-music.js' });
 }
-    // 【性能优化】延迟300ms加载，优先渲染主界面
+
+(async () => {
     setTimeout(function() {
     ;(function() {
         // ---- 状态 ----
@@ -2586,4 +2586,8 @@ if (typeof SDMUpdater !== 'undefined' && SDMUpdater && SDMUpdater.register) {
             setTimeout(function() { _tryAutoResume() }, 800)
         }
 
+        addDiagLog('音乐播放器模块已加载（播放列表 ' + _playlist.length + ' 首）', 'success')
+    })()
+    }, 300);
+})();
 // ── sdm-music 插件结束 ──
