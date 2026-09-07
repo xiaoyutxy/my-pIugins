@@ -1,20 +1,18 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// 插件: 热点流量监控面板
+// ─────────────────────────────────────────────────────────
+// 插件: 热点流量监控
 // ID: sdm-hotspot
 // 版本: 3.6.9.0
-// 此文件为独立插件，由 SDM 统一更新管理器管理
-// ─────────────────────────────────────────────────────────────────────────────
+// 此文件为独立插件,由 SDM 统一更新管理器管理
+// ─────────────────────────────────────────────────────────
 
 const PLUGIN_ID = 'sdm-hotspot';
 const PLUGIN_VERSION = '3.6.9.0';
 
-// 注册到统一更新管理器
 if (typeof SDMUpdater !== 'undefined' && SDMUpdater && SDMUpdater.register) {
-    SDMUpdater.register({ id: PLUGIN_ID, name: '热点流量监控面板', version: PLUGIN_VERSION, file: 'plugins/sdm-hotspot.js' });
+    SDMUpdater.register({ id: PLUGIN_ID, name: '热点流量监控', version: PLUGIN_VERSION, file: 'plugins/sdm-hotspot.js' });
 }
-    // ============ 热点流量监控 v2.0 ============
-    // 【性能优化】延迟200ms加载，避免阻塞主界面渲染
-    setTimeout(function() {
+
+(async () => {
     (async () => {
     const REQUIRED_APIS = ['runShellWithRoot', 'createToast', 'createFixedToast', 'saveConfig', 'checkAdvancedFunc', 'collapseGen', 'createModal', 'showModal', 'getUFIData', 'getCustomHead', 'setCustomHead'];
     const missingApis = REQUIRED_APIS.filter((n) => {
@@ -1536,5 +1534,6 @@ echo __RESULT__
     if (localStorage.getItem('#collapse_ht') === 'open') {
         initPanelState().catch(e => console.warn('[HT] init error:', e));
     }
+})();
 })();
 // ── sdm-hotspot 插件结束 ──
