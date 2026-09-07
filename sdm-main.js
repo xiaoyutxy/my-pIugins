@@ -633,6 +633,13 @@ try {
                 continue;
             }
 
+            // 校验：确保下载的是 var 版本（非 const），防止 CDN 缓存旧版导致 SyntaxError 静默失败
+            if (code.includes('const PLUGIN_ID =') || code.includes('const PLUGIN_VERSION =')) {
+                // CDN 缓存了旧的 const 版本，跳过此源试下一个
+                await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
+                continue;
+            }
+
             // 执行子插件代码（全局作用域注入）
             try {
                 _sdmExecPluginCode(code, plugin.id);
