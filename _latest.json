@@ -1,0 +1,16 @@
+{
+  "rev": "3.6.9.1",
+  "js": "https://cdn.jsdelivr.net/gh/xiaoyutxy/my-pIugins@main/sdm-main.js",
+  "notes": "新增插件管理器面板+日志，支持独立更新每个子插件；修复 const 重复声明导致 UI 不显示的问题",
+  "changelog": [
+    {
+      "title": "v3.6.9.1",
+      "items": [
+        "修复 7 个子插件头部 const PLUGIN_ID 重复声明导致 SyntaxError 静默失败（UI 不显示）",
+        "新增插件管理器浮窗：安装面板 + 实时日志",
+        "支持独立更新/重载每个子插件",
+        "加载器增加 CDN 缓存守卫：跳过含旧 const 版本的 CDN 源"
+      ]
+    }
+  ]
+}
