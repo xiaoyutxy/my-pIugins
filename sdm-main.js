@@ -3,7 +3,7 @@
 // 版本: 3.6.9
 // 由 SDM 统一更新管理器管理所有子插件
 // ─────────────────────────────────────────────────────────────────────────────
-const PLUGIN_VERSION = '3.6.9.1';
+const PLUGIN_VERSION = '3.6.9.2';
 //<script>
 //@@SDM_PLUGIN_ID:a1b2c3@@
 (async () => {
@@ -582,7 +582,21 @@ try {
 
     // 执行子插件代码：用 script 标签注入而非 new Function
     // 这样代码在全局作用域执行，与原单体文件行为一致
-    const _sdmExecPluginCode = (code, pluginId) => {
+    
+// 等待 DOM 元素出现（子插件注入面板需要等 .functions-container 渲染完成）
+const _sdmWaitForEl = (sel, timeoutMs = 15000) => new Promise(resolve => {
+    const el = document.querySelector(sel);
+    if (el) { resolve(el); return; }
+    const t0 = Date.now();
+    const intv = setInterval(() => {
+        const e2 = document.querySelector(sel);
+        if (e2) { clearInterval(intv); clearTimeout(fallback); resolve(e2); }
+        if (Date.now() - t0 > timeoutMs) { clearInterval(intv); clearTimeout(fallback); resolve(null); }
+    }, 200);
+    const fallback = setTimeout(() => { clearInterval(intv); resolve(null); }, timeoutMs);
+});
+
+const _sdmExecPluginCode = (code, pluginId) => {
         const script = document.createElement('script');
         script.textContent = code;
         script.setAttribute('data-sdm-plugin', pluginId);
@@ -616,47 +630,44 @@ try {
         const tmp = `/data/local/tmp/_sdm_sub_${plugin.id}.js`;
         const triedUrls = [];
 
-        for (let i = 0; i < SDM_CDN_SOURCES.length; i++) {
-            const src = SDM_CDN_SOURCES[i](plugin.file);
+        // 并发探测所有 CDN 源，最快返回 __OK__ 的胜出（3s 连接超时）
+        const srcFns = SDM_CDN_SOURCES.map(srcFn => srcFn(plugin.file));
+        const probe = (src) => _sdmRun(
+            `curl -sL --fail --connect-timeout 3 --max-time 10 ${_sdmSq(src)} -o ${_sdmSq(tmp)} 2>/dev/null; ec=$?; [ "\$ec" -eq 0 ] && echo __OK__ || echo __FAIL__:$ec`,
+            13000
+        );
+        let successSrc = null;
+        const results = await Promise.all(srcFns.map(src => probe(src).then(r => ({ src, r }))));
+        for (const { src, r } of results) {
             triedUrls.push(src);
-            // 5s 连接超时 + 20s 最大超时，快速失败
-            const dl = await _sdmRun(`curl -sL --fail --connect-timeout 5 --max-time 20 ${_sdmSq(src)} -o ${_sdmSq(tmp)} 2>/dev/null; ec=$?; [ "\$ec" -eq 0 ] && echo __OK__ || echo __FAIL__:\$ec`, 25000);
-            if (!String(dl?.content || '').includes('__OK__')) {
-                await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
-                continue;
-            }
-
-            const r = await _sdmRun(`cat ${_sdmSq(tmp)}`, 15000);
-            const code = String(r?.content || '').trim();
-            if (code.length < 100) {
-                await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
-                continue;
-            }
-
-            // 校验：确保下载的是 var 版本（非 const），防止 CDN 缓存旧版导致 SyntaxError 静默失败
-            if (code.includes('const PLUGIN_ID =') || code.includes('const PLUGIN_VERSION =')) {
-                // CDN 缓存了旧的 const 版本，跳过此源试下一个
-                await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
-                continue;
-            }
-
-            // 执行子插件代码（全局作用域注入）
-            try {
-                _sdmExecPluginCode(code, plugin.id);
-            } catch (e) {
-                await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
-                continue;
-            }
-
-            // 写入本地缓存
-            await _sdmRun(`mkdir -p ${_sdmSq(SDM_PLUGIN_CACHE_DIR)}`, 2000);
-            await _sdmRun(`cp ${_sdmSq(tmp)} ${_sdmSq(cacheFile)} && echo ${_sdmSq(plugin.version)} > ${_sdmSq(verFile)}`, 5000);
+            if (String(r?.content || '').includes('__OK__')) { successSrc = src; break; }
+        }
+        if (!successSrc) {
             await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
-
-            return { id: plugin.id, ok: true, from: 'network', src: src };
+            return { id: plugin.id, ok: false, error: '所有 CDN 源不可达', tried: triedUrls };
         }
 
-        return { id: plugin.id, ok: false, error: '所有源下载失败', tried: triedUrls };
+        const r2 = await _sdmRun(`cat ${_sdmSq(tmp)}`, 15000);
+        const code = String(r2?.content || '').trim();
+        if (code.length < 100) {
+            await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
+            return { id: plugin.id, ok: false, error: '下载内容为空' };
+        }
+
+        // 执行子插件代码（全局作用域注入）
+        try {
+            _sdmExecPluginCode(code, plugin.id);
+        } catch (e) {
+            await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
+            return { id: plugin.id, ok: false, error: '代码执行失败: ' + (e?.message || String(e)) };
+        }
+
+        // 写入本地缓存
+        await _sdmRun(`mkdir -p ${_sdmSq(SDM_PLUGIN_CACHE_DIR)}`, 2000);
+        await _sdmRun(`cp ${_sdmSq(tmp)} ${_sdmSq(cacheFile)} && echo ${_sdmSq(plugin.version)} > ${_sdmSq(verFile)}`, 5000);
+        await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000);
+
+        return { id: plugin.id, ok: true, from: 'network', src: successSrc };
     };
 
     // ════════════════════════════════════════════════════════════
@@ -681,10 +692,10 @@ try {
         const fab = document.createElement('div');
         fab.id = 'sdm_mgr_fab';
         fab.textContent = '🔧';
-        fab.style.cssText = 'position:fixed;right:12px;bottom:12px;width:46px;height:46px;border-radius:50%;background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;font-size:22px;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:99999;box-shadow:0 4px 14px rgba(0,0,0,.4);user-select:none';
+        fab.style.cssText = 'position:fixed;right:12px;top:60px;width:46px;height:46px;border-radius:50%;background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;font-size:22px;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:99999;box-shadow:0 4px 14px rgba(0,0,0,.4);user-select:none';
         const panel = document.createElement('div');
         panel.id = 'sdm_mgr_panel';
-        panel.style.cssText = 'position:fixed;right:12px;bottom:68px;width:92vw;max-width:400px;max-height:72vh;background:#1e293b;color:#e2e8f0;border-radius:14px;padding:14px;font-size:13px;z-index:99998;box-shadow:0 6px 28px rgba(0,0,0,.5);overflow:hidden;display:none;flex-direction:column';
+        panel.style.cssText = 'position:fixed;right:12px;top:116px;width:92vw;max-width:400px;max-height:72vh;background:#1e293b;color:#e2e8f0;border-radius:14px;padding:14px;font-size:13px;z-index:99998;box-shadow:0 6px 28px rgba(0,0,0,.5);overflow:hidden;display:none;flex-direction:column';
         panel.innerHTML = `
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
                 <div style="font-weight:800;font-size:15px">🔧 SDM 插件管理器</div>
@@ -771,7 +782,7 @@ try {
             const r = await _sdmRun(`cat ${_sdmSq(tmp)}`, 15000);
             const code = String(r?.content || '').trim();
             if (code.length < 100) { await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000); continue; }
-            if (code.includes('const PLUGIN_ID =') || code.includes('const PLUGIN_VERSION =')) { await _sdmRun(`rm -f ${_sdmSq(tmp)}`, 1000); continue; }
+            // [SDM] const 守卫已移除（子插件 const 在 async IIFE 内，不冲突）
             try {
                 _sdmExecPluginCode(code, pluginId);
                 const cacheFile = `${SDM_PLUGIN_CACHE_DIR}/${pluginId}.js`;
@@ -827,8 +838,8 @@ try {
     // 启动插件管理器浮窗（安装面板 + 日志，独立于子插件 UI，始终可用）
     _sdmShowManagerPanel();
 
-    // 延迟 500ms 启动子插件加载（等更新管理器初始化完成）
-    setTimeout(() => { _sdmLoadAllPlugins(); }, 500);
+    // 延迟 3s 启动子插件加载（等 KANO .functions-container 渲染完成）
+    setTimeout(() => { _sdmLoadAllPlugins(); }, 3000);
 
 } catch (e) {
     if (typeof createToast === 'function') createToast('SDM 初始化失败: ' + (e?.message || e), 'red', 5000);
